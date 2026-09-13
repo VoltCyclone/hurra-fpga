@@ -1,0 +1,125 @@
+{
+  "frame": {
+    "crc": "CRC-16/CCITT-FALSE",
+    "crc_init": 65535,
+    "crc_poly": 4129,
+    "header_size": 4,
+    "payload_size": 26,
+    "size": 32,
+    "sof": 104
+  },
+  "crc32": {
+    "algorithm": "CRC-32/IEEE",
+    "init": 4294967295,
+    "poly": 3988292384,
+    "xorout": 4294967295
+  },
+  "counter_positions": {
+    "COMMAND": {"ACCEPTED": 0, "COMPLETED": 4, "LATE": 2, "OVERFLOW": 5, "QUEUE_FULL": 3, "REJECTED": 1},
+    "LINK": {"BAD_CRC": 1, "BAD_LENGTH": 2, "BAD_SOF": 0, "BAD_TYPE": 3, "DUPLICATE": 5, "SEQUENCE_GAP": 4},
+    "REPORT_MAP": {"MAP_COMMIT": 4, "MAP_REJECT": 5, "MONITORING_DROP": 3, "MUTATED": 1, "NATIVE": 0, "SYNTHESIZED": 2}
+  },
+  "enumerations": {
+    "CLEAR_FLAG": {"ALL": 15, "BUTTONS": 2, "MOTION": 1, "PHYSICAL_MASKS": 4, "QUEUED_TIMED": 8},
+    "COMMAND_ACK_FLAG": {"LATE": 1, "SYNTHESIZED": 2},
+    "COMMAND_ACK_RESULT": {"BUSY": 3, "CLEARED": 6, "OVERFLOW": 4, "STALE_LEASE": 1, "STALE_MAP": 2, "SUCCESS": 0, "UNSUPPORTED_TARGET": 5},
+    "COMMAND_ACK_STAGE": {"ADMITTED": 0, "COMPLETED": 1, "REJECTED": 2},
+    "COUNTERS_PAGE": {"COMMAND": 1, "LINK": 0, "REPORT_MAP": 2},
+    "LINK_STATUS_FLAG": {"ENUMERATED": 1, "INJECTION_ENABLED": 4, "MAP_ACTIVE": 2, "RELAY_READY": 8},
+    "MAP_ENTRY_FLAG": {"BUTTON": 4, "PAN": 64, "RELATIVE": 2, "SIGNED": 1, "WHEEL": 32, "X": 8, "Y": 16},
+    "MAP_STATUS_ERROR": {"BIT_OFFSET": 10, "CRC": 5, "DESCRIPTOR_GENERATION": 1, "DUPLICATE_ENTRY": 14, "ENDPOINT": 7, "ENTRY_COUNT": 3, "FIELD_WIDTH": 9, "INTERNAL": 15, "INTERFACE": 6, "LAYOUT_COUNT": 4, "MAP_GENERATION": 2, "NONE": 0, "OVERLAP": 12, "REPORT_ID_PREFIX": 11, "REPORT_LENGTH": 8, "UNSUPPORTED_FIELD": 13},
+    "MAP_STATUS_STATUS": {"ABORTED": 3, "CANDIDATE_ACCEPTED": 0, "COMMIT_ACCEPTED": 1, "REJECTED": 2},
+    "RELATIVE_FLAG": {"PAN": 8, "WHEEL": 4, "X": 1, "Y": 2}
+  },
+  "field_masks": {
+    "BUTTON_STATE": {"flags": 0},
+    "CLEAR": {"clear_flags": 15},
+    "COMMAND_ACK": {"flags": 3},
+    "COUNTERS": {"flags": 0},
+    "LINK_STATUS": {"link_flags": 15},
+    "MAP_BEGIN": {"flags": 0},
+    "MAP_COMMIT": {"flags": 0},
+    "MAP_ENTRY": {"flags": 127},
+    "MAP_STATUS": {"flags": 0},
+    "PHYSICAL_MASK": {"flags": 0},
+    "RELATIVE": {"flags": 15},
+    "TELEMETRY_CONFIG": {"flags": 0}
+  },
+  "receive_reject_masks": {
+    "MAP_ENTRY": {"flags": 128}
+  },
+  "goldens": {
+    "map_entry": {
+      "descriptor_generation": 4660,
+      "map_generation": 22136,
+      "entry_index": 154,
+      "interface_number": 2,
+      "endpoint_number": 3,
+      "report_id": 1,
+      "usage_page": 1,
+      "usage": 48,
+      "bit_offset": 8,
+      "bit_width": 12,
+      "flags": 27,
+      "logical_minimum": -2048,
+      "logical_maximum": 2047,
+      "report_length": 4
+    },
+    "relative": {
+      "lease_generation": 4386,
+      "map_generation": 13124,
+      "command_sequence": 21862,
+      "target_frame": 30600,
+      "interface_number": 9,
+      "endpoint_number": 10,
+      "report_id": 11,
+      "flags": 15,
+      "x": -2,
+      "y": 4660,
+      "wheel": -4660,
+      "pan": 32767,
+      "hold_reports": 39612
+    }
+  },
+  "limits": {
+    "descriptor_bytes_per_interface": 2048,
+    "fields": 64,
+    "interfaces": 4,
+    "layouts": 16,
+    "report_bytes": 64
+  },
+  "message_types": {
+    "BUTTON_STATE": 133,
+    "CLEAR": 135,
+    "COMMAND_ACK": 5,
+    "COUNTERS": 6,
+    "DESCRIPTOR_FRAGMENT": 2,
+    "IDLE": 0,
+    "LINK_STATUS": 1,
+    "MAP_BEGIN": 129,
+    "MAP_COMMIT": 131,
+    "MAP_ENTRY": 130,
+    "MAP_STATUS": 4,
+    "PHYSICAL_MASK": 134,
+    "RELATIVE": 132,
+    "REPORT_FRAGMENT": 3,
+    "TELEMETRY_CONFIG": 136
+  },
+  "payloads": {
+    "BUTTON_STATE": [{"name": "lease_generation", "offset": 0, "type": "u16"}, {"name": "map_generation", "offset": 2, "type": "u16"}, {"name": "command_sequence", "offset": 4, "type": "u16"}, {"name": "target_frame", "offset": 6, "type": "u16"}, {"name": "interface_number", "offset": 8, "type": "u8"}, {"name": "endpoint_number", "offset": 9, "type": "u8"}, {"name": "report_id", "offset": 10, "type": "u8"}, {"name": "flags", "offset": 11, "type": "u8"}, {"name": "buttons", "offset": 12, "type": "u64"}, {"name": "hold_reports", "offset": 20, "type": "u16"}, {"name": "reserved", "offset": 22, "type": "u32", "reserved": true}],
+    "CLEAR": [{"name": "lease_generation", "offset": 0, "type": "u16"}, {"name": "map_generation", "offset": 2, "type": "u16"}, {"name": "command_sequence", "offset": 4, "type": "u16"}, {"name": "target_frame", "offset": 6, "type": "u16"}, {"name": "clear_flags", "offset": 8, "type": "u16"}, {"name": "reason", "offset": 10, "type": "u8"}, {"name": "reserved", "offset": 11, "type": "bytes", "count": 15, "reserved": true}],
+    "COMMAND_ACK": [{"name": "lease_generation", "offset": 0, "type": "u16"}, {"name": "map_generation", "offset": 2, "type": "u16"}, {"name": "command_sequence", "offset": 4, "type": "u16"}, {"name": "target_frame", "offset": 6, "type": "u16"}, {"name": "accepted_frame", "offset": 8, "type": "u16"}, {"name": "completed_frame", "offset": 10, "type": "u16"}, {"name": "ack_stage", "offset": 12, "type": "u8"}, {"name": "result", "offset": 13, "type": "u8"}, {"name": "command_type", "offset": 14, "type": "u8"}, {"name": "flags", "offset": 15, "type": "u8"}, {"name": "interface_number", "offset": 16, "type": "u8"}, {"name": "endpoint_number", "offset": 17, "type": "u8"}, {"name": "report_id", "offset": 18, "type": "u8"}, {"name": "reserved", "offset": 19, "type": "bytes", "count": 7, "reserved": true}],
+    "COUNTERS": [{"name": "page", "offset": 0, "type": "u8"}, {"name": "flags", "offset": 1, "type": "u8"}, {"name": "counter0", "offset": 2, "type": "u32"}, {"name": "counter1", "offset": 6, "type": "u32"}, {"name": "counter2", "offset": 10, "type": "u32"}, {"name": "counter3", "offset": 14, "type": "u32"}, {"name": "counter4", "offset": 18, "type": "u32"}, {"name": "counter5", "offset": 22, "type": "u32"}],
+    "DESCRIPTOR_FRAGMENT": [{"name": "descriptor_generation", "offset": 0, "type": "u16"}, {"name": "interface_number", "offset": 2, "type": "u8"}, {"name": "reserved", "offset": 3, "type": "u8", "reserved": true}, {"name": "offset", "offset": 4, "type": "u16"}, {"name": "total", "offset": 6, "type": "u16"}, {"name": "data", "offset": 8, "type": "bytes", "count": 18}],
+    "IDLE": [{"name": "reserved", "offset": 0, "type": "bytes", "count": 26, "reserved": true}],
+    "LINK_STATUS": [{"name": "usb_frame", "offset": 0, "type": "u16"}, {"name": "usb_subframe", "offset": 2, "type": "u8"}, {"name": "link_flags", "offset": 3, "type": "u8"}, {"name": "descriptor_generation", "offset": 4, "type": "u16"}, {"name": "active_map_generation", "offset": 6, "type": "u16"}, {"name": "slot_counter", "offset": 8, "type": "u32"}, {"name": "native_report_count", "offset": 12, "type": "u32"}, {"name": "fault_flags", "offset": 16, "type": "u32"}, {"name": "last_rx_sequence", "offset": 20, "type": "u8"}, {"name": "reserved", "offset": 21, "type": "bytes", "count": 5, "reserved": true}],
+    "MAP_BEGIN": [{"name": "descriptor_generation", "offset": 0, "type": "u16"}, {"name": "map_generation", "offset": 2, "type": "u16"}, {"name": "entry_count", "offset": 4, "type": "u8"}, {"name": "layout_count", "offset": 5, "type": "u8"}, {"name": "flags", "offset": 6, "type": "u16"}, {"name": "entries_crc32", "offset": 8, "type": "u32"}, {"name": "reserved", "offset": 12, "type": "bytes", "count": 14, "reserved": true}],
+    "MAP_COMMIT": [{"name": "descriptor_generation", "offset": 0, "type": "u16"}, {"name": "map_generation", "offset": 2, "type": "u16"}, {"name": "entry_count", "offset": 4, "type": "u8"}, {"name": "layout_count", "offset": 5, "type": "u8"}, {"name": "flags", "offset": 6, "type": "u16"}, {"name": "entries_crc32", "offset": 8, "type": "u32"}, {"name": "reserved", "offset": 12, "type": "bytes", "count": 14, "reserved": true}],
+    "MAP_ENTRY": [{"name": "descriptor_generation", "offset": 0, "type": "u16"}, {"name": "map_generation", "offset": 2, "type": "u16"}, {"name": "entry_index", "offset": 4, "type": "u8"}, {"name": "interface_number", "offset": 5, "type": "u8"}, {"name": "endpoint_number", "offset": 6, "type": "u8"}, {"name": "report_id", "offset": 7, "type": "u8"}, {"name": "usage_page", "offset": 8, "type": "u16"}, {"name": "usage", "offset": 10, "type": "u16"}, {"name": "bit_offset", "offset": 12, "type": "u16"}, {"name": "bit_width", "offset": 14, "type": "u8"}, {"name": "flags", "offset": 15, "type": "u8"}, {"name": "logical_minimum", "offset": 16, "type": "i32"}, {"name": "logical_maximum", "offset": 20, "type": "i32"}, {"name": "report_length", "offset": 24, "type": "u8"}, {"name": "reserved", "offset": 25, "type": "u8", "reserved": true}],
+    "MAP_STATUS": [{"name": "descriptor_generation", "offset": 0, "type": "u16"}, {"name": "map_generation", "offset": 2, "type": "u16"}, {"name": "active_map_generation", "offset": 4, "type": "u16"}, {"name": "entry_index", "offset": 6, "type": "u8"}, {"name": "status", "offset": 7, "type": "u8"}, {"name": "error", "offset": 8, "type": "u8"}, {"name": "flags", "offset": 9, "type": "u8"}, {"name": "entries_crc32", "offset": 10, "type": "u32"}, {"name": "reserved", "offset": 14, "type": "bytes", "count": 12, "reserved": true}],
+    "PHYSICAL_MASK": [{"name": "lease_generation", "offset": 0, "type": "u16"}, {"name": "map_generation", "offset": 2, "type": "u16"}, {"name": "command_sequence", "offset": 4, "type": "u16"}, {"name": "target_frame", "offset": 6, "type": "u16"}, {"name": "interface_number", "offset": 8, "type": "u8"}, {"name": "endpoint_number", "offset": 9, "type": "u8"}, {"name": "report_id", "offset": 10, "type": "u8"}, {"name": "flags", "offset": 11, "type": "u8"}, {"name": "button_mask", "offset": 12, "type": "u64"}, {"name": "reserved", "offset": 20, "type": "bytes", "count": 6, "reserved": true}],
+    "RELATIVE": [{"name": "lease_generation", "offset": 0, "type": "u16"}, {"name": "map_generation", "offset": 2, "type": "u16"}, {"name": "command_sequence", "offset": 4, "type": "u16"}, {"name": "target_frame", "offset": 6, "type": "u16"}, {"name": "interface_number", "offset": 8, "type": "u8"}, {"name": "endpoint_number", "offset": 9, "type": "u8"}, {"name": "report_id", "offset": 10, "type": "u8"}, {"name": "flags", "offset": 11, "type": "u8"}, {"name": "x", "offset": 12, "type": "i16"}, {"name": "y", "offset": 14, "type": "i16"}, {"name": "wheel", "offset": 16, "type": "i16"}, {"name": "pan", "offset": 18, "type": "i16"}, {"name": "hold_reports", "offset": 20, "type": "u16"}, {"name": "reserved", "offset": 22, "type": "u32", "reserved": true}],
+    "REPORT_FRAGMENT": [{"name": "descriptor_generation", "offset": 0, "type": "u16"}, {"name": "interface_number", "offset": 2, "type": "u8"}, {"name": "endpoint_number", "offset": 3, "type": "u8"}, {"name": "report_id", "offset": 4, "type": "u8"}, {"name": "offset", "offset": 5, "type": "u16"}, {"name": "total", "offset": 7, "type": "u16"}, {"name": "data", "offset": 9, "type": "bytes", "count": 17}],
+    "TELEMETRY_CONFIG": [{"name": "lease_generation", "offset": 0, "type": "u16"}, {"name": "command_sequence", "offset": 2, "type": "u16"}, {"name": "telemetry_mask", "offset": 4, "type": "u32"}, {"name": "interval_slots", "offset": 8, "type": "u16"}, {"name": "report_sample_divisor", "offset": 10, "type": "u16"}, {"name": "counter_page", "offset": 12, "type": "u8"}, {"name": "flags", "offset": 13, "type": "u8"}, {"name": "reserved", "offset": 14, "type": "bytes", "count": 12, "reserved": true}]
+  }
+}

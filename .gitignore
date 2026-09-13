@@ -1,0 +1,50 @@
+# Python bytecode and packaging
+*.egg-info/
+*.py[cod]
+__pycache__/
+.venv/
+build/
+dist/
+
+# Test, lint, and benchmark caches
+.benchmarks/
+.pytest_cache/
+.ruff_cache/
+
+# Gateware build products (Amaranth / Yosys / nextpnr)
+*.bit
+*.il
+*.vcd
+
+# Firmware build products. Sources and linker scripts are tracked; build
+# output is not, including *.hex. A committed image goes stale silently, and
+# this tree builds diagnostic variants (see DIAG_SEND_EVERY in
+# firmware/teensy_hs_mouse/Makefile) that are indistinguishable from the
+# normal instrument once they are a binary. Build it; it takes seconds.
+firmware/**/*.d
+firmware/**/*.elf
+firmware/**/*.hex
+firmware/**/*.map
+firmware/**/*.o
+firmware/**/.build-defines
+
+# AI assistant workspaces: planning specs/plans, session memory, and
+# tool-local settings. Kept on disk, never tracked.
+.claude/settings.local.json
+.codebase-memory/
+.remember/
+.superpowers/
+docs/superpowers/
+
+# Local engineering history: dated hardware validation runs and
+# point-in-time investigation notes. Kept on disk, not published.
+docs/BRINGUP_LOG.md
+docs/handoffs/
+
+# Editor and OS droppings
+*.bak
+*.orig
+*.rej
+*.swp
+*~
+.DS_Store

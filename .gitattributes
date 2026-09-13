@@ -1,0 +1,14 @@
+# Preserve byte-exact imported CH32H417 platform and WCH vendor files.
+# Handwritten firmware sources remain subject to the repository whitespace gate.
+firmware/ch32h417/core/link_v3f.ld -whitespace
+firmware/ch32h417/core/link_v5f.ld -whitespace
+firmware/ch32h417/core/startup_v3f.S -whitespace
+firmware/ch32h417/core/startup_v5f.S -whitespace
+firmware/ch32h417/core/system_ch32h417.c -whitespace
+firmware/ch32h417/core/system_ch32h417.h -whitespace
+firmware/ch32h417/core/timebase.c -whitespace
+firmware/ch32h417/core/timebase.h -whitespace
+firmware/ch32h417/include/ch32h417_conf.h -whitespace
+firmware/ch32h417/include/ch32h417_it.h -whitespace
+firmware/ch32h417/include/ch32h417_port.h -whitespace
+firmware/ch32h417/vendor/** -whitespace

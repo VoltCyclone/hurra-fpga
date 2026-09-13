@@ -1,0 +1,139 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Everything that needs nothing but Python. This is the gate that matters:
+  # the test suite is Amaranth simulation end to end and needs no hardware.
+  test:
+    name: lint + tests (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e '.[dev]'
+      - name: ruff check
+        run: ruff check src tests
+      - name: ruff format --check
+        run: ruff format --check src tests
+      - name: pytest
+        run: pytest -q
+      - name: emit host RTLIL
+        run: PYTHONPATH=src python -m hurra_cynthion.gateware --rtlil build/host.il
+      - name: build wheel and sdist
+        run: |
+          python -m pip install build
+          python -m build
+
+  # The CH32 unit tests compile for the host (HOST_CC, default cc), so they
+  # need no cross toolchain -- worth a job of their own rather than hiding
+  # behind the firmware build, which does.
+  firmware-host-tests:
+    name: CH32 host unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: make firmware-test
+        run: make firmware-test
+
+  # Cross-compiled CH32 image plus its image checks. The Makefile probes for
+  # riscv-none-elf-gcc on PATH and falls back to an xPack install path.
+  firmware-ch32:
+    name: CH32 firmware build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: install riscv-none-elf-gcc
+        run: |
+          npm install -g @xpack-dev-tools/riscv-none-elf-gcc@latest
+          echo "$(npm root -g)/@xpack-dev-tools/riscv-none-elf-gcc/.content/bin" >> "$GITHUB_PATH"
+      - run: riscv-none-elf-gcc --version
+      - name: make firmware
+        run: make firmware
+      - name: make firmware-check
+        run: make firmware-check
+
+  # The synthetic High Speed HID device used as a test instrument.
+  firmware-teensy:
+    name: Teensy test instrument build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install arm-none-eabi-gcc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-none-eabi
+      - name: build
+        run: make -C firmware/teensy_hs_mouse TOOLCHAIN_BIN=/usr/bin
+      - name: build a diagnostic variant
+        run: |
+          make -C firmware/teensy_hs_mouse clean
+          make -C firmware/teensy_hs_mouse TOOLCHAIN_BIN=/usr/bin DIAG_SEND_EVERY=8
+
+  # The real regression: place and route on the pinned seed, and fail if the
+  # 60 MHz ULPI domain does not close. nextpnr writes no bitstream on a timing
+  # failure, so the artefact existing is the pass signal -- but the log line is
+  # checked too, because a silent drop in margin is worth seeing in the diff.
+  gateware:
+    name: bitstream (ECP5, pinned seed)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - uses: YosysHQ/setup-oss-cad-suite@v3
+        with:
+          osscadsuite-version: "2025-01-01"
+      - run: python -m pip install -e '.[dev]'
+      - name: yosys and nextpnr versions
+        run: |
+          which yosys nextpnr-ecp5 ecppack
+          yosys -V
+          nextpnr-ecp5 --version
+      - name: build bitstream
+        run: |
+          LUNA_PLATFORM=cynthion.gateware.platform:CynthionPlatformRev1D4 \
+            make build
+      - name: report timing
+        if: always()
+        run: |
+          # top.tim carries four "Max frequency" lines (two clocks x
+          # placement-estimate and post-routing); the usb domain's post-routing
+          # result is the third.
+          if [ -f build/top.tim ]; then
+            grep "Max frequency for clock" build/top.tim || true
+          fi
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: bitstream
+          path: build/hurra-cynthion.bit
+          if-no-files-found: error

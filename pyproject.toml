@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hurra-cynthion"
+version = "0.1.0"
+description = "Bounded full-speed USB mouse host gateware for Cynthion r1.4"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = [
+    "amaranth==0.5.7",
+    "cynthion==0.2.3",
+    "luna-usb==0.2.2",
+    "usb-protocol==0.9.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "build==1.2.2.post1",
+    "pytest==9.0.1",
+    "ruff==0.8.1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hurra_cynthion"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+pythonpath = ["src"]
+filterwarnings = [
+    # LUNA 0.2.2 is pinned and still imports Amaranth APIs deprecated for 0.6.
+    "ignore:instead of .*:DeprecationWarning:luna\\..*",
+    "ignore:the `amaranth.lib.coding` module .*:DeprecationWarning:luna\\..*",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "SIM", "UP"]
