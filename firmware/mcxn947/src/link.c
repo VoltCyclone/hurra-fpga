@@ -188,8 +188,15 @@ static uint32_t s_last_fault_sr;
 
 static void link_dma_rings_install(void);
 
+// Last value driven onto the line. `mcu_ready` is an output with no readback
+// path in this design -- GPIO_PortSet/Clear are write-only register writes --
+// so the only way the console can report the link's ready state is for the
+// one function that drives it to remember what it drove.
+static bool s_ready;
+
 void link_mcu_ready_set(bool ready)
 {
+    s_ready = ready;
     if (ready) {
         GPIO_PortSet(LINK_READY_GPIO, 1uL << LINK_READY_PIN);
     } else {
@@ -681,13 +688,21 @@ void EDMA_0_CH1_DriverIRQHandler(void)
 // link_demo_perturb_rx). The mechanism is NOT established, and a claim resting
 // on "the boundary is latched at CR[MEN]" should not be built on this.
 //
-// WHY THAT IS TOLERABLE: the wait is best-effort and does not have to be right.
-// If it misses, the framing monitor in link_poll() sees every retired slot fail
-// to parse and runs the section 4 ladder, which drops CR[MEN] and chooses a new
-// boundary. Measured doing exactly that on the bench -- a recovery whose own
-// re-arm landed mis-framed was detected and repaired 60 ms later, at a cost of
-// 480 bad slots, after which the link ran flat. Alignment converges rather than
-// depending on a lucky boot, which is the property that matters.
+// WHAT THE FRAMING MONITOR DOES AND DOES NOT BUY, corrected against the
+// 20-boot experiment that closed step 3 and superseded what stood here:
+//
+//   * A RECOVERY whose own re-arm lands mis-framed IS repaired. Measured on
+//     the bench -- detected and corrected 60 ms later at a cost of 480 bad
+//     slots, after which the link ran flat.
+//   * A BOOT that comes up mis-framed is NOT. Measured: the ladder ran ~220
+//     times against one such boot and never repaired it. It needs a reset.
+//     See PROVENANCE.md and design doc section 10.
+//
+// So the wait is not best-effort scaffolding backed by a converging monitor,
+// and the sentence that used to end this block -- "alignment converges rather
+// than depending on a lucky boot" -- was measured false. The wait is the only
+// mitigation there is for the boot case (20/20 with it, 16/20 without), and
+// the monitor's role there is to NAME the condition, not to fix it.
 #define LINK_GAP_WAIT_SPINS 4000000u
 
 // Wait for chip select to be ASSERTED and then RELEASED, so what follows is the
@@ -726,9 +741,14 @@ static void link_spi_enable_aligned(void)
     // -DLINK_SKIP_GAP_WAIT builds the control arm: enable the module without
     // waiting for the inter-frame gap. The gap wait is a HYPOTHESIS about the
     // boot-random frame offset, measured at 7/7 clean with it and 1/2 without,
-    // and n=2 is not a prior. This switch exists to get one. It is safe to run
-    // because link_retire_framing_lost() + the section 4 ladder repair a
-    // mis-framed boot within ~60 ms, which is itself measured.
+    // and n=2 is not a prior. This switch exists to get one -- and it has now
+    // given one: 20/20 clean with the wait against 16/20 without.
+    //
+    // The line that used to stand here called the control arm safe "because
+    // link_retire_framing_lost() + the section 4 ladder repair a mis-framed
+    // boot within ~60 ms". That was measured false; the ladder does not repair
+    // a mis-framed boot at all. A control-arm boot that comes up offset stays
+    // offset until it is reset. The switch is safe to build, not to rely on.
 #if !defined(LINK_SKIP_GAP_WAIT)
     if (!link_wait_for_interframe_gap()) {
         s_gap_wait_timeouts++;
@@ -1143,6 +1163,36 @@ static bool link_framing_poll(void)
     return lost;
 }
 
+// --- Snapshots for the console ---------------------------------------------
+//
+// Both mask the retirement interrupt for the copy. See link.h: the ISR runs
+// at 8 kHz, so an unmasked field-by-field read would splice several slots'
+// worth of counters into one apparently coherent sample.
+
+void link_counters_read(link_retire_counters_t *out)
+{
+    NVIC_DisableIRQ(EDMA_0_CH1_IRQn);
+    *out = *link_retire_counters();
+    NVIC_EnableIRQ(EDMA_0_CH1_IRQn);
+}
+
+void link_diagnostics_read(link_diagnostics_t *out)
+{
+    NVIC_DisableIRQ(EDMA_0_CH1_IRQn);
+    out->isr_entries = s_isr_entries;
+    out->retire_stalls = s_retire_stalls;
+    out->daddr_out_of_range = s_daddr_out_of_range;
+    NVIC_EnableIRQ(EDMA_0_CH1_IRQn);
+
+    // The rest are foreground-only: link_poll() is their sole writer and it
+    // is the same context the console runs in, so masking would assert
+    // nothing.
+    out->recoveries = s_recoveries;
+    out->framing_recoveries = s_framing_recoveries;
+    out->gap_wait_timeouts = s_gap_wait_timeouts;
+    out->ready = s_ready;
+}
+
 // --- Periodic report -------------------------------------------------------
 
 #define LINK_REPORT_MS 1000u
@@ -1287,7 +1337,7 @@ void link_init(void)
 
     link_mcu_ready_set(true);
 
-    dbg_puts("\n==== hurra mcxn947 step3: RX retirement + ERR051588 ====\n");
+    dbg_puts("\n==== hurra mcxn947 step4: link + CDC console ====\n");
 
     dbg_puts("-- clocking --\n");
     link_show("PLLCLKDIVSEL ", SYSCON->PLLCLKDIVSEL);

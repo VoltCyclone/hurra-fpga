@@ -52,6 +52,7 @@
 #include <stdint.h>
 
 #include "injection_wire.h"
+#include "link_retire.h"
 #include "spi_frame.h"
 
 // Banks per direction. Two, so the ring alternates and the CPU can touch the
@@ -103,6 +104,36 @@ bool link_slot_is_inert_idle(const uint8_t slot[INJ_FRAME_SIZE]);
 
 // Successor bank in the ring.
 uint8_t link_next_bank(uint8_t bank);
+
+// --- Diagnostics the FPGA cannot see ---------------------------------------
+//
+// The counters in link_retire.h mirror the FPGA's own by name and are the
+// half of the picture both ends can state. These are the other half: things
+// only this side of the wire knows, and the ones a `stats` reader needs in
+// order to tell "the FPGA is quiet" from "we stopped listening".
+//
+// Split out rather than added to link_retire_counters_t because that struct
+// is the mirror, and putting an MCU-only field in it would make a
+// field-by-field comparison against the FPGA read as a mismatch.
+typedef struct {
+    uint32_t isr_entries;         // eDMA0 channel 1 major-loop ISR entries.
+    uint32_t retire_stalls;       // ISR entries that retired no bank.
+    uint32_t daddr_out_of_range;  // TCD destination outside the RX bank array.
+    uint32_t recoveries;          // ERR051588 ladder runs, all causes.
+    uint32_t framing_recoveries;  // Of those, ones triggered by lost framing.
+    uint32_t gap_wait_timeouts;   // link_spi_enable_aligned() gave up waiting.
+    bool ready;                   // Last value driven onto `mcu_ready`.
+} link_diagnostics_t;
+
+// Both reads below mask the retirement interrupt for the duration of the
+// copy. That is not defensive tidiness: the ISR advances these at 8 kHz, and
+// a console that formatted them field by field straight from the live
+// structures would print a sample from several different slots and call it
+// one -- the same class of manufactured evidence link_retire_last_slot()
+// documents, and it would be far harder to spot here because every individual
+// number would look plausible.
+void link_diagnostics_read(link_diagnostics_t *out);
+void link_counters_read(link_retire_counters_t *out);
 
 // --- Hardware entry points (target only) -----------------------------------
 

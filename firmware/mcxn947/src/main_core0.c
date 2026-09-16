@@ -4,10 +4,17 @@
 // Nothing here touches MMIO -- platform.c and heartbeat.c own that behind their
 // guards -- so this file is portable by default, per the guard-polarity rule.
 //
-// Deliberately absent, and each arriving with its own step: the TinyUSB CDC
-// console (step 4), the CPU1 release and the shared window (step 5), the map
-// uploader (step 8) and the watchdog (step 9). TX is still permanently IDLE:
-// originating a command is step 8/9, not this one.
+// Deliberately absent, and each arriving with its own step: the CPU1 release
+// and the shared window (step 5), the map uploader (step 8) and the watchdog
+// (step 9). TX is still permanently IDLE: originating a command is step 8/9,
+// not this one.
+//
+// The console arrived at step 4 and its placement in this function IS the
+// safety invariant. Design doc section 4(a): `mcu_ready` is raised at rung 4
+// and USB is brought up at rung 6, never the other way round. link_init()
+// raises the line as its last act, so usb_console_init() below is rung 6 and
+// the ordering holds by construction -- but only as long as the two calls stay
+// in this order. Nothing in the build checks it; this comment is the check.
 //
 // The foreground loop is no longer empty, but it is still not on any deadline.
 // Retirement itself runs in the eDMA0 channel 1 ISR, where the 125 us slot
@@ -22,6 +29,7 @@
 #include "heartbeat.h"
 #include "link.h"
 #include "platform.h"
+#include "usb_console.h"
 
 int main(void)
 {
@@ -34,11 +42,23 @@ int main(void)
     // inside is the safety invariant's boot ladder; see link.c.
     link_init();
 
-    // SysTick_Handler blinks; the eDMA0 channel 1 ISR retires. This loop only
-    // services the things that tolerate latency. A plain spin rather than
-    // __WFI(): WFI is a CMSIS intrinsic and would pull a vendor header into the
-    // one file that is meant to have none.
+    // Rung 6. After the link, always. A host that never appears, a J11 that is
+    // not plugged in, a PHY PLL that never locks -- none of them can reach the
+    // link from here, because the link was already running when this was
+    // called.
+    usb_console_init();
+
+    // SysTick_Handler blinks; the eDMA0 channel 1 ISR retires; the USB1_HS ISR
+    // moves packets. This loop only services the things that tolerate latency.
+    // A plain spin rather than __WFI(): WFI is a CMSIS intrinsic and would pull
+    // a vendor header into the one file that is meant to have none.
+    //
+    // Design doc section 3 is measured here rather than argued: CPU0 has a
+    // 107.93 us staging window per slot, not a latency deadline, so a console
+    // sharing this loop is affordable. Step 4's third gate saturates the
+    // console and re-reads the FPGA's counters to check that claim.
     for (;;) {
         link_poll();
+        usb_console_poll();
     }
 }

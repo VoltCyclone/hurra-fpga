@@ -13,6 +13,11 @@ firmware/ch32h417/include/ch32h417_it.h -whitespace
 firmware/ch32h417/include/ch32h417_port.h -whitespace
 firmware/ch32h417/vendor/** -whitespace
 
-# Preserve byte-exact imported MCXN947 files: the MCUXpresso SDK subset and
-# the NXP hal_nxp linker scripts and startup. See firmware/mcxn947/PROVENANCE.md.
+# Preserve byte-exact imported MCXN947 files. Three upstreams live under this
+# one glob and each carries its own licence, so the exemption is stated once
+# and the provenance is stated per-upstream:
+#   vendor/mcux-sdk  MCUXpresso SDK 24.12.00 subset  BSD-3-Clause (+ Apache-2.0 CMSIS)
+#   vendor/hal_nxp   linker scripts and startup      BSD-3-Clause
+#   vendor/tinyusb   hathach/tinyusb 0.20.0 subset   MIT
+# See firmware/mcxn947/PROVENANCE.md.
 firmware/mcxn947/vendor/** -whitespace

@@ -1,12 +1,13 @@
-# FRDM-MCXN947 controller firmware -- migration step 3: CPU0 only.
+# FRDM-MCXN947 controller firmware -- migration step 4: CPU0 only.
 #
 # Builds ONE image. It brings the part to overdrive + 150 MHz, arms a 1 kHz
 # SysTick, blinks the green LED, brings up LPSPI6 as an SPI slave on
 # LP_FLEXCOMM6 fed by a self-loading eDMA0 scatter-gather ring that transmits a
 # permanently IDLE slot, retires every received slot through the portable
-# transport in src/link_retire.c, and detects and recovers ERR051588 through
-# the ladder in src/link_recovery.c. There is no USB, no display and no CPU1
-# image yet; each arrives with its own step in
+# transport in src/link_retire.c, detects and recovers ERR051588 through the
+# ladder in src/link_recovery.c, and -- new at step 4 -- presents a TinyUSB CDC
+# console on the ChipIdea High Speed controller behind J11. There is no display
+# and no CPU1 image yet; each arrives with its own step in
 # docs/MCXN947_CONTROLLER.md section 9.
 #
 # `make all` is not the gate. --gc-sections will silently discard a translation
@@ -46,6 +47,7 @@ DEFINES := -DCPU_MCXN947VDF_cm33_core0 -DMCXN947
 
 VENDOR_SDK := vendor/mcux-sdk
 VENDOR_HAL := vendor/hal_nxp
+VENDOR_TUSB := vendor/tinyusb
 
 LINKER_SCRIPT := $(VENDOR_HAL)/devices/MCXN947/gcc/MCXN947_cm33_core0_flash.ld
 STARTUP       := $(VENDOR_HAL)/devices/MCXN947/gcc/startup_MCXN947_cm33_core0.S
@@ -60,7 +62,8 @@ INCLUDES := -Isrc -isystem include \
 	-isystem $(VENDOR_SDK)/devices/MCXN947 \
 	-isystem $(VENDOR_SDK)/devices/MCXN947/periph \
 	-isystem $(VENDOR_SDK)/devices/MCXN947/drivers \
-	-isystem $(VENDOR_SDK)/boards/frdmmcxn947/project_template
+	-isystem $(VENDOR_SDK)/boards/frdmmcxn947/project_template \
+	-isystem $(VENDOR_TUSB)/src
 
 COMMON_CFLAGS := $(ARCH) $(DEFINES) $(INCLUDES) $(EXTRA_CFLAGS) -Os -ffunction-sections \
 	-fdata-sections -fno-common
@@ -158,10 +161,25 @@ LDFLAGS := $(ARCH) -T$(LINKER_SCRIPT) -Wl,--gc-sections \
 # the Driver name, and it is the Driver name that startup_MCXN947_cm33_core0.S
 # `.set`s to DefaultISR -- so rooting the vector name would ask "is it defined?"
 # of the vendor's own trampoline and always get yes.
+#
+# Step 4 adds the USB controller vector, and it is the same shape again: the
+# table names USB1_HS_IRQHandler, which is a weak trampoline branching to
+# USB1_HS_DriverIRQHandler, and it is the Driver name that startup
+# `.set`s to DefaultISR. Rooting the table name would ask "is it defined?" of
+# the vendor's own trampoline and always get yes, while the real handler --
+# the only thing that ever calls tusb_int_handler() -- had been discarded. The
+# symptom would be a device that never enumerates at all, with a perfectly
+# clean build.
+#
+# Note the controller is USB1_HS, not USB0. UM12018: "only the HS USB
+# controller and PHY interface is used and it is connected to the USB Type-C
+# connector (J11)". USB0_FS is routed nowhere on this board, so USB0_FS_IRQn
+# (vector 50) is not the vector this design uses; USB1_HS_IRQn is vector 67.
 CORE0_RETAIN := \
 	main=build/core0/main_core0.o \
 	SysTick_Handler=build/core0/heartbeat.o \
-	EDMA_0_CH1_DriverIRQHandler=build/core0/link.o
+	EDMA_0_CH1_DriverIRQHandler=build/core0/link.o \
+	USB1_HS_DriverIRQHandler=build/core0/usb_console.o
 
 retain_symbol = $(word 1,$(subst =, ,$(1)))
 
@@ -211,10 +229,20 @@ CORE0_OBJECTS := \
 	build/core0/link_retire.o \
 	build/core0/link_recovery.o \
 	build/core0/link.o \
+	build/core0/console.o \
+	build/core0/usb_descriptors.o \
+	build/core0/usb_console.o \
+	build/core0/tusb.o \
+	build/core0/tusb_fifo.o \
+	build/core0/usbd.o \
+	build/core0/usbd_control.o \
+	build/core0/cdc_device.o \
+	build/core0/dcd_ci_hs.o \
 	build/core0/main_core0.o
 
 .PHONY: all check check-copies clean flash probes test test-platform \
-	test-heartbeat test-link test-link-retire test-link-recovery test-spi-frame
+	test-heartbeat test-link test-link-retire test-link-recovery test-spi-frame \
+	test-console
 
 all: build/hurra-mcxn947-core0.bin
 
@@ -252,9 +280,70 @@ build/core0/link_retire.o: src/link_retire.c src/link_retire.h src/spi_frame.h \
 build/core0/link_recovery.o: src/link_recovery.c src/link_recovery.h | build/core0
 	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
-# Bring-up diagnostic UART. Retained: step 3's method is reading counters out
-# of a running target, which the LinkServer debugger cannot do (it stalls the
-# boot ROM on attach). It goes when step 4's TinyUSB CDC console replaces it.
+# --- the step-4 console ----------------------------------------------------
+#
+# console.c is the portable half and is host-tested below. It never sees a
+# TinyUSB header, which is what keeps that true -- note the absence of
+# $(VENDOR_TUSB) from its host recipe, and the Makefile rule at the top of this
+# file: if a host test ever needs -Ivendor, the module is mis-split.
+build/core0/console.o: src/console.c src/console.h | build/core0
+	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
+
+# The glue and the descriptor table. Both include tusb.h, so both are built
+# with GLUE_WARNINGS rather than APP_WARNINGS: -Wconversion fires inside the
+# vendored headers' own macros (TUD_CDC_DESCRIPTOR packs 16-bit fields with
+# U16_TO_U8S_LE, tu_htole16 and friends), and we may not edit those. Every
+# other warning in the app set still applies, including -Werror. The narrowing
+# is on the headers, not on this code.
+GLUE_WARNINGS := -std=c11 -Wall -Wextra -Werror -Wshadow
+
+build/core0/usb_descriptors.o: src/usb_descriptors.c src/tusb_config.h | build/core0
+	$(CC) $(COMMON_CFLAGS) $(GLUE_WARNINGS) -c $< -o $@
+
+build/core0/usb_console.o: src/usb_console.c src/usb_console.h src/console.h \
+		src/dbg_uart.h src/link.h src/link_retire.h src/platform.h \
+		src/tusb_config.h | build/core0
+	$(CC) $(COMMON_CFLAGS) $(GLUE_WARNINGS) -c $< -o $@
+
+# --- vendored TinyUSB ------------------------------------------------------
+#
+# Subset only; PROVENANCE.md lists every file and the git archive command that
+# produced it. The device stack, the CDC class and the ChipIdea HS device
+# controller driver -- no host stack, no other class, and specifically NOT
+# dcd_ci_fs.c: USB0_FS is routed nowhere on this board.
+#
+# COMMON_CFLAGS carries -DMCXN947, our guard macro, which TinyUSB does not
+# read; what TinyUSB switches on is CFG_TUSB_MCU, set in src/tusb_config.h and
+# reached through -Isrc.
+build/core0/tusb.o: $(VENDOR_TUSB)/src/tusb.c | build/core0
+	$(CC) $(COMMON_CFLAGS) $(VENDOR_WARNINGS) -c $< -o $@
+
+build/core0/tusb_fifo.o: $(VENDOR_TUSB)/src/common/tusb_fifo.c | build/core0
+	$(CC) $(COMMON_CFLAGS) $(VENDOR_WARNINGS) -c $< -o $@
+
+build/core0/usbd.o: $(VENDOR_TUSB)/src/device/usbd.c | build/core0
+	$(CC) $(COMMON_CFLAGS) $(VENDOR_WARNINGS) -c $< -o $@
+
+build/core0/usbd_control.o: $(VENDOR_TUSB)/src/device/usbd_control.c | build/core0
+	$(CC) $(COMMON_CFLAGS) $(VENDOR_WARNINGS) -c $< -o $@
+
+build/core0/cdc_device.o: $(VENDOR_TUSB)/src/class/cdc/cdc_device.c | build/core0
+	$(CC) $(COMMON_CFLAGS) $(VENDOR_WARNINGS) -c $< -o $@
+
+build/core0/dcd_ci_hs.o: $(VENDOR_TUSB)/src/portable/chipidea/ci_hs/dcd_ci_hs.c | build/core0
+	$(CC) $(COMMON_CFLAGS) $(VENDOR_WARNINGS) -c $< -o $@
+
+# Bring-up diagnostic UART. Retained deliberately THROUGH step 4, against the
+# note in dbg_uart.c saying it goes when the CDC console arrives.
+#
+# Two reasons, both measured rather than sentimental. The console is on the
+# USB the console is used to debug, so a USB fault takes out the instrument
+# exactly when it is needed -- the debug UART is on a different peripheral, a
+# different connector and a different host cable (MCU-Link VCOM on J17, not
+# J11). And step 4's own gates are boot-rate measurements against a 20% boot
+# hazard: the UART prints from link_init() onward, before USB enumeration has
+# even been attempted, so a boot that fails before enumeration is still
+# visible. It goes when there is a second independent channel, not before.
 build/core0/dbg_uart.o: src/dbg_uart.c src/dbg_uart.h | build/core0
 	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
@@ -328,7 +417,7 @@ check: all check-copies
 # grows MMIO outside its guard, the host build of it stops compiling here.
 
 test: test-platform test-heartbeat test-spi-frame test-link test-link-retire \
-	test-link-recovery
+	test-link-recovery test-console
 
 test-platform: build/host/platform_test
 	./build/host/platform_test
@@ -366,6 +455,16 @@ build/host/link_retire_test: test/link_retire_test.c src/link_retire.c src/spi_f
 
 test-link-recovery: build/host/link_recovery_test
 	./build/host/link_recovery_test
+
+# Note what is NOT on this recipe: -isystem $(VENDOR_TUSB)/src. The console is
+# one of the two modules design doc section 7 calls portable by construction,
+# and a TinyUSB include creeping into it would break this build rather than
+# pass unnoticed into the image.
+test-console: build/host/console_test
+	./build/host/console_test
+
+build/host/console_test: test/console_test.c src/console.c src/console.h | build/host
+	$(HOST_CC) $(APP_WARNINGS) -Isrc test/console_test.c src/console.c -o $@
 
 build/host/link_recovery_test: test/link_recovery_test.c src/link_recovery.c \
 		src/link_recovery.h | build/host

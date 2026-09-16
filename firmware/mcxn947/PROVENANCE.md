@@ -3,11 +3,12 @@
 Target: **FRDM-MCXN947** (MCXN947VDF, dual Cortex-M33), replacing the CH32H417 on
 the PMOD-A injection link. Design: `docs/MCXN947_CONTROLLER.md`.
 
-**This tree is at migration step 3 of that document's section 9** — CPU0 only:
+**This tree is at migration step 4 of that document's section 9** — CPU0 only:
 clock, blink, LPSPI6 as an SPI slave on LP_FLEXCOMM6 driven by a self-loading
 eDMA0 scatter-gather ring that transmits a permanently IDLE slot, retirement of
-every received slot through `src/link_retire.c`, and ERR051588 detection and
-recovery through `src/link_recovery.c`. There is no USB, no display and no CPU1
+every received slot through `src/link_retire.c`, ERR051588 detection and
+recovery through `src/link_recovery.c`, and a TinyUSB CDC console on the
+ChipIdea High Speed controller behind J11. There is no display and no CPU1
 image. What is *absent* is recorded here too, because "we did not vendor it yet"
 and "we decided not to vendor it" are different claims.
 
@@ -81,8 +82,25 @@ price of the guarantee.
 - **`fsl_edma_soc.c`** — imported at step 2, **removed at step 3**. Only
   `fsl_edma_soc.h` remains. See deviation 8; it is a collision, not a
   preference.
-- **`middleware/usb/phy/usb_phy.{c,h}`**, `boot_multicore_slave.c`, and the
-  ST7796S / DBI / FlexIO display stack. Steps 4, 5 and 7 respectively.
+- **`middleware/usb/phy/usb_phy.{c,h}` — REJECTED at step 4, not deferred.**
+  Design doc section 7 lists it as "the only file from `middleware/usb/`". It
+  cannot be that, and the dependency chain was measured rather than guessed:
+  `usb_phy.c`'s first include is `usb.h`, which it needs for three enumerators
+  (`kUSB_ControllerEhci0`, `kStatus_USB_Success`, `kStatus_USB_Error`), plus
+  `kUSB_ControllerIp3516Hs0/1` and `kUSB_ControllerLpcIp3511Hs0/1` in a branch
+  that is dead on this part. `middleware/usb/include/usb.h` in turn includes
+  `usb_misc.h`, `usb_spec.h` and `fsl_os_abstraction.h` — 944 lines of the NXP
+  USB stack's common headers and the OSA layer, both of which the same section
+  excludes by name. So vendoring "one file" would in fact vendor four headers
+  plus an OS abstraction, to obtain roughly forty lines of `USBPHY` register
+  writes.
+
+  Those writes are instead in `usb_console_hardware_init()` in
+  `src/usb_console.c`. See deviation 9 for why that is defensible rather than
+  a shortcut: two independent upstreams state the same sequence register for
+  register.
+- **`boot_multicore_slave.c`** and the ST7796S / DBI / FlexIO display stack.
+  Steps 5 and 7 respectively.
 - **`fsl_dbi_flexio_smartdma`** — rejected outright, not deferred. SmartDMA is a
   third bus master and admitting it would put an engine nobody has reasoned
   about against the link's arbitration budget (design doc section 7).
@@ -148,6 +166,87 @@ Three naming divergences, all at slots this firmware does not use:
   QDC interrupt must define the `ENC*` name**, not the one the enum suggests.
 - Slots 165-166: hal_nxp has `SM3_IRQHandler` / `TRNG0_IRQHandler`; 24.12.00 has
   them reserved.
+
+---
+
+## Upstream 3 — hathach/tinyusb
+
+- **Tag `0.20.0`**, commit `3af1bec1a9161ee8dec29487831f7ac7ade9e189`,
+  2025-11-20. A real release tag, as design doc section 7 requires — not the
+  commit pin its fallback wording allows for.
+- **Licence: MIT** (`vendor/tinyusb/LICENSE`). **This is the third licence in
+  this tree**, alongside the SDK's BSD-3-Clause and CMSIS's Apache-2.0. Any
+  distribution of this firmware now has to carry all three.
+- **Copied from:** the local clone at `~/code/tinyusb`, read-only, with
+  `git archive`. That clone's working tree was on `0.18.0-309-g2a364ca27` — a
+  mid-development merge, not a release — and it was left exactly where it was.
+  No checkout, no worktree, no fetch.
+
+### Why 0.20.0
+
+It is the newest release tag in that clone (0.19.0 is 2025-10-06, 0.20.0 is
+2025-11-20) and the clone's own HEAD is an ancestor of it, so pinning forward
+to it is a fast-forward rather than a jump onto an unrelated line. All three
+tags carry `src/portable/chipidea/ci_hs/ci_hs_mcx.h`, so MCX HS support is not
+what distinguishes them; taking the newest release is simply the fewest known
+bugs. Nothing in this firmware depends on a 0.20.0-only API.
+
+### The extraction, reproducibly
+
+Run from anywhere; `$TUSB` is any clone that has the tag. It never writes to
+the clone.
+
+```sh
+TUSB=~/code/tinyusb
+cd firmware/mcxn947 && mkdir -p vendor/tinyusb
+git -C "$TUSB" archive --format=tar 0.20.0 \
+  LICENSE \
+  src/tusb.c src/tusb.h src/tusb_option.h \
+  src/common/tusb_common.h src/common/tusb_compiler.h src/common/tusb_debug.h \
+  src/common/tusb_fifo.c src/common/tusb_fifo.h src/common/tusb_mcu.h \
+  src/common/tusb_private.h src/common/tusb_types.h src/common/tusb_verify.h \
+  src/device/dcd.h src/device/usbd.c src/device/usbd.h \
+  src/device/usbd_control.c src/device/usbd_pvt.h \
+  src/class/cdc/cdc.h src/class/cdc/cdc_device.c src/class/cdc/cdc_device.h \
+  src/osal/osal.h src/osal/osal_none.h \
+  src/portable/chipidea/ci_hs/ci_hs_type.h \
+  src/portable/chipidea/ci_hs/ci_hs_mcx.h \
+  src/portable/chipidea/ci_hs/dcd_ci_hs.c \
+  | tar -x -C vendor/tinyusb
+```
+
+26 files, ~460 KB. The whole of `src/` is 182 files and 3.5 MB; a subset is
+taken for the same reason the SDK's drivers are — an unused vendored file is a
+file nobody has read — and unlike the SDK's `periph/`, nothing here is a
+generated header whose includes would break if pruned. Every include in the
+subset is either present or behind a `CFG_TU*` that `src/tusb_config.h` sets
+to 0.
+
+### Excluded from upstream 3, and why
+
+- **`src/portable/chipidea/ci_fs/`** — the Full Speed device controller.
+  Rejected, not deferred. UM12018: on FRDM-MCXN947 "only the HS USB controller
+  and PHY interface is used and it is connected to the USB Type-C connector
+  (J11)"; `USB0_FS` is routed to nothing. Note that `tusb_mcu.h` defines *both*
+  `TUP_USBIP_CHIPIDEA_FS` and `TUP_USBIP_CHIPIDEA_HS` for `OPT_MCU_MCXN9`, so
+  vendoring `dcd_ci_fs.c` as well would compile a second `dcd_init()` and the
+  link would fail — which is the good outcome, but it is worth knowing the
+  exclusion is load-bearing rather than tidiness.
+- **The host stack** (`src/host/`, `hcd_ci_hs.c`, every `*_host.c`) — this is a
+  device, and the FPGA owns the host role in this product.
+- **Every class except CDC** — HID, MSC, MIDI, audio, video, net, DFU, vendor,
+  bth, usbtmc, mtp. `CFG_TUD_*` is 0 for all of them, so they would compile to
+  nothing; they are absent so that nobody has to check.
+- **`src/typec/`** — USB-PD. The board's Type-C CC logic is a separate
+  PTN5150A in DRP mode (UM12018 Table 11); the MCU does not participate.
+- **All OSAL backends except `osal_none.h`** — no RTOS on CPU0.
+- **`hw/`, `examples/`, `tools/`, `docs/`, `test/`** — the whole of TinyUSB's
+  own build and board-support tree. `hw/bsp/mcx/family.c` was *read* while
+  writing `usb_console_hardware_init()` (deviation 9) and deliberately not
+  imported: it is board glue for TinyUSB's example build system, it configures
+  LEDs and a UART this firmware already owns, and it would arrive with
+  `board.h`, `pin_mux.c` and `clock_config.c` for a different clock profile
+  than ours.
 
 ---
 
@@ -258,7 +357,181 @@ Each is a change *we* made, or a vendor behaviour we deliberately did not adopt.
    copying. Should that ever stop being true, the changed file and its rationale
    belong in this list, as `core/startup_v5f.S` is recorded in the CH32 tree.
 
+9. **The USB HS clock and PHY sequence is hand-written in
+   `src/usb_console.c`, not vendored.** Follows directly from rejecting
+   `usb_phy.c` (see "Excluded from upstream 1"). What makes it defensible
+   rather than a guess is that **two independent upstreams state the same
+   sequence register for register**, and both were read before a line was
+   written:
+
+   - the SDK's own `USB_DeviceClockInit()` in
+     `boards/frdmmcxn947/usb_examples/usb_device_cdc_vcom/bm/cm33_core0/virtual_com.c`,
+     under `USB_DEVICE_CONFIG_EHCI`;
+   - `hw/bsp/mcx/family.c` in the pinned TinyUSB tree, under
+     `BOARD_TUD_RHPORT == 1 && CFG_TUSB_MCU == OPT_MCU_MCXN9`.
+
+   They agree on all of it: `SPC0->ACTIVE_VDELAY = 0x0500`; the `ACTIVE_CFG`
+   write; the `SCG0->LDOCSR` enable with the `TRIM_LOCK` key; the
+   `AHBCLKCTRLSET[2]` gates; the `SOSCCFG`/`SOSCCSR` crystal start and
+   `SOSCVLD` spin; `CLOCK_CTRL`'s `CLKIN_ENA` and `CLKIN_ENA_FM_USBH_LPT`;
+   `CLOCK_EnableUsbhsPhyPllClock(kCLOCK_Usbphy480M, 24000000)`;
+   `CLOCK_EnableUsbhsClock()`. TinyUSB then inlines exactly the body of
+   `USB_EhciPhyInit()` for a part with neither `FSL_FEATURE_SOC_ANATOP_COUNT`
+   nor `FSL_FEATURE_SOC_CCM_ANALOG_COUNT` — `TRIM_OVERRIDE_EN = 0x1f`,
+   `CTRL |= ENUTMILEVEL2 | ENUTMILEVEL3`, `PWD = 0`, then the `TX` trim. Ours
+   is that same body.
+
+   The PHY trim constants are NOT open-coded: `BOARD_USB_PHY_D_CAL` (0x04),
+   `BOARD_USB_PHY_TXCAL45DP` (0x07) and `BOARD_USB_PHY_TXCAL45DM` (0x07) come
+   from the already-vendored `project_template/board.h`, and
+   `BOARD_XTAL0_CLK_HZ` (24 MHz) from the already-vendored `clock_config.h`.
+   So the board-specific numbers stay in the vendored file that owns them.
+
+   **One interaction worth flagging to whoever touches power management next.**
+   That `ACTIVE_CFG` write happens *after* `platform_init()` has already taken
+   the part to overdrive for LPSPI6's 30 MHz slave ceiling. The levels it
+   writes — `DCDC_VDD_LVL(3)`, `CORELDO_VDD_LVL(3)` — are the same overdrive
+   levels, so it neither raises nor lowers the rail the link depends on; what
+   it adds is `SYSLDO_VDD_DS` and `ACTIVE_VDELAY` for the PHY's analogue
+   supply. If the core voltage policy is ever changed, these two writes have to
+   be reconciled, because design doc section 2 is explicit that a routine power
+   optimisation here silently becomes a protocol violation on the link.
+
+10. **`src/usb_descriptors.c` and `src/usb_console.c` are built with
+    `GLUE_WARNINGS`, not `APP_WARNINGS` — `-Wconversion` is dropped for those
+    two objects only.** Both include `tusb.h`, and the warning fires inside
+    TinyUSB's own descriptor macros (`TUD_CDC_DESCRIPTOR` packs 16-bit fields
+    through `U16_TO_U8S_LE`, and `tu_htole16` and friends narrow deliberately).
+    They are vendored and may not be edited, and `-isystem` does not suppress a
+    warning raised by a macro expanded in our translation unit. Everything else
+    in the app set still applies, `-Werror` included. Nothing in the app's own
+    code needed the relaxation; `src/console.c` — the half that carries the
+    logic — is built with the full `APP_WARNINGS` and has no TinyUSB include at
+    all.
+
+11. **The debug UART survives step 4.** `src/dbg_uart.c`'s own header says it
+    "goes when step 4's TinyUSB CDC console replaces it", and the Makefile
+    comment said the same. It stays, for two measured reasons rather than
+    sentiment. The console is carried on the USB that the console is the
+    instrument for debugging, so a USB fault removes the instrument exactly
+    when it is needed — while the UART is a different peripheral, a different
+    connector and a different host cable (MCU-Link VCOM on J17, not J11). And
+    step 4's gates are *boot-rate* measurements against the 20% boot hazard, so
+    the channel that reports them has to be live from `link_init()` onward,
+    before USB enumeration has even been attempted. `src/usb_console.c` prints
+    a one-line USB status report on that UART at 1 Hz for the same reason: a
+    console cannot report its own absence.
+
 ---
+
+## Findings while building step 4
+
+- **The USB vector on this board is `USB1_HS`, not `USB0`.** Worth stating
+  because "USB0" is the obvious guess and it is wrong twice over. UM12018: "only
+  the HS USB controller and PHY interface is used and it is connected to the USB
+  Type-C connector (J11)" — `USB0_FS` (vector 50) is routed to nothing on the
+  FRDM board. The vector that matters is `USB1_HS_IRQn`, 67, and the retention
+  root is `USB1_HS_DriverIRQHandler`, not the weak trampoline
+  `USB1_HS_IRQHandler` that the table actually names. `make check` reports it as
+  `T ... from usb_console.o`, which is what proves the real handler survived
+  `--gc-sections` rather than the vendor's `DefaultISR` alias.
+
+- **`rhport = 1`, and the reason it could have been wrong for a long time
+  without anyone noticing.** Design doc section 10 listed the number as "taken
+  from `ci_hs_mcx.h`, not re-read". Re-read at this step and confirmed three
+  ways in the pinned tree: `tusb_mcu.h` defines `TUP_RHPORT_HIGHSPEED 1` for
+  `OPT_MCU_MCXN9`; `dcd_ci_hs.c` selects `ci_hs_mcx.h` under a comment reading
+  "MCX N9 only port 1 use this controller"; and `hw/bsp/mcx/family.c` routes
+  `USB1_HS_IRQHandler` to `tusb_int_handler(1, true)`.
+
+  The trap is that **`ci_hs_mcx.h` ignores the number**. `CI_HS_REG(port)` casts
+  `(void) port` away and returns `_ci_controller[0]` unconditionally, and
+  `CI_DCD_INT_ENABLE`/`DISABLE` do the same. So the DCD would work with rhport
+  0; what breaks is everything above it — `TUD_OPT_RHPORT` is derived from which
+  `CFG_TUSB_RHPORTn_MODE` is defined, `tusb_int_handler()` range-checks against
+  `TUP_USBIP_CONTROLLER_NUM` (2, from `tusb_private.h`), and the ISR's argument
+  has to match the port the stack was initialised on. A wrong number here fails
+  silently in some configurations and loudly in others, which is the worst
+  combination for a value nobody has re-read.
+
+  Related: `tusb_init(rhport, NULL)` **ignores its own `rhport` argument** and
+  falls back to `TUD_OPT_RHPORT`. `usb_console_init()` therefore passes an
+  explicit `tusb_rhport_init_t` instead of `NULL`, so the number that gets used
+  is the number that was written down.
+
+- **The CH32 console has no command surface to carry over.** Design doc
+  section 7 says `usb_cdc_fs.c` "collapses to ~17 lines of TinyUSB glue plus
+  descriptors", with the implication that its *commands* migrate. They do not
+  exist: `firmware/ch32h417/src/usb_cdc_fs.c` is 644 lines of pure USBFS
+  endpoint transport with no parser, its header describes the channel as
+  carrying "kmbox-style injection text" that was never written, and
+  `main_v5f.c` calls only `cdc_fs_init()` / `cdc_fs_poll()` — it never reads a
+  byte out of the RX ring. The actual precedent for what a console should say
+  is step 3's `link_report()` on the debug UART, so `stats` deliberately mirrors
+  that line's field names and grouping.
+
+- **The collapse is real but it is not 17 lines, and the useful number is a
+  different one.** Counting non-comment, non-blank lines: the CH32's transport
+  was 427, all of them guarded. The MCXN947's is 179 guarded lines in
+  `usb_console.c`, of which about a third is the clock/PHY sequence and the
+  debug-UART status report rather than USB glue. The change that matters is not
+  the total but the split: 234 lines of console *logic* in `console.c` with
+  **zero** guarded lines and a host test covering every command, against a CH32
+  tree where the equivalent logic did not exist and could not have been tested
+  if it had.
+
+- **Two comments in `link.c` asserted something step 3's own experiment had
+  already disproved, and are corrected here.** Both said, in different words,
+  that the framing monitor plus the section 4 ladder repair a mis-framed boot —
+  one of them concluding "alignment converges rather than depending on a lucky
+  boot". The 20-boot experiment that closed step 3 found the opposite and this
+  file records it: the ladder ran ~220 times against one mis-framed boot without
+  ever repairing it, and such a boot needs a reset. The distinction the
+  corrected comments now draw is that a **recovery** whose own re-arm lands
+  mis-framed *is* repaired (measured: 60 ms, 480 bad slots) while a **boot**
+  that comes up mis-framed is not. No code changed; the mitigation
+  (`link_spi_enable_aligned()`) is untouched.
+
+- **Bringing the USB stack up does not disturb the link, measured before any
+  host was attached.** The step-2 gate re-run against the step-4 image with
+  `tusb_init()` returning ok and the controller running but no cable on J11:
+  `spi_slots` 8000.00/s, `spi_bad_sof` / `spi_bad_crc` / `spi_bad_length` /
+  `spi_bad_type` / `spi_queue_full` / `link_losses` / `rx_invalid` all zero over
+  a 14.9 s window, `link_ready=1`, `map_active=0`. This isolates the clock and
+  PHY bring-up — which touches `SPC0->ACTIVE_CFG`, the core rail the link's
+  30 MHz slave ceiling depends on — from anything the host does later.
+
+- **Any step-4 gate must be measured at least ~70 s after boot, because step 3's
+  provocation demo deliberately breaks the link before then.** `link_demo_step()`
+  arms at `LINK_DEMO_ARM_SLOTS` = 160,000 slots (~20 s at 8 kHz) and then runs
+  two provocation phases of `LINK_DEMO_HOLD_SLOTS` = 80,000 slots (~10 s) each.
+  Measured, the cost of getting this wrong: a 22.9 s FPGA window started ~30 s
+  after a reflash read `spi_bad_sof` at 173.97/s and `link_losses` 6 and
+  verdicted FAIL, while the identical measurement taken after the demo had
+  finished read 8000.30 slots/s with every counter flat over 27.9 s. Both are
+  correct readings of a board doing different things. This is the same trap as
+  step 3's classifier guarding on `ms > 35000`, and it now applies to the FPGA
+  side of the gate as well as the UART side.
+
+- **Adding the USB stack did not make the boot hazard worse: 6 of 6 clean.**
+  Design doc section 10's standing warning is that any single-boot measurement
+  on this board is one draw from a distribution with a 20% failure mode, so the
+  step-4 image was re-flashed and re-measured six times with the step-3 method
+  (`vcom.py` across the flash, anchored on the boot banner, verdict from the
+  last report inside the window and before the deliberate provocations at
+  ~41 s). Every trial: `sof=0 recov=0 framing=0`, ~109,310 slots retired in
+  13.7 s (7,964/s MCU-side), and `init=ok` on the USB line. Against step 3's
+  20/20 with the gap wait this is consistent and adds no evidence of harm,
+  though six trials cannot detect a small change in a 20% rate — it rules out a
+  gross regression, not a subtle one.
+
+- **`OTGSC[BSV]` is the field that tells you whether J11 has a cable**, and
+  having it on the debug UART is the difference between two diagnoses that look
+  identical from the host. With no cable: `otgsc=0x0021100a` — BSV (bit 11) = 0,
+  BSE (bit 12) = 1 — `PORTSC1[CCS] = 0`, and nothing appears in `/dev`. With a
+  firmware fault the host sees exactly the same nothing. The board does route
+  VBUS (UM12018 Table 11: J11 "provides the 5 V power supply (P5V_USB_HS)
+  source to the board"), so a 0 there is a bench condition, not a limitation.
 
 ## Findings while building step 3
 

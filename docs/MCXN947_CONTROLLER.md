@@ -413,16 +413,31 @@ chosen to vendor. What would change this: Ethernet coming off the deferred list
    `periph/` whole (pruning a generated header would violate byte-exactness),
    drivers (`fsl_common`, `clock`, `reset`, `spc`, `gpio`, `port`, `edma`,
    `lpspi`, `lpflexcomm`, `ctimer`, `wwdt`, `inputmux`, `flexio*`), CMSIS core,
-   `middleware/usb/phy/usb_phy.{c,h}` (the only file from `middleware/usb/`),
+   ~~`middleware/usb/phy/usb_phy.{c,h}` (the only file from `middleware/usb/`)~~,
    `project_template/{clock_config,board}.{c,h}`, `boot_multicore_slave.c`, and
    the display stack: `components/display/st7796s`,
    `components/video/display/dbi/fsl_dbi`, `.../dbi/flexio/fsl_dbi_flexio_edma`.
+
+   **`usb_phy.{c,h}` cannot be "the only file from `middleware/usb/`", and was
+   rejected at step 4 rather than taken.** Measured: `usb_phy.c`'s first
+   include is `usb.h`, which it needs for `kUSB_ControllerEhci0` and the
+   `kStatus_USB_*` returns; `middleware/usb/include/usb.h` includes
+   `usb_misc.h`, `usb_spec.h` and `fsl_os_abstraction.h`. So taking one file
+   takes 944 lines of the NXP USB stack's common headers plus the OSA layer —
+   both excluded by name below. `USB_EhciPhyInit()`'s whole contribution on
+   this part (no ANATOP, no CCM analog) is `TRIM_OVERRIDE_EN`, two `CTRL` bits,
+   `PWD = 0` and the `TX` trim, and the SDK's own `USB_DeviceClockInit()` and
+   TinyUSB's `hw/bsp/mcx/family.c` state the surrounding clock sequence
+   identically register for register. It is written out in
+   `src/usb_console.c`; see `firmware/mcxn947/PROVENANCE.md` deviation 9.
 2. **NXP hal_nxp / mcux-sdk classic layout** — for the four files SDK 24.12.00
    does **not** ship: `MCXN947_cm33_core{0,1}_flash.ld` and
    `startup_MCXN947_cm33_core{0,1}.S`. The SDK ships only the MCUXpresso-IDE
    managed-linker startup and *no* `.ld` at all. Available locally at
    `~/zephyrproject/modules/hal/nxp/mcux/mcux-sdk/devices/MCXN947/gcc/`.
 3. `hathach/tinyusb` at a pinned tag — **MIT**, a third licence in the tree.
+   Pinned at **`0.20.0`** (`3af1bec1`, 2025-11-20) at step 4: the newest
+   release tag, and a descendant of the local clone's own HEAD.
 
 **Excluded, deliberately:** the NXP USB device stack, FreeRTOS, lwIP, mbedTLS,
 LVGL/emWin, MCMgr (§8), and **`fsl_dbi_flexio_smartdma`** — SmartDMA is a *third*
@@ -670,6 +685,14 @@ display bugs.
   board as one draw from a distribution with a 20% failure mode — including
   every gate in §9 that was accepted on one boot.
 
+  **The mitigation is not complete.** All 40 experiment trials used a
+  flash-triggered reset. On 2026-09-16 a board running the default build — gap
+  wait present — came up mis-framed after a **VBUS power reset** (plugging in
+  J11), with the ladder looping past recovery #959 without repairing. So the
+  20/20 result does not generalise to power-on, and the hazard is reduced by an
+  unknown amount rather than removed. Whatever explains the mechanism has to
+  explain that too.
+
 - **Serial number source.** `SYSCON->DIEID` is *revision and die number*,
   identical across boards of the same revision — wrong for a serial. No UUID
   register in `PERI_SYSCON.h`; SDK `components/silicon_id/` has no MCXN947
@@ -716,7 +739,20 @@ display bugs.
   datasheet is not on disk. (S035/ST7796S may differ; confirm for the actual
   panel.)
 - **SJ20 pin 2-3** — one schematic glance before soldering to J3 pin 3.
-- **TinyUSB `rhport` numbering** — taken from `ci_hs_mcx.h`, not re-read.
+- ~~**TinyUSB `rhport` numbering**~~ — **RESOLVED at step 4: it is 1**, and
+  re-reading was worth doing for a reason other than the number. Three
+  independent statements in the pinned tree agree: `tusb_mcu.h` sets
+  `TUP_RHPORT_HIGHSPEED 1` for `OPT_MCU_MCXN9`; `dcd_ci_hs.c` selects
+  `ci_hs_mcx.h` under "MCX N9 only port 1 use this controller"; and
+  `hw/bsp/mcx/family.c` calls `tusb_int_handler(1, true)` from
+  `USB1_HS_IRQHandler`. But `ci_hs_mcx.h` itself **ignores the argument** —
+  `CI_HS_REG(port)` discards `port` and always returns controller index 0 — so
+  a wrong value would not fail where you would look for it. What depends on it
+  is `TUD_OPT_RHPORT`, `tusb_int_handler()`'s range check against
+  `TUP_USBIP_CONTROLLER_NUM`, and the ISR argument matching the port the stack
+  was initialised on. Related trap: `tusb_init(rhport, NULL)` ignores its own
+  `rhport` and falls back to `TUD_OPT_RHPORT`; pass an explicit
+  `tusb_rhport_init_t`.
 - ~~**`JLINK_DEVICE = MCXN947_M33_0`**~~ — **MOOT: the flow is LinkServer, not
   J-Link** (see §7). The name itself is confirmed correct, from the SDK's own
   debug configs, which also give `MCXN947_M33_1` for core1 — relevant only if
