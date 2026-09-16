@@ -1,10 +1,13 @@
-# FRDM-MCXN947 controller firmware -- migration step 2: CPU0 only.
+# FRDM-MCXN947 controller firmware -- migration step 3: CPU0 only.
 #
 # Builds ONE image. It brings the part to overdrive + 150 MHz, arms a 1 kHz
-# SysTick, blinks the green LED, and brings up LPSPI6 as an SPI slave on
+# SysTick, blinks the green LED, brings up LPSPI6 as an SPI slave on
 # LP_FLEXCOMM6 fed by a self-loading eDMA0 scatter-gather ring that transmits a
-# permanently IDLE slot. There is no USB, no display and no CPU1 image yet;
-# each arrives with its own step in docs/MCXN947_CONTROLLER.md section 9.
+# permanently IDLE slot, retires every received slot through the portable
+# transport in src/link_retire.c, and detects and recovers ERR051588 through
+# the ladder in src/link_recovery.c. There is no USB, no display and no CPU1
+# image yet; each arrives with its own step in
+# docs/MCXN947_CONTROLLER.md section 9.
 #
 # `make all` is not the gate. --gc-sections will silently discard a translation
 # unit that nothing references, and the vector table declares every handler
@@ -59,7 +62,7 @@ INCLUDES := -Isrc -isystem include \
 	-isystem $(VENDOR_SDK)/devices/MCXN947/drivers \
 	-isystem $(VENDOR_SDK)/boards/frdmmcxn947/project_template
 
-COMMON_CFLAGS := $(ARCH) $(DEFINES) $(INCLUDES) -Os -ffunction-sections \
+COMMON_CFLAGS := $(ARCH) $(DEFINES) $(INCLUDES) $(EXTRA_CFLAGS) -Os -ffunction-sections \
 	-fdata-sections -fno-common
 APP_WARNINGS      := -std=c11 -Wall -Wextra -Werror -Wconversion -Wshadow
 # Vendor sources are byte-exact imports and are not held to the app's warning
@@ -143,15 +146,22 @@ LDFLAGS := $(ARCH) -T$(LINKER_SCRIPT) -Wl,--gc-sections \
 # table alone retains it. The mechanism is established now, while the list is
 # two lines long, rather than during the step that first needs it.
 #
-# Step 2 adds no root. Its eDMA0 rings are scatter-gather and self-loading, so
-# the link needs no ISR at all -- and with no console yet, an MCU-side liveness
-# counter would be unreadable anyway. The retention roots that matter here are
-# the ones step 3 adds when it turns on INTMAJOR for the RX channel, and the
-# name to root then is `EDMA_0_CH1_DriverIRQHandler`, not the vector-table
-# `EDMA_0_CH1_IRQHandler`, which is only a weak trampoline.
+# Step 3 is where the mechanism stops being defensive. It turns INTMAJOR on for
+# the RX channel, so there is now an ISR whose loss would be silent: the rings
+# stay self-loading either way, so a dropped handler does not stop the link --
+# it stops RETIREMENT, and the symptom would be `slots` frozen at zero while
+# every FPGA counter stayed perfectly flat. Exactly the shape of failure the
+# gate exists for.
+#
+# The name rooted is `EDMA_0_CH1_DriverIRQHandler`, NOT the vector-table
+# `EDMA_0_CH1_IRQHandler`. The table entry is a weak trampoline that branches to
+# the Driver name, and it is the Driver name that startup_MCXN947_cm33_core0.S
+# `.set`s to DefaultISR -- so rooting the vector name would ask "is it defined?"
+# of the vendor's own trampoline and always get yes.
 CORE0_RETAIN := \
 	main=build/core0/main_core0.o \
-	SysTick_Handler=build/core0/heartbeat.o
+	SysTick_Handler=build/core0/heartbeat.o \
+	EDMA_0_CH1_DriverIRQHandler=build/core0/link.o
 
 retain_symbol = $(word 1,$(subst =, ,$(1)))
 
@@ -161,6 +171,29 @@ CORE0_RETAIN_LDFLAGS := \
 # Object list. This is the source of truth for what must survive into the
 # image; `make check` asserts that every one of these contributes at least one
 # symbol to core0.elf.
+#
+# fsl_edma_soc.c left this list at step 3 and its .c is no longer vendored --
+# only fsl_edma_soc.h, which fsl_edma.h includes. The file defines NOTHING but
+# 32 strong `EDMA_<n>_CH<m>_DriverIRQHandler` wrappers around
+# `EDMA_DriverIRQHandler(instance, channel)`, which dispatches through the
+# transactional handle array `s_EDMAHandle[][]` that this firmware never
+# populates. Two consequences, both settled by measurement rather than by
+# preference:
+#
+#   * it COLLIDES. Step 3's retirement ISR must be named
+#     EDMA_0_CH1_DriverIRQHandler (see CORE0_RETAIN), and the vendor's strong
+#     definition of that same symbol makes the link fail outright. That is the
+#     good failure -- the alternative name, EDMA_0_CH1_IRQHandler, would have
+#     silently displaced only the trampoline and left the other 31 in place.
+#   * it was never inert. `EDMA_HandleIRQ()` opens with `assert(handle !=
+#     NULL)`, assert is live in this image, and nosys.specs makes newlib's
+#     failure path hang rather than reset -- so every one of those 32 vectors
+#     was a latent hang behind any eDMA interrupt anyone later enabled. Step 2
+#     enabled none, so nothing showed.
+#
+# Dropping it also removes 31 handlers the image had no use for; the weak
+# `.set`-to-DefaultISR entries in startup_MCXN947_cm33_core0.S are the correct
+# occupants of those slots.
 CORE0_OBJECTS := \
 	build/core0/startup.o \
 	build/core0/system.o \
@@ -171,16 +204,17 @@ CORE0_OBJECTS := \
 	build/core0/fsl_reset.o \
 	build/core0/fsl_lpflexcomm.o \
 	build/core0/fsl_edma.o \
-	build/core0/fsl_edma_soc.o \
 	build/core0/platform.o \
 	build/core0/heartbeat.o \
 	build/core0/spi_frame.o \
 	build/core0/dbg_uart.o \
+	build/core0/link_retire.o \
+	build/core0/link_recovery.o \
 	build/core0/link.o \
 	build/core0/main_core0.o
 
 .PHONY: all check check-copies clean flash probes test test-platform \
-	test-heartbeat test-link test-spi-frame
+	test-heartbeat test-link test-link-retire test-link-recovery test-spi-frame
 
 all: build/hurra-mcxn947-core0.bin
 
@@ -199,14 +233,28 @@ build/core0/main_core0.o: src/main_core0.c src/heartbeat.h src/platform.h | buil
 build/core0/platform.o: src/platform.c src/platform.h | build/core0
 	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
-build/core0/heartbeat.o: src/heartbeat.c src/heartbeat.h | build/core0
+build/core0/heartbeat.o: src/heartbeat.c src/heartbeat.h src/platform.h | build/core0
 	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
-build/core0/link.o: src/link.c src/link.h src/spi_frame.h src/platform.h src/dbg_uart.h \
+build/core0/link.o: src/link.c src/link.h src/link_retire.h src/link_recovery.h \
+		src/spi_frame.h src/platform.h src/dbg_uart.h \
 		include/injection_wire.h | build/core0
 	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
-# TEMPORARY step-2 bring-up diagnostic -- remove with src/dbg_uart.*
+# The portable transport half of step 3. Neither of these compiles a single
+# MMIO access, which is the point: -Ivendor is absent from their host test
+# recipes below, so a vendor header creeping into either one stops the host
+# build rather than passing unnoticed into the target image.
+build/core0/link_retire.o: src/link_retire.c src/link_retire.h src/spi_frame.h \
+		include/injection_wire.h | build/core0
+	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
+
+build/core0/link_recovery.o: src/link_recovery.c src/link_recovery.h | build/core0
+	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
+
+# Bring-up diagnostic UART. Retained: step 3's method is reading counters out
+# of a running target, which the LinkServer debugger cannot do (it stalls the
+# boot ROM on attach). It goes when step 4's TinyUSB CDC console replaces it.
 build/core0/dbg_uart.o: src/dbg_uart.c src/dbg_uart.h | build/core0
 	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
@@ -279,7 +327,8 @@ check: all check-copies
 # They are the demonstration that the guard polarity holds: if a module ever
 # grows MMIO outside its guard, the host build of it stops compiling here.
 
-test: test-platform test-heartbeat test-spi-frame test-link
+test: test-platform test-heartbeat test-spi-frame test-link test-link-retire \
+	test-link-recovery
 
 test-platform: build/host/platform_test
 	./build/host/platform_test
@@ -306,6 +355,21 @@ test-link: build/host/link_test
 build/host/link_test: test/link_test.c src/link.c src/spi_frame.c src/link.h \
 		src/spi_frame.h include/injection_wire.h | build/host
 	$(HOST_CC) $(APP_WARNINGS) -Isrc -isystem include test/link_test.c src/link.c src/spi_frame.c -o $@
+
+test-link-retire: build/host/link_retire_test
+	./build/host/link_retire_test
+
+build/host/link_retire_test: test/link_retire_test.c src/link_retire.c src/spi_frame.c \
+		src/link_retire.h src/spi_frame.h include/injection_wire.h | build/host
+	$(HOST_CC) $(APP_WARNINGS) -Isrc -isystem include test/link_retire_test.c \
+		src/link_retire.c src/spi_frame.c -o $@
+
+test-link-recovery: build/host/link_recovery_test
+	./build/host/link_recovery_test
+
+build/host/link_recovery_test: test/link_recovery_test.c src/link_recovery.c \
+		src/link_recovery.h | build/host
+	$(HOST_CC) $(APP_WARNINGS) -Isrc test/link_recovery_test.c src/link_recovery.c -o $@
 
 # --- flash -----------------------------------------------------------------
 #

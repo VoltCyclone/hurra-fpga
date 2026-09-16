@@ -646,6 +646,30 @@ display bugs.
 
 ## 10. Open and UNVERIFIED
 
+- **BOOT-RANDOM FRAME OFFSET — open, and the most serious thing in this list.**
+  Measured at step 3: **1 boot in 5 comes up with the whole 256-bit slot
+  permanently offset** (4 of 20, with the mitigation compiled out). It is
+  invisible to every status register — no underrun, no overrun, no DMA error,
+  `SR` reads exactly as on a healthy link — and the only FPGA-side symptom is
+  `spi_bad_sof` saturated 1:1 with `spi_slots`, which is the *non-discriminating*
+  signature of any whole-slot corruption. It was nameable only once step 3's
+  retirement made the received bytes readable: decoded, the stream is the FPGA's
+  own keepalive rotated right by a fixed number of bits.
+
+  `link_spi_enable_aligned()` waits for the inter-frame gap on the CS pad before
+  `CR[MEN]` and is 20/20 clean against 16/20 without (Fisher one-tailed
+  p = 0.053). **The mechanism is not established** and three deliberate attempts
+  to reproduce the offset at run time all failed, so the boundary is not simply
+  latched at `CR[MEN]`.
+
+  **The framing monitor is not a backstop for this.** It detects the condition
+  and runs the recovery ladder ~220 times without ever repairing it; a
+  mis-framed boot needs a reset. See `firmware/mcxn947/PROVENANCE.md`.
+
+  Until the mechanism is understood, treat any single-boot measurement on this
+  board as one draw from a distribution with a 20% failure mode — including
+  every gate in §9 that was accepted on one boot.
+
 - **Serial number source.** `SYSCON->DIEID` is *revision and die number*,
   identical across boards of the same revision — wrong for a serial. No UUID
   register in `PERI_SYSCON.h`; SDK `components/silicon_id/` has no MCXN947

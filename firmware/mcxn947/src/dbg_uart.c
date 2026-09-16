@@ -1,4 +1,4 @@
-// ---- TEMPORARY STEP-2 BRING-UP DIAGNOSTIC -- REMOVE BEFORE COMMIT ----
+// ---- BRING-UP DIAGNOSTIC UART -- retained deliberately ----
 //
 // Minimal LPUART4 transmitter on the MCU-Link VCOM, so bring-up questions can
 // be answered by reading registers out of the running target instead of by
@@ -11,7 +11,11 @@
 // BOARD_DEBUG_UART_CLK_ATTACH = kFRO12M_to_FLEXCOMM4.
 //
 // Deliberately NOT the step-4 console. That is TinyUSB CDC over J11 and is a
-// product feature; this is scaffolding and leaves with the probe.
+// product feature; this is scaffolding. It stays until that console exists:
+// step 3's whole method is reading counters out of a RUNNING target, and the
+// LinkServer debugger cannot do that -- it stalls the boot ROM on attach, so
+// every register read taken that way describes a device the debugger is
+// holding. The frame-offset finding was only nameable because this existed.
 
 #if defined(MCXN947)
 
@@ -64,6 +68,27 @@ void dbg_hex32(uint32_t v)
     dbg_puts("0x");
     for (int shift = 28; shift >= 0; shift -= 4) {
         dbg_putc(digits[(v >> shift) & 0xFu]);
+    }
+}
+
+// Decimal, because step 3's counters are compared against the FPGA's decimal
+// register dump and against each other as rates; hex would mean arithmetic by
+// hand on every sample.
+void dbg_dec32(uint32_t v)
+{
+    char buf[10];
+    uint32_t n = 0u;
+
+    if (v == 0u) {
+        dbg_putc('0');
+        return;
+    }
+    while (v != 0u && n < sizeof(buf)) {
+        buf[n++] = (char)('0' + (v % 10u));
+        v /= 10u;
+    }
+    while (n != 0u) {
+        dbg_putc(buf[--n]);
     }
 }
 

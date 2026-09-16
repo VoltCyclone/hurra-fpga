@@ -28,6 +28,18 @@
 // of a silently wrong tick rate. Portable; host-tested.
 uint32_t platform_systick_reload(uint32_t core_hz, uint32_t tick_hz);
 
+// Monotonic millisecond count since platform_init() armed SysTick.
+//
+// Portable state, advanced by platform_tick_advance() from the SysTick ISR in
+// heartbeat.c -- which owns that vector already, and is a retention root for
+// it. Split this way rather than counting inside heartbeat's own state so the
+// tick survives any later change to what the LED means.
+//
+// Wraps after ~49 days. Every consumer compares differences (`now - then >=
+// interval`) in unsigned arithmetic, which is correct across the wrap.
+uint32_t platform_ticks(void);
+void platform_tick_advance(void);
+
 // SPC overdrive -> BOARD_BootClockPLL150M() -> flash wait states -> SysTick.
 // Defined only for the target.
 void platform_init(void);

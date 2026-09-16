@@ -3,12 +3,13 @@
 Target: **FRDM-MCXN947** (MCXN947VDF, dual Cortex-M33), replacing the CH32H417 on
 the PMOD-A injection link. Design: `docs/MCXN947_CONTROLLER.md`.
 
-**This tree is at migration step 2 of that document's section 9** — CPU0 only:
-clock, blink, and LPSPI6 as an SPI slave on LP_FLEXCOMM6 driven by a
-self-loading eDMA0 scatter-gather ring that transmits a permanently IDLE slot.
-There is no RX retirement, no USB, no display and no CPU1 image. What is
-*absent* is recorded here too, because "we did not vendor it yet" and "we
-decided not to vendor it" are different claims.
+**This tree is at migration step 3 of that document's section 9** — CPU0 only:
+clock, blink, LPSPI6 as an SPI slave on LP_FLEXCOMM6 driven by a self-loading
+eDMA0 scatter-gather ring that transmits a permanently IDLE slot, retirement of
+every received slot through `src/link_retire.c`, and ERR051588 detection and
+recovery through `src/link_recovery.c`. There is no USB, no display and no CPU1
+image. What is *absent* is recorded here too, because "we did not vendor it yet"
+and "we decided not to vendor it" are different claims.
 
 Everything under `vendor/` is imported unmodified and is exempted from the
 repository whitespace gate by `.gitattributes`. Do not reformat it.
@@ -43,7 +44,7 @@ Imported unchanged:
 | `vendor/mcux-sdk/devices/MCXN947/drivers/fsl_{clock,spc,gpio}.{c,h}` | `devices/MCXN947/drivers/` |
 | `vendor/mcux-sdk/devices/MCXN947/drivers/fsl_reset.c` | `devices/MCXN947/drivers/` |
 | `vendor/mcux-sdk/devices/MCXN947/drivers/fsl_lpflexcomm.{c,h}` | `devices/MCXN947/drivers/` |
-| `vendor/mcux-sdk/devices/MCXN947/drivers/fsl_edma.{c,h}`, `fsl_edma_core.h`, `fsl_edma_soc.{c,h}` | `devices/MCXN947/drivers/` |
+| `vendor/mcux-sdk/devices/MCXN947/drivers/fsl_edma.{c,h}`, `fsl_edma_core.h`, `fsl_edma_soc.h` | `devices/MCXN947/drivers/` (`fsl_edma_soc.c` **removed at step 3** — see deviation 8) |
 | `vendor/mcux-sdk/devices/MCXN947/drivers/fsl_lpspi.h` | `devices/MCXN947/drivers/` (**header only** — see deviation 4) |
 | `vendor/mcux-sdk/boards/frdmmcxn947/project_template/{clock_config.c,clock_config.h,board.h}` | same |
 
@@ -77,6 +78,9 @@ price of the guarantee.
   this list at step 2, which is the step that calls them.
 - **`fsl_lpspi.c` and `fsl_lpspi_edma.c`** — excluded deliberately, not
   deferred; only `fsl_lpspi.h` is imported. See deviation 4.
+- **`fsl_edma_soc.c`** — imported at step 2, **removed at step 3**. Only
+  `fsl_edma_soc.h` remains. See deviation 8; it is a collision, not a
+  preference.
 - **`middleware/usb/phy/usb_phy.{c,h}`**, `boot_multicore_slave.c`, and the
   ST7796S / DBI / FlexIO display stack. Steps 4, 5 and 7 respectively.
 - **`fsl_dbi_flexio_smartdma`** — rejected outright, not deferred. SmartDMA is a
@@ -222,10 +226,173 @@ Each is a change *we* made, or a vendor behaviour we deliberately did not adopt.
    (`FIRMWARE_ROOT = REPO_ROOT / "firmware" / "ch32h417"`), so nothing else in
    the repository would notice a divergence here.
 
-7. **No local modification to any vendored file.** Every file under `vendor/`
+7. **`fsl_edma_soc.c` is not vendored; only `fsl_edma_soc.h` is.** Removed at
+   step 3, and not as tidying — it made the link fail.
+
+   The file defines **nothing but** 32 strong
+   `EDMA_<n>_CH<m>_DriverIRQHandler` wrappers around
+   `EDMA_DriverIRQHandler(instance, channel)`, which dispatches through the
+   transactional handle array `s_EDMAHandle[][]`. Verified with `nm`: every
+   symbol it defines is one of those 32, and its only undefined reference is
+   `EDMA_DriverIRQHandler` itself. Nothing else in the tree needs it —
+   `EDMA_SetChannelMux` and the rest are `static inline` in `fsl_edma.h`.
+
+   Step 3's RX retirement ISR must be named `EDMA_0_CH1_DriverIRQHandler`,
+   because the vector-table entry `EDMA_0_CH1_IRQHandler` is a weak trampoline
+   that branches to the Driver name and it is the Driver name that
+   `startup_MCXN947_cm33_core0.S` `.set`s to `DefaultISR` (see the step-1
+   findings below). The vendor's strong definition of that same symbol makes
+   the link fail outright — which is the good outcome. Taking the trampoline
+   name instead would have linked silently and left the other 31 in place.
+
+   Those 31 were never inert. `EDMA_HandleIRQ()` opens with
+   `assert(handle != NULL)`, SDK `assert()` is live in this image, and
+   `nosys.specs` makes newlib's failure path hang rather than reset — so every
+   one of those vectors was a latent hang behind any eDMA interrupt a later
+   step enabled with the transactional API unused. Step 2 enabled none, so
+   nothing showed. The weak `.set`-to-`DefaultISR` entries in the startup file
+   are the correct occupants of those slots.
+
+8. **No local modification to any vendored file.** Every file under `vendor/`
    was verified byte-identical to its upstream with `cmp` / `diff -r` after
    copying. Should that ever stop being true, the changed file and its rationale
    belong in this list, as `core/startup_v5f.S` is recorded in the CH32 tree.
+
+---
+
+## Findings while building step 3
+
+Three of these change what the firmware does and none of them is in the design
+doc. The first contradicts a claim the design doc makes.
+
+- **A boot can come up with the whole slot permanently offset, and it is
+  boot-random.** Two consecutive flashes of a byte-identical image, nothing else
+  changed, came up 69 bits out and then perfectly aligned. The offset does not
+  decay; it held for the entire 20 s the board ran.
+
+  Nothing in any status register says so. No underrun, no overrun, no DMA error
+  — SR reads exactly as it does on a healthy link, because from the
+  peripheral's point of view nothing went wrong. On the FPGA the only symptom is
+  `spi_bad_sof` at 1:1 with `spi_slots`, which step 2 already recorded as the
+  saturated, non-discriminating signature of *any* whole-slot corruption. It was
+  only nameable once retirement made the received bytes readable: decoded, the
+  received stream was the FPGA's own IDLE keepalive **rotated right by exactly
+  69 bits**.
+
+  This is the reason step 2's 22 s of flat counters was a weaker result than it
+  looked. It was one boot.
+
+  `link_spi_enable_aligned()` waits for the inter-frame gap on the chip-select
+  pad before setting `CR[MEN]`, reading it out of `GPIO3->PDIR` — which reflects
+  the pad whatever the PORT mux selects, so the pin is readable as an input at
+  the same time as it is wired to PCS0, which `SR[MBF]` cannot do with the
+  module disabled.
+
+  **Measured properly, 20 boots per arm, `-DLINK_SKIP_GAP_WAIT` building the
+  control:**
+
+  | arm | clean | mis-framed |
+  |---|---|---|
+  | gap wait present | **20 / 20** | 0 |
+  | gap wait removed | 16 / 20 | **4 (20%)** |
+
+  Fisher's exact, one-tailed: **p = 0.053** — well supported, and *just* short
+  of the conventional threshold, so state it as evidence rather than proof. Put
+  the other way: if the wait did nothing, twenty clean boots in a row would
+  happen 1.1% of the time. An earlier 7-of-7 against 1-of-2 is NOT pooled in;
+  those runs came from a session with the code changing underneath, and
+  combining non-comparable runs to reach significance is how the repo's old
+  four-row yosys table became worthless.
+
+  The mechanism is still **not** established — see the next item.
+
+- **Three deliberate attempts to reproduce that offset at run time all failed,
+  and the link self-heals from every mid-run perturbation tried.** Each was held
+  for ten seconds with the fault monitor disarmed, and each ended with `sof`
+  still zero and every FPGA counter still flat:
+
+  | provocation | result |
+  |---|---|
+  | cycle `CR[MEN]` ~1 µs into the burst | no effect at all |
+  | starve the transmit FIFO (`ERQ` off, 1 s) | sets `SR[TEF]`, then self-heals |
+  | steal 3 words from the receive FIFO | receive path re-synchronises |
+
+  So the boundary is **not** simply latched at `CR[MEN]`, and the boot case has
+  a cause none of these reproduces. The transmit result also qualifies
+  ERR051588's "does not self-heal" as the design doc states it: the erratum's
+  own trigger fires — `SR[TEF]` latches, measured three times — but on this part
+  a one-second underrun did not leave the transmit stream corrupt.
+
+  The perturbation is kept in `link.c` as a labelled negative control. A
+  provocation nobody records having tried gets tried again.
+
+- **The framing monitor DETECTS a mis-framed boot but does NOT repair it.**
+  This corrects an earlier claim in this file that it was "the backstop that
+  makes the alignment hypothesis not need to be right". It is not a backstop.
+
+  `link_retire_framing_lost()` reports the link mis-framed when at least 200
+  slots were retired in a 50 ms window and *not one* of them parsed. The
+  threshold is "none", not "most", because a framed link that is merely noisy
+  still lands the FPGA's constant keepalive between the bad slots. That
+  predicate fires correctly. The ladder that follows does not fix this fault.
+
+  All four mis-framed boots in the 20-boot control arm looked like this:
+
+  ```
+  sof=92917  recov=220  framing=220   ms=11691
+  sof=93049  recov=221  framing=221   ms=11701
+  sof=92952  recov=220  framing=220   ms=11692
+  sof=92915  recov=220  framing=220   ms=11690
+  ```
+
+  Every slot failing for the whole window, with the ladder firing once per
+  ~53 ms monitor pass — about 220 times — and never succeeding. **A mis-framed
+  boot is not recoverable in software on this part; it requires a reset.**
+
+  The monitor's one observed success was repairing a *recovery's own* bad
+  re-arm: detected and fixed 60 ms later at a cost of 480 bad slots, FPGA-side
+  123.9 `spi_bad_sof`/s during the window and 0.0/s after, flat thereafter.
+  That is a real result and worth keeping — but it is a different fault from
+  the boot offset, and generalising from it was the error.
+
+  Consequence for anyone building on this: the gap wait is doing the real work
+  and there is no working fallback behind it. The mechanism is unexplained and
+  the hazard without it is 1 boot in 5.
+
+- **The recovery ladder deviates from design doc section 4 in one place: it
+  drops `CR[MEN]` at rung 3 and restores it at rung 5.** Section 4 does not
+  mention `MEN`. Without it the ladder can only re-arm the DMA, and re-arming a
+  mis-framed slave changes nothing; dropping the module is what lets rung 5
+  choose a new boundary in the inter-frame gap. Two smaller additions for the
+  same reason: rung 5 does not return until the transmit FIFO holds a whole slot
+  again, and rung 6 clears `SR` immediately before raising `mcu_ready`. The
+  window between the FIFO reset and the refill is one in which the FPGA is still
+  clocking an empty transmit FIFO, so it sets `SR[TEF]` *by construction* — a
+  fault manufactured by the recovery rather than found by it. Leaving it latched
+  had the monitor read it on its very next pass and recover forever.
+
+- **Retirement runs in the ISR, not the foreground, and the numbers say it must.**
+  A two-bank ring gives 250 µs of slack; one 115200-baud report line takes
+  ~17 ms and would cost seventy rotations. In the ISR the cost is ~10 µs per
+  125 µs slot, nearly all of it the bitwise CRC-16. Measured over 550,000 slots:
+  `stall = 0`, `daddr_err = 0`, and ISR entries track retired slots exactly (the
+  constant ~59 difference the report shows is the UART latency between printing
+  one counter and reading the other, at 8 slots per millisecond).
+
+- **The FPGA is not only sending keepalives.** About 1 in 8 slots is a real
+  `INJ_TYPE_REPORT_FRAGMENT` (0x03) carrying a live sequence byte, at ~1 kHz —
+  the mouse report rate, matching `native_reports`. Over 68,000 of them the
+  classifier reported one sequence gap (across a recovery) and zero duplicates
+  or stales. The design doc describes this direction as telemetry; it is worth
+  recording that it is *populated* from step 3 onwards, because it means the
+  sequence classifier is exercised by real traffic rather than only by tests.
+
+- **Printing a shared buffer a byte at a time manufactures evidence.** A 32-byte
+  hex dump takes ~30 ms at 115200 baud and the retirement ISR rewrites the
+  source buffer 240 times in that window, so the line that reaches the terminal
+  is a splice of hundreds of slots. On the bench a perfectly healthy keepalive
+  acquired a scatter of stray bytes it never carried on the wire, which briefly
+  read as corruption. The snapshot is now taken with the ISR masked.
 
 ---
 

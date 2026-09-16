@@ -33,8 +33,15 @@ uint8_t link_next_bank(uint8_t bank)
 #include "fsl_lpspi.h"
 #include "fsl_port.h"
 
-// PLATFORM_CORE_HZ, for the FlexComm6 divider static assert below. Portable
-// header; nothing in it is MMIO.
+// The step-3 portable halves. Both are MMIO-free and host-tested in their own
+// right; they are included inside the guard so that a host build of this file
+// still links against nothing but spi_frame.c, as test/link_test.c does.
+#include "link_recovery.h"
+#include "link_retire.h"
+
+// PLATFORM_CORE_HZ, for the FlexComm6 divider static assert below, and
+// platform_ticks() for the report cadence. Portable header; nothing in it is
+// MMIO.
 #include "platform.h"
 
 // --- Board wiring: mikroBUS J6, LP_FLEXCOMM6 -------------------------------
@@ -149,6 +156,38 @@ static uint8_t s_rx_bank[LINK_SLOT_BANKS][INJ_FRAME_SIZE] __attribute__((aligned
 static edma_tcd_t s_tx_tcd[LINK_SLOT_BANKS] __attribute__((aligned(32)));
 static edma_tcd_t s_rx_tcd[LINK_SLOT_BANKS] __attribute__((aligned(32)));
 
+// --- Step-3 state ----------------------------------------------------------
+//
+// s_rx_cursor is the next RX bank to retire. It is NOT a model of where the
+// DMA is -- that is read from the live TCD every time, because a self-loading
+// scatter-gather ring never tells the CPU when it reloaded (link_retire.h
+// explains why a software `bank ^= 1` would be wrong after a recovery or a
+// missed completion). The cursor only records how far retirement has got.
+//
+// Written by the RX ISR and by link_dma_rings_install(), which only ever runs
+// with the channel request off and the IRQ masked. Read nowhere else.
+static uint8_t s_rx_cursor;
+
+// ISR-side liveness and shortfall, the pair that separates "the DMA stopped"
+// from "we stopped retiring". s_isr_entries counts major-loop completions
+// delivered to the CPU; link_retire_counters()->slots counts banks actually
+// retired. The two must track 1:1 -- a completion that finds the cursor
+// already on the live bank retires nothing and is a lost slot.
+static volatile uint32_t s_isr_entries;
+static volatile uint32_t s_retire_stalls;
+static volatile uint32_t s_daddr_out_of_range;
+
+// ERR051588 accounting. A nonzero s_recoveries in normal operation is a bug,
+// not routine -- design doc section 4 says so and this is the counter it means.
+static uint32_t s_recoveries;
+static uint32_t s_framing_recoveries;
+static uint32_t s_recovery_wait_timeouts;
+static uint32_t s_recovery_fill_timeouts;
+static uint32_t s_recovery_last_ms;
+static uint32_t s_last_fault_sr;
+
+static void link_dma_rings_install(void);
+
 void link_mcu_ready_set(bool ready)
 {
     if (ready) {
@@ -161,6 +200,10 @@ void link_mcu_ready_set(bool ready)
 static void link_pins_init(void)
 {
     CLOCK_EnableClock(kCLOCK_Port3);
+    // GPIO3 as well as PORT3: link_wait_for_interframe_gap() reads the chip
+    // select out of GPIO3->PDIR while the pin is muxed to LPSPI6, and PDIR
+    // reads zero forever without this gate whatever the pad is doing.
+    CLOCK_EnableClock(kCLOCK_Gpio3);
 
     // Fast slew and the input buffer enabled on all four: at 15 MHz SCK the
     // slow-slew pad would not settle, and PCS/SCK/data all need to be readable
@@ -276,7 +319,8 @@ static void link_dma_ring_init(uint32_t channel,
                                // one parameter that can name either has to carry const.
                                const volatile uint32_t *peripheral,
                                bool to_peripheral,
-                               int32_t request_source)
+                               int32_t request_source,
+                               uint16_t interrupt_mask)
 {
     for (uint8_t bank = 0u; bank < LINK_SLOT_BANKS; ++bank) {
         edma_transfer_config_t transfer = {
@@ -289,10 +333,11 @@ static void link_dma_ring_init(uint32_t channel,
             // One word per peripheral request, eight requests per slot.
             .minorLoopBytes = LINK_DMA_MINOR_BYTES,
             .majorLoopCounts = LINK_DMA_MAJOR_ITER,
-            // No interrupt. The ring self-loads, so the CPU has nothing to do
-            // per slot at this step; step 3 turns INTMAJOR on for the RX
-            // channel to retire completed slots.
-            .enabledInterruptMask = 0u,
+            // INTMAJOR on the RX ring and nothing on the TX ring. The rings
+            // self-load either way -- the interrupt is not what keeps them
+            // turning -- but a completed RX bank has to be retired before the
+            // engine comes round to overwrite it, and a bank is 125 us wide.
+            .enabledInterruptMask = interrupt_mask,
         };
 
         // EDMA_TcdSetTransferConfig documents that the caller must reset the
@@ -338,14 +383,31 @@ static void link_dma_init(void)
     EDMA_GetDefaultConfig(&config);
     EDMA_Init(LINK_DMA, &config);
 
+    link_dma_rings_install();
+}
+
+// Build (or rebuild) both rings and install each channel's first descriptor.
+// Split out of link_dma_init() because design doc section 4's recovery rung 4
+// is "rewrite both TCD rings": after an ERR051588 the descriptors are rebuilt
+// from scratch here rather than the channel being nudged, so there is exactly
+// one expression of the ring's geometry and the recovery cannot drift from the
+// boot path.
+static void link_dma_rings_install(void)
+{
     link_dma_ring_init(LINK_DMA_CHANNEL_TX, s_tx_tcd, s_tx_bank, &LINK_SPI->TDR, true,
-                       (int32_t)kDma0RequestMuxLpFlexcomm6Tx);
+                       (int32_t)kDma0RequestMuxLpFlexcomm6Tx, 0u);
     link_dma_ring_init(LINK_DMA_CHANNEL_RX, s_rx_tcd, s_rx_bank, &LINK_SPI->RDR, false,
-                       (int32_t)kDma0RequestMuxLpFlexcomm6Rx);
+                       (int32_t)kDma0RequestMuxLpFlexcomm6Rx,
+                       (uint16_t)kEDMA_MajorInterruptEnable);
+
+    // Both channels restart at descriptor 0, so the retirement cursor does
+    // too. This is the one place software state about the ring position is
+    // set, and it is set from the same call that decides the hardware's.
+    s_rx_cursor = 0u;
 }
 
 
-// ---- TEMPORARY WIRE PROBE -- REMOVE BEFORE COMMIT ----
+// ---- WIRE PROBE -- retained deliberately ----
 // Sample the four FC6 pins as plain GPIO inputs before LPSPI claims them.
 // The FPGA drives SCK, CS and MOSI continuously at 8 kHz whatever the byte
 // order or the MISO/MOSI orientation, so a pin that never changes state is a
@@ -430,9 +492,9 @@ static void link_wire_probe(void)
         }
     }
 }
-// ---- END TEMPORARY WIRE PROBE ----
+// ---- END WIRE PROBE ----
 
-// ---- TEMPORARY step-2 bring-up probe -- REMOVE BEFORE COMMIT ----
+// ---- BOOT-TIME REGISTER DUMP -- retained deliberately ----
 
 static void link_delay(uint32_t n)
 {
@@ -523,6 +585,673 @@ static void link_watch(void)
     dbg_puts("  (CITER seen is a BITMASK of observed values; one bit => frozen)\n");
 }
 
+// --- RX retirement ---------------------------------------------------------
+
+// Retire every bank between the cursor and the one the DMA is currently
+// writing. Bounded by LINK_SLOT_BANKS iterations by construction: the loop
+// stops at `active`, and `active` is always a valid bank index.
+//
+// This is design doc section 4's "only ever touch the bank the DMA is *not*
+// pointing at", implemented rather than assumed. The live TCD destination
+// address is the only thing on this part that knows where the engine is; see
+// link_retire.h for why a software ping-pong counter is not a substitute.
+static void link_drain_rx(void)
+{
+    uint8_t active;
+
+    if (!link_retire_active_bank(LINK_DMA->CH[LINK_DMA_CHANNEL_RX].TCD_DADDR,
+                                 (uint32_t)s_rx_bank[0], INJ_FRAME_SIZE,
+                                 (uint8_t)LINK_SLOT_BANKS, &active)) {
+        // The destination address is not inside the bank array at all: a
+        // corrupted or never-installed descriptor. Retire nothing -- there is
+        // no bank that can be shown to be safe.
+        s_daddr_out_of_range++;
+        return;
+    }
+
+    if (s_rx_cursor == active) {
+        // A completion arrived but the only bank we had left to retire is the
+        // one now being written. Retirement is a full rotation behind and this
+        // slot is lost. Self-healing: the next completion moves `active` on
+        // and the cursor is free again.
+        s_retire_stalls++;
+        return;
+    }
+
+    while (s_rx_cursor != active) {
+        link_retire_slot(s_rx_bank[s_rx_cursor]);
+        s_rx_cursor = link_next_bank(s_rx_cursor);
+    }
+}
+
+// eDMA0 channel 1 major-loop completion: one received slot.
+//
+// The name is `EDMA_0_CH1_DriverIRQHandler`, not `EDMA_0_CH1_IRQHandler`. The
+// vector table entry is a weak trampoline that branches to the Driver name,
+// and it is the Driver name that startup_MCXN947_cm33_core0.S `.set`s to
+// DefaultISR -- so rooting the vector name would pass the "is it defined?"
+// question against the vendor's own trampoline and prove nothing. The
+// Makefile's CORE0_RETAIN roots this symbol and `make check` asserts it is a
+// strong definition owned by this object.
+//
+// Retirement runs HERE and not in the foreground. A two-bank ring gives 250 us
+// of slack; a foreground that also drives a 115200-baud report spends ~17 ms
+// inside one print and would miss seventy rotations. The cost is ~10 us of ISR
+// per 125 us slot, nearly all of it the bitwise CRC-16 over 30 bytes.
+void EDMA_0_CH1_DriverIRQHandler(void);
+void EDMA_0_CH1_DriverIRQHandler(void)
+{
+    // Clear the channel interrupt request before retiring rather than after.
+    // CH_INT is a single W1C bit, so a completion that lands while we are
+    // draining coalesces into the next entry either way -- but clearing first
+    // means that entry actually happens instead of being cleared away.
+    LINK_DMA->CH[LINK_DMA_CHANNEL_RX].CH_INT = DMA_CH_INT_INT_MASK;
+    s_isr_entries++;
+    link_drain_rx();
+}
+
+// --- Frame alignment -------------------------------------------------------
+//
+// THE MEASUREMENT. A boot can come up with the whole 256-bit slot permanently
+// offset, and it is boot-random: two consecutive flashes of a byte-identical
+// image, nothing else changed, came up 69 bits out and then perfectly aligned.
+// The offset does not decay -- it held for the entire 20 s the board ran.
+//
+// It is invisible to every status register. No underrun, no overrun, no DMA
+// error; SR reads exactly as it does on a healthy link. On the FPGA the only
+// symptom is spi_bad_sof at 1:1 with spi_slots, which is the saturated
+// non-discriminating signature step 2 already recorded for any whole-slot
+// corruption. It was only nameable once retirement made the received bytes
+// readable: decoded, the stream was the FPGA's own IDLE keepalive rotated right
+// by exactly 69 bits.
+//
+// THE HYPOTHESIS, which is weaker than the measurement. Enabling the module
+// mid-burst leaves the boundary wherever the burst had got to. Waiting for the
+// gap between frames before setting CR[MEN] should therefore start it clean.
+// Reading the chip select while LPSPI6 is disabled is what that needs, and
+// SR[MBF] cannot serve -- a disabled module reports nothing. GPIO3->PDIR can:
+// PDIR reflects the pad whatever the PORT mux selects, provided PCR[IBE] is
+// set, which link_pins_init() sets on all four link pins for the peripheral's
+// own benefit. So the chip select is readable as a plain input at the same time
+// as it is wired to PCS0.
+//
+// EVIDENCE FOR IT: 7 of 7 boots clean with this wait, against 1 of 2 without.
+// Suggestive, not proven -- n = 2 on the control side -- and three deliberate
+// attempts to reproduce the offset at run time all failed (see
+// link_demo_perturb_rx). The mechanism is NOT established, and a claim resting
+// on "the boundary is latched at CR[MEN]" should not be built on this.
+//
+// WHY THAT IS TOLERABLE: the wait is best-effort and does not have to be right.
+// If it misses, the framing monitor in link_poll() sees every retired slot fail
+// to parse and runs the section 4 ladder, which drops CR[MEN] and chooses a new
+// boundary. Measured doing exactly that on the bench -- a recovery whose own
+// re-arm landed mis-framed was detected and repaired 60 ms later, at a cost of
+// 480 bad slots, after which the link ran flat. Alignment converges rather than
+// depending on a lucky boot, which is the property that matters.
+#define LINK_GAP_WAIT_SPINS 4000000u
+
+// Wait for chip select to be ASSERTED and then RELEASED, so what follows is the
+// start of an idle window rather than its tail. At 8 kHz with a ~17 us burst
+// the idle window is ~108 us, which is an eternity next to the two register
+// writes that follow. Returns false if either edge did not arrive inside the
+// spin budget -- the caller proceeds anyway, because an unaligned link that the
+// monitor will repair beats a link that never comes up at all.
+#if !defined(LINK_SKIP_GAP_WAIT)
+static bool link_wait_for_interframe_gap(void)
+{
+    const uint32_t cs = 1uL << LINK_PIN_CS;  // active low
+    uint32_t spins = 0u;
+
+    while ((GPIO3->PDIR & cs) != 0u) {
+        if (++spins >= LINK_GAP_WAIT_SPINS) {
+            return false;
+        }
+    }
+    spins = 0u;
+    while ((GPIO3->PDIR & cs) == 0u) {
+        if (++spins >= LINK_GAP_WAIT_SPINS) {
+            return false;
+        }
+    }
+    return true;
+}
+#endif  // !LINK_SKIP_GAP_WAIT
+
+static uint32_t s_gap_wait_timeouts;
+
+// Enable LPSPI6 on a frame boundary. The only place CR[MEN] is ever set.
+static void link_spi_enable_aligned(void)
+{
+    // TEMPORARY EXPERIMENT SWITCH -- REMOVE WITH THE SCAFFOLDING.
+    // -DLINK_SKIP_GAP_WAIT builds the control arm: enable the module without
+    // waiting for the inter-frame gap. The gap wait is a HYPOTHESIS about the
+    // boot-random frame offset, measured at 7/7 clean with it and 1/2 without,
+    // and n=2 is not a prior. This switch exists to get one. It is safe to run
+    // because link_retire_framing_lost() + the section 4 ladder repair a
+    // mis-framed boot within ~60 ms, which is itself measured.
+#if !defined(LINK_SKIP_GAP_WAIT)
+    if (!link_wait_for_interframe_gap()) {
+        s_gap_wait_timeouts++;
+    }
+#endif
+    LINK_SPI->CR = LPSPI_CR_MEN_MASK;
+}
+
+// --- ERR051588 -------------------------------------------------------------
+
+// Bounded spin for CH_CSR[ACTIVE] to fall. A channel is at most one 4-byte
+// minor loop from idle once its request is off, so this is orders of magnitude
+// more than needed; it exists so a wedged controller cannot hang the recovery.
+#define LINK_RECOVERY_WAIT_SPINS 100000u
+
+// Storm guard: the minimum gap between two recoveries. See link_poll().
+#define LINK_RECOVERY_MIN_GAP_MS 20u
+
+static void link_read_fault(link_fault_t *fault)
+{
+    const uint32_t sr = LINK_SPI->SR;
+    const uint32_t tx_es = LINK_DMA->CH[LINK_DMA_CHANNEL_TX].CH_ES;
+    const uint32_t rx_es = LINK_DMA->CH[LINK_DMA_CHANNEL_RX].CH_ES;
+    const uint32_t tx_csr = LINK_DMA->CH[LINK_DMA_CHANNEL_TX].CH_CSR;
+    const uint32_t rx_csr = LINK_DMA->CH[LINK_DMA_CHANNEL_RX].CH_CSR;
+
+    fault->lpspi_transmit_error = (sr & LPSPI_SR_TEF_MASK) != 0u;
+    fault->lpspi_receive_error = (sr & LPSPI_SR_REF_MASK) != 0u;
+    fault->dma_channel_error = ((tx_es | rx_es) & DMA_CH_ES_ERR_MASK) != 0u;
+    fault->dma_controller_halted = (LINK_DMA->MP_CSR & DMA_MP_CSR_HALT_MASK) != 0u;
+    // Read, reported, and deliberately not acted on. See link_recovery.h: DONE
+    // is sticky status that a scatter-gather reload never clears, so on a
+    // healthy self-loading ring it reads set forever.
+    fault->dma_channel_done_latched = ((tx_csr | rx_csr) & DMA_CH_CSR_DONE_MASK) != 0u;
+
+    // The one term that comes from the retired content rather than a register.
+    // Filled in by link_poll(), which owns the sampling window.
+    fault->receive_framing_lost = false;
+}
+
+// One rung of design doc section 4's ladder. The ORDER is not decided here --
+// link_recovery.c owns it and test/link_recovery_test.c asserts each ordering
+// clause the design states. This function only knows how to perform a rung.
+static void link_recovery_apply(void *ctx, link_recovery_op_t op)
+{
+    (void)ctx;
+
+    switch (op) {
+    case LINK_RECOVERY_OP_MCU_READY_LOW:
+        // Rung 1, and it must be first. `send_message = mcu_ready & tx_queued`
+        // on the FPGA, so this stops it consuming what we emit; and all four
+        // spi_bad_* counters are gated on `transfer_ready`, latched from this
+        // pin at slot start, so the garbage still in flight is ignored rather
+        // than counted against us.
+        link_mcu_ready_set(false);
+        break;
+
+    case LINK_RECOVERY_OP_REQUESTS_OFF:
+        EDMA_DisableChannelRequest(LINK_DMA, LINK_DMA_CHANNEL_TX);
+        EDMA_DisableChannelRequest(LINK_DMA, LINK_DMA_CHANNEL_RX);
+        // Mask the retirement ISR for the same window. Nothing may retire a
+        // bank while the descriptors are being rewritten underneath it.
+        NVIC_DisableIRQ(EDMA_0_CH1_IRQn);
+        break;
+
+    case LINK_RECOVERY_OP_WAIT_CHANNELS_IDLE: {
+        uint32_t spins = 0u;
+        while (((LINK_DMA->CH[LINK_DMA_CHANNEL_TX].CH_CSR |
+                 LINK_DMA->CH[LINK_DMA_CHANNEL_RX].CH_CSR) &
+                DMA_CH_CSR_ACTIVE_MASK) != 0u) {
+            if (++spins >= LINK_RECOVERY_WAIT_SPINS) {
+                s_recovery_wait_timeouts++;
+                break;
+            }
+        }
+        break;
+    }
+
+    case LINK_RECOVERY_OP_RESET_FIFOS:
+        // Rung 3, and the erratum's own workaround: "reset the transmit FIFO
+        // (CR[RTF] = 1) before writing any new data". RRF goes with it because
+        // the receive FIFO may hold the tail of a frame that no longer has a
+        // matching transmit side. MEN is left alone -- RTF/RRF are
+        // self-clearing commands and the vendor's own LPSPI_FlushFifo() writes
+        // them with the module enabled.
+        LINK_SPI->CR |= LPSPI_CR_RTF_MASK | LPSPI_CR_RRF_MASK;
+        // SR's error flags are W1C. TCF is cleared with them so the next
+        // frame-complete is unambiguous.
+        LINK_SPI->SR = LPSPI_SR_TEF_MASK | LPSPI_SR_REF_MASK | LPSPI_SR_TCF_MASK;
+        // ...and then disable the module. This is a DEVIATION from design doc
+        // section 4's ladder, which does not mention MEN, and it is what makes
+        // the ladder able to repair a mis-framed slave rather than only an
+        // underrun one: the frame boundary is latched at MEN and a disabled
+        // module ignores SCK entirely, so dropping it here is what lets rung 5
+        // choose a new boundary in the inter-frame gap.
+        LINK_SPI->CR &= ~(uint32_t)LPSPI_CR_MEN_MASK;
+        break;
+
+    case LINK_RECOVERY_OP_CLEAR_CHANNEL_STATE:
+        // Rung 4a. DONE is cleared because the design says to, not because it
+        // meant anything; ERROR and HALT are cleared because they do.
+        // enableHaltOnError is true by default, so an error on either channel
+        // stops BOTH, and a TCD installed into a halted controller arms
+        // nothing at all.
+        EDMA_ClearChannelStatusFlags(LINK_DMA, LINK_DMA_CHANNEL_TX,
+                                     (uint32_t)kEDMA_DoneFlag | (uint32_t)kEDMA_ErrorFlag |
+                                         (uint32_t)kEDMA_InterruptFlag);
+        EDMA_ClearChannelStatusFlags(LINK_DMA, LINK_DMA_CHANNEL_RX,
+                                     (uint32_t)kEDMA_DoneFlag | (uint32_t)kEDMA_ErrorFlag |
+                                         (uint32_t)kEDMA_InterruptFlag);
+        LINK_DMA->MP_CSR &= ~(uint32_t)DMA_MP_CSR_HALT_MASK;
+        break;
+
+    case LINK_RECOVERY_OP_REARM_RINGS:
+        // Rung 4b. Re-seed both TX banks first, then rewrite the descriptors:
+        // the steady-state invariant is that the buffer the DMA will next read
+        // is never empty and never half written, and the moment the descriptor
+        // is installed is the moment that becomes true again.
+        for (uint8_t bank = 0u; bank < LINK_SLOT_BANKS; ++bank) {
+            link_build_idle_slot(s_tx_bank[bank]);
+        }
+        link_dma_rings_install();
+        break;
+
+    case LINK_RECOVERY_OP_REQUESTS_ON: {
+        NVIC_ClearPendingIRQ(EDMA_0_CH1_IRQn);
+        NVIC_EnableIRQ(EDMA_0_CH1_IRQn);
+        EDMA_EnableChannelRequest(LINK_DMA, LINK_DMA_CHANNEL_TX);
+        EDMA_EnableChannelRequest(LINK_DMA, LINK_DMA_CHANNEL_RX);
+
+        // The module comes back on a frame boundary, and only here -- the same
+        // call the boot path uses, so there is one expression of the rule.
+        link_spi_enable_aligned();
+
+        // Do not leave until the FIFO actually holds a whole slot again. The
+        // steady-state invariant is that the buffer the DMA will next read is
+        // never empty; the FIFO is 8 x 32 bits = exactly one slot, and the eight
+        // DMA moves that fill it take well under a microsecond against the
+        // ~108 us of idle wire this rung is standing in. Leaving early would
+        // hand the next frame a half-full FIFO, which underruns -- the fault,
+        // again, manufactured by its own recovery.
+        uint32_t spins = 0u;
+        while (((LINK_SPI->FSR & LPSPI_FSR_TXCOUNT_MASK) >> LPSPI_FSR_TXCOUNT_SHIFT) <
+               (LINK_TX_WATERMARK + 1u)) {
+            if (++spins >= LINK_RECOVERY_WAIT_SPINS) {
+                s_recovery_fill_timeouts++;
+                break;
+            }
+        }
+        break;
+    }
+
+    case LINK_RECOVERY_OP_MCU_READY_HIGH:
+        // Rung 6, and it must be last: this is the edge that makes the FPGA
+        // start scoring us again, so nothing may still be half-armed.
+        //
+        // SR is cleared once more immediately before the edge. The window
+        // between the FIFO reset in rung 3 and the refill in rung 5 is one in
+        // which the FPGA is still clocking an empty transmit FIFO, so it sets
+        // SR[TEF] by construction -- a fault caused by the recovery rather than
+        // found by it. Leaving it latched would have the monitor read it on its
+        // very next pass and recover forever, 8,000 times a second.
+        LINK_SPI->SR = LPSPI_SR_TEF_MASK | LPSPI_SR_REF_MASK | LPSPI_SR_TCF_MASK;
+        link_mcu_ready_set(true);
+        break;
+
+    case LINK_RECOVERY_OP_COUNT:
+    default:
+        break;
+    }
+}
+
+static void link_recover(const link_fault_t *fault)
+{
+    s_recoveries++;
+    if (fault->receive_framing_lost) {
+        s_framing_recoveries++;
+    }
+    s_last_fault_sr = LINK_SPI->SR;
+
+    dbg_puts("!! ERR051588 recovery #");
+    dbg_dec32(s_recoveries);
+    dbg_puts("  SR=");
+    dbg_hex32(s_last_fault_sr);
+    dbg_puts(fault->lpspi_transmit_error ? " TEF" : "");
+    dbg_puts(fault->lpspi_receive_error ? " REF" : "");
+    dbg_puts(fault->dma_channel_error ? " CH_ES" : "");
+    dbg_puts(fault->dma_controller_halted ? " HALT" : "");
+    dbg_puts(fault->receive_framing_lost ? " FRAMING" : "");
+    dbg_puts("\n");
+
+    (void)link_recovery_run(link_recovery_apply, NULL);
+
+    dbg_puts("   recovered, SR=");
+    dbg_hex32(LINK_SPI->SR);
+    dbg_puts(" FSR=");
+    dbg_hex32(LINK_SPI->FSR);
+    dbg_puts(" idle_timeouts=");
+    dbg_dec32(s_recovery_wait_timeouts);
+    dbg_puts(" fill_timeouts=");
+    dbg_dec32(s_recovery_fill_timeouts);
+    dbg_puts("\n");
+}
+
+// --- The one-shot ERR051588 provocation ------------------------------------
+//
+// Design doc section 9 step 3: "Includes deliberately provoking ERR051588 by
+// halting the core while the FPGA clocks SCK. A recovery path that has never
+// run is not a recovery path."
+//
+// A debugger halt is NOT the mechanism, and step 2 already recorded why:
+// EDMA_GetDefaultConfig leaves `enableDebugMode = false`, so the eDMA keeps
+// running while the core is stopped. The rings are self-loading, so a plain
+// halt does not starve the transmit FIFO and produces no underrun at all.
+//
+// What does produce one, deterministically and on demand, is taking the
+// transmit channel's request away while the FPGA keeps clocking: the FIFO
+// holds exactly one slot, so it is empty within 125 us and the next 256 clocks
+// underrun. That is ERR051588's own trigger -- "a transmit FIFO underrun
+// (SR[TEF]) in slave mode" -- reached by the same route a reset window or an
+// error halt would reach it, and unlike a debugger halt it is repeatable.
+//
+// The schedule is driven by the retirement counter rather than by wall-clock,
+// so every phase boundary is a fixed number of slots and the FPGA-side sampling
+// windows line up with it. The three phases are arranged to make the evidence
+// falsifiable:
+//
+//   ARMED     ~10 s of untouched steady state, so "flat before" is measured.
+//   STARVING  ~1 s with the TX request off. The underrun happens here.
+//   BROKEN    ~20 s with the request back ON and NO recovery. If ERR051588 did
+//             not really corrupt the FIFO pointers, the link would heal itself
+//             here and the FPGA counters would stay flat. They do not, and that
+//             is what makes the recovery in the next phase mean something.
+//   DONE      recovery has run; the automatic fault monitor is armed from here.
+typedef enum {
+    LINK_DEMO_ARMED = 0,
+    LINK_DEMO_STARVING,
+    LINK_DEMO_UNDERRUN_HELD,
+    LINK_DEMO_PERTURBED_HELD,
+    LINK_DEMO_DONE,
+} link_demo_phase_t;
+
+#define LINK_DEMO_ARM_SLOTS 160000u    // ~20 s at 8 kHz
+#define LINK_DEMO_STARVE_SLOTS 8000u   // ~1 s
+#define LINK_DEMO_HOLD_SLOTS 80000u    // ~10 s per broken window
+
+static link_demo_phase_t s_demo_phase = LINK_DEMO_ARMED;
+static uint32_t s_demo_mark;
+
+static const char *link_demo_phase_name(void)
+{
+    switch (s_demo_phase) {
+    case LINK_DEMO_ARMED:
+        return "armed";
+    case LINK_DEMO_STARVING:
+        return "STARVING";
+    case LINK_DEMO_UNDERRUN_HELD:
+        return "UNDERRUN";
+    case LINK_DEMO_PERTURBED_HELD:
+        return "PERTURB";
+    case LINK_DEMO_DONE:
+    default:
+        return "steady";
+    }
+}
+
+// The automatic monitor is suppressed for exactly the windows the provocation
+// owns. Everywhere else -- including before the provocation, so a fault
+// inherited from the boot or from a flash cycle is caught -- it is armed.
+static bool link_fault_monitor_armed(void)
+{
+    return s_demo_phase == LINK_DEMO_ARMED || s_demo_phase == LINK_DEMO_DONE;
+}
+
+// A NEGATIVE CONTROL, and it is labelled one because it is what it measured.
+//
+// The intent was to reproduce the persistent frame offset seen on a boot, by
+// stealing three words out of the receive FIFO before the eDMA could move them.
+// The reasoning: the ring writes eight words per bank and the FPGA clocks eight
+// words per slot, so taking three away should leave every bank holding the last
+// five words of one slot followed by the first three of the next, forever.
+//
+// IT DOES NOT. Ten seconds after the theft, `sof` is still zero and every FPGA
+// counter is still flat. The receive path re-synchronises on its own.
+//
+// It is the third provocation to fail that way, and together they are the
+// finding, which contradicts the obvious reading of the boot symptom:
+//
+//   * cycling CR[MEN] mid-burst -- no effect, ten seconds, not one bad slot.
+//     So the frame boundary is NOT simply latched at the module enable.
+//   * starving the transmit FIFO (provocation 1 above) -- sets SR[TEF] exactly
+//     as ERR051588 says, and then the transmit path self-heals once the request
+//     returns. Measured three times, ten seconds each.
+//   * this -- the receive path likewise re-synchronises.
+//
+// So the link tolerates every mid-run perturbation that has been tried, and the
+// persistent 69-bit offset measured once at boot has a cause none of these
+// reproduces. link_spi_enable_aligned() is a hypothesis about that cause with
+// 7 of 7 clean boots behind it and 1 of 2 before it -- suggestive, not proven --
+// and the framing monitor is the backstop that makes it not matter: a boot that
+// comes up mis-framed repairs itself whether or not the hypothesis is right.
+//
+// Kept rather than deleted because "the link survives three words stolen out of
+// its receive FIFO" is a robustness property worth re-measuring after any change
+// to the ring, and because a provocation nobody records having tried gets tried
+// again.
+static void link_demo_perturb_rx(void)
+{
+    // Masked, so the retirement ISR cannot drain the FIFO between the wait and
+    // the read and leave us reading an empty RDR (which consumes nothing and
+    // would shift nothing).
+    NVIC_DisableIRQ(EDMA_0_CH1_IRQn);
+    for (uint32_t word = 0u; word < 3u; ++word) {
+        uint32_t spins = 0u;
+        while (((LINK_SPI->FSR & LPSPI_FSR_RXCOUNT_MASK) >> LPSPI_FSR_RXCOUNT_SHIFT) == 0u) {
+            if (++spins >= LINK_GAP_WAIT_SPINS) {
+                break;
+            }
+        }
+        (void)LINK_SPI->RDR;
+    }
+    NVIC_EnableIRQ(EDMA_0_CH1_IRQn);
+}
+
+static void link_demo_step(uint32_t slots)
+{
+    switch (s_demo_phase) {
+    case LINK_DEMO_ARMED:
+        if (slots >= LINK_DEMO_ARM_SLOTS) {
+            dbg_puts("\n-- provocation 1/2: ERR051588, TX DMA request off --\n");
+            EDMA_DisableChannelRequest(LINK_DMA, LINK_DMA_CHANNEL_TX);
+            s_demo_mark = slots;
+            s_demo_phase = LINK_DEMO_STARVING;
+        }
+        break;
+
+    case LINK_DEMO_STARVING:
+        if (slots - s_demo_mark >= LINK_DEMO_STARVE_SLOTS) {
+            const uint32_t sr = LINK_SPI->SR;
+            EDMA_EnableChannelRequest(LINK_DMA, LINK_DMA_CHANNEL_TX);
+            dbg_puts("-- TX request back on, monitor still OFF. SR=");
+            dbg_hex32(sr);
+            dbg_puts((sr & LPSPI_SR_TEF_MASK) != 0u ? "  TEF SET (underrun)\n"
+                                                    : "  TEF CLEAR (no underrun!)\n");
+            s_demo_mark = slots;
+            s_demo_phase = LINK_DEMO_UNDERRUN_HELD;
+        }
+        break;
+
+    case LINK_DEMO_UNDERRUN_HELD:
+        if (slots - s_demo_mark >= LINK_DEMO_HOLD_SLOTS) {
+            link_fault_t fault;
+            link_read_fault(&fault);
+            dbg_puts("-- running the section 4 ladder on the latched TEF --\n");
+            if (link_recovery_required(&fault)) {
+                link_recover(&fault);
+            } else {
+                dbg_puts("   nothing to recover; fault predicate says clean\n");
+            }
+
+            dbg_puts("\n-- provocation 2/2 (negative control): steal 3 RX FIFO words --\n");
+            link_demo_perturb_rx();
+            s_demo_mark = slots;
+            s_demo_phase = LINK_DEMO_PERTURBED_HELD;
+        }
+        break;
+
+    case LINK_DEMO_PERTURBED_HELD:
+        if (slots - s_demo_mark >= LINK_DEMO_HOLD_SLOTS) {
+            // Nothing is called here. The monitor is simply armed, and the
+            // repair has to happen on its own -- that is the whole point. A
+            // ladder someone has to invoke by hand is not a recovery path.
+            dbg_puts("-- monitor ARMED; a link still broken must now repair itself --\n");
+            s_demo_phase = LINK_DEMO_DONE;
+        }
+        break;
+
+    case LINK_DEMO_DONE:
+    default:
+        break;
+    }
+}
+
+// --- Framing monitor -------------------------------------------------------
+//
+// Samples the retirement counters on a fixed cadence and asks link_retire.c
+// whether anything parsed in the interval. The window has to be long enough to
+// clear LINK_FRAMING_MIN_SLOTS (200 slots, ~25 ms) and short enough that a
+// mis-framed boot is repaired long before anyone looks at it.
+#define LINK_FRAMING_WINDOW_MS 50u
+
+static link_framing_sample_t s_framing_previous;
+static uint32_t s_framing_ms;
+
+// Returns the verdict for the window that just closed, or false while one is
+// still open. Sampling here rather than inside link_read_fault() keeps the
+// window under this function's control: a verdict is only ever computed from
+// two samples a whole window apart, never from two taken microseconds apart by
+// a fast foreground loop.
+static bool link_framing_poll(void)
+{
+    const uint32_t now = platform_ticks();
+    if (now - s_framing_ms < LINK_FRAMING_WINDOW_MS) {
+        return false;
+    }
+    s_framing_ms = now;
+
+    link_framing_sample_t current;
+    link_retire_framing_sample(&current);
+    const bool lost = link_retire_framing_lost(&s_framing_previous, &current);
+    s_framing_previous = current;
+    return lost;
+}
+
+// --- Periodic report -------------------------------------------------------
+
+#define LINK_REPORT_MS 1000u
+
+static uint32_t s_report_ms;
+
+static void link_report(void)
+{
+    const link_retire_counters_t *c = link_retire_counters();
+
+    dbg_puts("[");
+    dbg_puts(link_demo_phase_name());
+    dbg_puts("] slots=");
+    dbg_dec32(c->slots);
+    dbg_puts(" idle=");
+    dbg_dec32(c->idle);
+    dbg_puts(" deliv=");
+    dbg_dec32(c->deliverable);
+    dbg_puts(" sof=");
+    dbg_dec32(c->bad_sof);
+    dbg_puts(" crc=");
+    dbg_dec32(c->bad_crc);
+    dbg_puts(" len=");
+    dbg_dec32(c->bad_length);
+    dbg_puts(" typ=");
+    dbg_dec32(c->bad_type);
+    dbg_puts(" dup=");
+    dbg_dec32(c->duplicate);
+    dbg_puts(" stale=");
+    dbg_dec32(c->stale);
+    dbg_puts(" gap=");
+    dbg_dec32(c->sequence_gap);
+    dbg_puts("\n      isr=");
+    dbg_dec32(s_isr_entries);
+    dbg_puts(" stall=");
+    dbg_dec32(s_retire_stalls);
+    dbg_puts(" daddr_err=");
+    dbg_dec32(s_daddr_out_of_range);
+    dbg_puts(" recov=");
+    dbg_dec32(s_recoveries);
+    dbg_puts("/");
+    dbg_dec32(s_framing_recoveries);
+    dbg_puts("fr gapto=");
+    dbg_dec32(s_gap_wait_timeouts);
+    dbg_puts(" cursor=");
+    dbg_dec32(s_rx_cursor);
+    dbg_puts(" SR=");
+    dbg_hex32(LINK_SPI->SR);
+    dbg_puts(" ms=");
+    dbg_dec32(platform_ticks());
+    // The last bank retired, verbatim. This is the evidence that retirement is
+    // reading bytes the FPGA put there: an untouched bank is all zeros, and the
+    // keepalive it actually sends is 68 00 00 00 .. 00 fe 36.
+    //
+    // Snapshotted with the retirement ISR masked, and that is not a nicety. The
+    // hex dump takes ~30 ms at 115200 baud and the ISR rewrites the source
+    // buffer 240 times in that window, so printing straight from the pointer
+    // splices hundreds of slots into one line -- a healthy keepalive acquires a
+    // scatter of bytes it never carried, and on the bench that briefly looked
+    // like wire corruption. Masking for a 32-byte copy costs tens of
+    // nanoseconds against a 125 us slot.
+    uint8_t snapshot[INJ_FRAME_SIZE];
+    NVIC_DisableIRQ(EDMA_0_CH1_IRQn);
+    for (uint32_t index = 0u; index < INJ_FRAME_SIZE; ++index) {
+        snapshot[index] = link_retire_last_slot()[index];
+    }
+    NVIC_EnableIRQ(EDMA_0_CH1_IRQn);
+    link_dump_bytes("\n      last slot", snapshot, INJ_FRAME_SIZE);
+}
+
+void link_poll(void)
+{
+    const uint32_t slots = link_retire_counters()->slots;
+
+    // Sampled unconditionally, acted on only when armed. Sampling inside the
+    // armed branch instead would leave s_framing_previous stale across a
+    // disarmed window, so the first verdict after re-arming would be computed
+    // against a sample from minutes earlier.
+    const bool framing_lost = link_framing_poll();
+
+    link_demo_step(slots);
+
+    if (link_fault_monitor_armed()) {
+        link_fault_t fault;
+        link_read_fault(&fault);
+        fault.receive_framing_lost = framing_lost;
+        // One recovery per LINK_RECOVERY_MIN_GAP_MS at most. A recovery that
+        // re-creates its own trigger would otherwise run at the poll rate and
+        // do nothing but flood the UART and drop `mcu_ready` thousands of times
+        // a second. Rate-limited, the same bug shows as `recov` climbing
+        // steadily in the report, which is a diagnosis rather than a brick.
+        const uint32_t since = platform_ticks() - s_recovery_last_ms;
+        if (link_recovery_required(&fault) &&
+            (s_recoveries == 0u || since >= LINK_RECOVERY_MIN_GAP_MS)) {
+            s_recovery_last_ms = platform_ticks();
+            link_recover(&fault);
+        }
+    }
+
+    // Wall-clock rather than slot-driven, deliberately: a link that has stopped
+    // delivering slots is the case that most needs a report, and a slot-driven
+    // cadence would go silent exactly then.
+    const uint32_t now = platform_ticks();
+    if (now - s_report_ms >= LINK_REPORT_MS) {
+        s_report_ms = now;
+        link_report();
+    }
+}
+
 void link_init(void)
 {
     dbg_uart_init();
@@ -530,6 +1259,9 @@ void link_init(void)
 
     link_pins_init();
     link_mcu_ready_set(false);
+
+    // Retirement state before anything can complete into it.
+    link_retire_reset();
 
     for (uint8_t bank = 0u; bank < LINK_SLOT_BANKS; ++bank) {
         link_build_idle_slot(s_tx_bank[bank]);
@@ -544,11 +1276,18 @@ void link_init(void)
     EDMA_EnableChannelRequest(LINK_DMA, LINK_DMA_CHANNEL_TX);
     EDMA_EnableChannelRequest(LINK_DMA, LINK_DMA_CHANNEL_RX);
 
-    LINK_SPI->CR = LPSPI_CR_MEN_MASK;
+    // The RX retirement interrupt, armed before the module is enabled so the
+    // first completion is not missed. The RX banks are zeroed above, so if the
+    // ISR somehow ran before any transfer it would retire zeros and score them
+    // as bad_sof -- which is a visible failure rather than a silent one.
+    NVIC_ClearPendingIRQ(EDMA_0_CH1_IRQn);
+    NVIC_EnableIRQ(EDMA_0_CH1_IRQn);
+
+    link_spi_enable_aligned();
 
     link_mcu_ready_set(true);
 
-    dbg_puts("\n==== hurra mcxn947 step2 probe v2 ====\n");
+    dbg_puts("\n==== hurra mcxn947 step3: RX retirement + ERR051588 ====\n");
 
     dbg_puts("-- clocking --\n");
     link_show("PLLCLKDIVSEL ", SYSCON->PLLCLKDIVSEL);
@@ -607,6 +1346,28 @@ void link_init(void)
     link_dump_bytes("-- RX bank0 --", s_rx_bank[0], INJ_FRAME_SIZE);
     link_dump_bytes("-- RX bank1 --", s_rx_bank[1], INJ_FRAME_SIZE);
 
+    dbg_puts("-- retirement --\n");
+    link_show("isr entries  ", s_isr_entries);
+    link_show("slots retired", link_retire_counters()->slots);
+    link_show("idle frames  ", link_retire_counters()->idle);
+    link_show("bad sof      ", link_retire_counters()->bad_sof);
+    link_show("bad crc      ", link_retire_counters()->bad_crc);
+    link_show("rx cursor    ", s_rx_cursor);
+    {
+        uint8_t snapshot[INJ_FRAME_SIZE];
+        NVIC_DisableIRQ(EDMA_0_CH1_IRQn);
+        for (uint32_t index = 0u; index < INJ_FRAME_SIZE; ++index) {
+            snapshot[index] = link_retire_last_slot()[index];
+        }
+        NVIC_EnableIRQ(EDMA_0_CH1_IRQn);
+        link_dump_bytes("-- last retired slot --", snapshot, INJ_FRAME_SIZE);
+    }
+    dbg_puts("  (a bank nothing filled reads all-zero; the FPGA keepalive is\n"
+             "   68 00 00 00 .. 00 fe 36, so a non-zero slot here is wire data)\n");
+
+    // The report cadence starts from whatever the boot dump cost, so the first
+    // periodic line is one full interval away rather than immediate.
+    s_report_ms = platform_ticks();
 }
 
 #endif  // MCXN947

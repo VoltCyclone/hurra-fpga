@@ -1,11 +1,13 @@
 // The FPGA injection link: LPSPI6 as an SPI slave on LP_FLEXCOMM6, fed by a
 // self-loading eDMA0 scatter-gather ring.
 //
-// Migration step 2 of docs/MCXN947_CONTROLLER.md section 9. At this step the
-// MCU never originates a message: both TX banks are seeded with a complete
-// IDLE keepalive and nothing ever refills them, so the same inert slot is
-// clocked out forever. RX lands in two banks that nothing reads yet; retiring
-// them is step 3.
+// Migration step 3 of docs/MCXN947_CONTROLLER.md section 9. TX is still
+// permanently IDLE -- both banks are seeded with a complete IDLE keepalive and
+// nothing ever refills them, so the same inert slot is clocked out forever;
+// originating commands is step 8/9. What step 3 adds is the other direction
+// and the fault path: received banks are retired through link_retire.c, and
+// an ERR051588 transmit underrun is detected and recovered through
+// link_recovery.c's ladder.
 //
 // Declarations here are portable C. Only the definitions in link.c that touch
 // MMIO are inside `#if defined(MCXN947)`, so the transport predicates below
@@ -52,10 +54,12 @@
 #include "injection_wire.h"
 #include "spi_frame.h"
 
-// Banks per direction. Two, so the ring alternates and the CPU can refill the
+// Banks per direction. Two, so the ring alternates and the CPU can touch the
 // bank the DMA is not pointing at -- the steady-state invariant in design doc
-// section 4. Step 2 never refills either one; step 3 is what needs the rule.
-// Power of two, because link_next_bank() masks rather than divides.
+// section 4. Step 3 is the step that needs the rule, and it obeys it by
+// deriving the live bank from the TCD rather than tracking it in software; see
+// link_retire.h. Power of two, because link_next_bank() masks rather than
+// divides.
 #define LINK_SLOT_BANKS 2u
 _Static_assert((LINK_SLOT_BANKS & (LINK_SLOT_BANKS - 1u)) == 0u,
                "LINK_SLOT_BANKS must be a power of two");
@@ -108,8 +112,18 @@ uint8_t link_next_bank(uint8_t bank);
 // implementation detail; see link.c.
 void link_init(void);
 
-// Drive `mcu_ready`. Called by link_init() at both ends of the ladder, and the
-// first and last rungs of the step-3 ERR051588 recovery.
+// Drive `mcu_ready`. Called by link_init() at both ends of the boot ladder,
+// and by the first and last rungs of the ERR051588 recovery.
 void link_mcu_ready_set(bool ready);
+
+// Foreground service. Retirement itself runs in the eDMA0 channel 1 major-loop
+// ISR -- at 8 kHz a foreground that also prints would miss whole rotations of a
+// two-bank ring -- so this call does the things that tolerate latency: sample
+// the fault status and recover if ERR051588 (or a DMA error) has fired, drive
+// the one-shot fault provocation this step exists to prove the recovery with,
+// and emit the periodic counter report on the debug UART.
+//
+// Never blocks on the link. Safe to call as fast as the foreground loop turns.
+void link_poll(void);
 
 #endif  // HURRA_MCXN947_LINK_H

@@ -27,6 +27,9 @@ bool heartbeat_tick(heartbeat_t *hb)
 #include "fsl_gpio.h"
 #include "fsl_port.h"
 
+// platform_tick_advance(). Portable header, no MMIO in it.
+#include "platform.h"
+
 // FRDM-MCXN947 green LED: P0_27, PORT mux ALT0 (= GPIO on this part), active
 // low. Taken from the SDK's own board package for this board --
 // boards/frdmmcxn947/project_template/{board.h,pin_mux.c}. Note that the
@@ -76,6 +79,10 @@ void heartbeat_start(uint32_t half_period_ticks)
 // build error anywhere.
 void SysTick_Handler(void)
 {
+    // The one monotonic time base on CPU0. Advanced first so a long blink path
+    // could never skew it.
+    platform_tick_advance();
+
     if (heartbeat_tick(&g_heartbeat)) {
         heartbeat_hw_set(g_heartbeat.on);
     }

@@ -4,6 +4,18 @@
 
 #include "platform.h"
 
+static volatile uint32_t s_ticks;
+
+void platform_tick_advance(void)
+{
+    s_ticks++;
+}
+
+uint32_t platform_ticks(void)
+{
+    return s_ticks;
+}
+
 uint32_t platform_systick_reload(uint32_t core_hz, uint32_t tick_hz)
 {
     if (tick_hz == 0u || core_hz == 0u) {
