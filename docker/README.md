@@ -93,3 +93,9 @@ netlist, and on this one it is the *worst* of the twelve.
 Any RTL edit changes the netlist by design and invalidates this sweep; redo it
 and re-record the sha. `synth.sh` prints the sha and writes `top.sha256` so a
 surprising sweep can be told apart from a changed netlist at a glance.
+
+The sha is **path-sensitive**: yosys embeds source paths in `src` attributes, so
+the same logic built from a different directory hashes differently. A container
+build from `/work` and a native build from `~/ctr/exp` gave different shas but
+identical logic — 98 modules, 24249 cells, and the same fmax on all twelve
+seeds. Compare shas only across builds from the same path.

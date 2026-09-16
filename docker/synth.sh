@@ -42,6 +42,13 @@ fi
 # sha identifies the netlist a sweep was measured against. Recording it turns
 # "the sweep moved" into "the netlist changed, of course it moved" at a glance,
 # without gating on it -- any legitimate RTL edit changes it by design.
+#
+# It is PATH-SENSITIVE: yosys embeds source paths in "src" attributes, so the
+# same logic built from a different directory hashes differently. Measured --
+# a container build from /work and a native build from ~/ctr/exp produced
+# different shas but identical logic (98 modules, 24249 cells, and the same
+# fmax on all twelve seeds). Compare shas only across builds from the same
+# path; CI always builds from $GITHUB_WORKSPACE, so within CI it is stable.
 SHA="$(sha256sum "$OUT/top.json" | cut -d" " -f1)"
 printf '%s\n' "$SHA" > "$OUT/top.sha256"
 

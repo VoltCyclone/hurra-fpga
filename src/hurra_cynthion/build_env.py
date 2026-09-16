@@ -107,10 +107,15 @@ REQUIRED_NEXTPNR_FLAG = "--placer-heap-timingweight"
 #: longer exists, and could not have been reproduced even at the time.** The
 #: superseded 2026-09-13 entry read 8 of 12 passing, seed 9 best at 65.45 MHz.
 #:
-#: Re-swept 2026-09-15 on the first reproducible netlist, sha 3c1c3404c085e7c2,
-#: oss-cad-suite 2026-09-01 (yosys 0.68+136). 12 seeds run directly on the
-#: synthesised top.json (~70 s each, synthesis is identical across seeds),
-#: **12 of 12 passing**:
+#: Re-swept 2026-09-15 on the first reproducible netlist, sha 3c1c3404c085e7c2
+#: as built inside the container from ``/work``, oss-cad-suite 2026-09-01
+#: (yosys 0.68+136). That sha is **path-sensitive** -- yosys embeds source
+#: paths in ``src`` attributes, so the same logic built elsewhere hashes
+#: differently; a native build from a different directory gave a different sha
+#: with identical logic (98 modules, 24249 cells) and the same fmax on all
+#: twelve seeds. Compare shas only across builds from the same path. 12 seeds
+#: run directly on the synthesised top.json (~70 s each, synthesis is identical
+#: across seeds), **12 of 12 passing**:
 #:
 #:     7: 69.05   2: 67.64   4: 65.98   12: 65.63   1: 65.42   3: 64.82
 #:     5: 63.35   8: 62.20   10: 61.74  11: 61.58   6: 61.07   9: 60.95
