@@ -539,12 +539,48 @@ counters over JTAG.
 1. **Skeleton + toolchain (CPU0 only).** Clock, blink, `make check` green.
    Isolates linker script / startup / retention roots / J-Link before they can be
    confused with a link problem.
-2. **`mcu_ready` low -> LPSPI6 + eDMA0 ring -> TX permanently IDLE.**
-   *Gate: `spi_slots` advancing at 8 kHz with every `spi_bad_*` and
-   `spi_queue_full` flat.* This decomposes cleanly: `spi_bad_sof` flat proves
-   byte order (**the `TCR[BYSW]` question resolves here and nowhere else**);
-   `spi_bad_crc` flat proves bit alignment and CPOL/CPHA; `spi_slots` stuck at 1
-   means the TCD ring is not self-loading.
+2. **LPSPI6 + eDMA0 ring armed -> `mcu_ready` raised -> TX permanently IDLE.**
+   *Gate: every `spi_bad_*` and `spi_queue_full` flat **while `link_ready = 1`**,
+   `spi_slots` advancing at 8 kHz, and `map_active` never leaving 0.*
+   `spi_bad_sof` flat proves byte order (**the `TCR[BYSW]` question resolves here
+   and nowhere else**); `spi_bad_crc` flat proves bit alignment and CPOL/CPHA;
+   `spi_slots` stuck at 1 means the TCD ring is not self-loading.
+
+   **An earlier version of this step said "`mcu_ready` low" and gated on
+   `spi_slots` advancing with the error counters flat. That gate is vacuous and
+   was measured to be so** — it passes with no MCU firmware whatsoever. Two
+   facts in the gateware, both verified by reading the RTL and confirmed on the
+   bench at 8,049 slots/s against a board running only step 1's blink:
+
+   - `spi_link.py:281` increments `slot_counter` on the fixed cadence boundary,
+     under a comment reading "A fixed slot boundary is generated independently
+     of transfer state". **`spi_slots` at 8 kHz is the FPGA's own cadence and
+     says nothing about the MCU.**
+   - Every `bad_*` counter is gated on `transfer_ready`, which is latched from
+     `mcu_ready` at slot start (`spi_link.py:289`) — e.g.
+     `with m.If(transfer_ready & (rx_sof != SOF))` at `:433`. **With `mcu_ready`
+     low the FPGA never validates a returned slot, so no error counter can
+     increment and "all flat" is meaningless.**
+
+   `mcu_ready` low is the *boot* discipline — hold it low until both DMA
+   directions are armed, exactly as `docs/hardware/ch32-cynthion-wiring.md`
+   specifies — not the steady state. Raise it once the ring is armed.
+
+   **§4 already knew this and this step contradicted it.** The ERR051588
+   recovery sequence above says, of driving `mcu_ready` low: "all four error
+   counters are gated on `transfer_ready`, so the garbage slots are *ignored*
+   rather than counted" — and *uses* that to suppress counting during recovery,
+   ending at "6. Raise `mcu_ready`." Low being a deliberate
+   stop-counting-and-ignore state is exactly why it cannot also be the state a
+   gate reads counters in.
+
+   **Safety does not come from `mcu_ready` being low; it comes from TX being
+   IDLE.** The wire contract's admission predicate is
+   `deliverable <=> SOF == 0x68 and known_type and length == expected(type) and
+   CRC ok and type != IDLE`, so an IDLE slot is never deliverable, no command is
+   ever committed, and no map can activate. `map_active` staying 0 is therefore
+   part of the gate rather than an assumption — if it ever leaves 0 with TX
+   IDLE, something is wrong with that reasoning and the step should stop.
 3. **RX retirement + the portable transport half.** Includes **deliberately
    provoking ERR051588** by halting the core while the FPGA clocks SCK. A
    recovery path that has never run is not a recovery path.
