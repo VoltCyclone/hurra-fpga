@@ -65,13 +65,40 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
+      # Pinned xPack release, fetched directly.
+      #
+      # This step used to be `npm install -g @xpack-dev-tools/riscv-none-elf-gcc`,
+      # which has never worked and is why this job has been red since the
+      # initial commit. That npm package is a 39 KB METADATA STUB with no
+      # postinstall hook -- xPack binaries are fetched by `xpm`, not `npm`, so
+      # `.content/bin` was never created, the GITHUB_PATH entry pointed at
+      # nothing, and `riscv-none-elf-gcc --version` exited 127 nine seconds in.
+      #
+      # Going direct rather than via xpm keeps this consistent with how the
+      # rest of the repo treats toolchains: an exact pinned version with a
+      # published checksum, not a floating @latest. An unpinned RISC-V compiler
+      # is the same hazard as an unpinned yosys, which is the subject of this
+      # branch.
       - name: install riscv-none-elf-gcc
+        env:
+          XPACK_VERSION: "15.2.0-1"
+          XPACK_SHA256: "aaaa8060c914851a3e5ee1ba82cc3d6f80972f90638a05c6e823a37557a33758"
         run: |
-          npm install -g @xpack-dev-tools/riscv-none-elf-gcc@latest
-          echo "$(npm root -g)/@xpack-dev-tools/riscv-none-elf-gcc/.content/bin" >> "$GITHUB_PATH"
+          set -euo pipefail
+          TARBALL="xpack-riscv-none-elf-gcc-${XPACK_VERSION}-linux-x64.tar.gz"
+          curl -fsSL -o "$TARBALL" \
+            "https://github.com/xpack-dev-tools/riscv-none-elf-gcc-xpack/releases/download/v${XPACK_VERSION}/${TARBALL}"
+          echo "${XPACK_SHA256}  ${TARBALL}" | sha256sum -c -
+          sudo mkdir -p /opt/xpack
+          sudo tar -xzf "$TARBALL" -C /opt/xpack
+          rm "$TARBALL"
+          # Locate the compiler rather than hardcoding the layout. The bundle
+          # also carries an unprefixed toolchain under riscv-none-elf/bin,
+          # so match the prefixed driver by name and take its directory --
+          # and fail here, loudly, if the archive is ever restructured.
+          GCC="$(find /opt/xpack -type f -name riscv-none-elf-gcc -perm -u+x | head -1)"
+          test -n "$GCC" || { echo "riscv-none-elf-gcc not found in the xPack archive" >&2; exit 1; }
+          dirname "$GCC" >> "$GITHUB_PATH"
       - run: riscv-none-elf-gcc --version
       - name: make firmware
         run: make firmware
