@@ -109,9 +109,15 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+      # yosys >= 0.60 is load-bearing: the same source fails to close timing on
+      # older yosys and produces no bitstream. Measured on this pin (yosys
+      # 0.68+136): 68.71 MHz at seed 9, 10 of 12 seeds passing. On the previous
+      # "2025-01-01" pin (yosys 0.48+47): 56.57 MHz and no bitstream, which is
+      # why every run of this job was red until 2026-09-15. build_env.py
+      # enforces the floor. See docs/handoffs/TIMING_CLOSURE_HANDOFF.md.
       - uses: YosysHQ/setup-oss-cad-suite@v3
         with:
-          osscadsuite-version: "2025-01-01"
+          osscadsuite-version: "2026-09-01"
       - run: python -m pip install -e '.[dev]'
       - name: yosys and nextpnr versions
         run: |
@@ -126,8 +132,11 @@ jobs:
         if: always()
         run: |
           # top.tim carries four "Max frequency" lines (two clocks x
-          # placement-estimate and post-routing); the usb domain's post-routing
-          # result is the third.
+          # placement-estimate and post-routing). The verdict is the LAST line
+          # naming $glbnet$aux_phy_0__clk__o -- the earlier one for that clock is
+          # a placement estimate reading ~10 MHz low. Note this step is
+          # currently a no-op: LUNA builds in tempfile.mkdtemp() unless
+          # --keep-files is passed, so build/top.tim never exists.
           if [ -f build/top.tim ]; then
             grep "Max frequency for clock" build/top.tim || true
           fi

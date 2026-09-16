@@ -22,6 +22,9 @@ See ``docs/TIMING_CLOSURE.md``.
 from __future__ import annotations
 
 import os
+import re
+import shutil
+import subprocess
 from collections.abc import MutableMapping
 
 NEXTPNR_OPTS_VAR = "AMARANTH_nextpnr_opts"
@@ -145,6 +148,89 @@ DETERMINISM_VARS = {
 }
 
 
+#: Minimum yosys version that closes timing on this design.
+#:
+#: **The most load-bearing pin in this file, and it did not exist until
+#: 2026-09-15.** From byte-identical source at ``3ba7d8b``, measured full-flow
+#: at seed 9 with only the synthesis binary varied:
+#:
+#:     yosys 0.48+47  -> 56.57 MHz, no bitstream   (was the CI pin)
+#:     yosys 0.53+15  -> 53.82 MHz, no bitstream
+#:     yosys 0.60     -> 65.45 MHz, bitstream
+#:     yosys 0.68+136 -> 68.71 MHz, bitstream, 10/12 seeds
+#:
+#: A 2x2 cross against nextpnr 0.7 vs 0.11.1 puts ~+9-10 MHz on the yosys axis
+#: and only ~+2-3 MHz on the router axis -- newer yosys closes timing even on
+#: the *old* pinned nextpnr. Synthesis is the half that matters.
+#:
+#: This file pinned nextpnr options and solver threads for a long time while
+#: saying nothing about the synthesis tool. That is how one commit produced four
+#: different answers on four machines, why every run of the CI bitstream job was
+#: red, and why a toolchain artefact was misdiagnosed as an RTL regression.
+#:
+#: The *reason* newer yosys wins is unexplained. A 7.6x LUT7 macro difference
+#: (197 vs 26) is a real correlate but is refuted as the cause: a netlist with
+#: zero wide muxes still fails, and the passing 0.68 netlist keeps 291 L6MUX21.
+#: Do not build reasoning on it. See docs/handoffs/TIMING_CLOSURE_HANDOFF.md.
+MINIMUM_YOSYS_VERSION = (0, 60)
+
+_YOSYS_VERSION_RE = re.compile(r"Yosys\s+(\d+)\.(\d+)")
+
+
+def parse_yosys_version(text: str) -> tuple[int, int] | None:
+    """Return ``(major, minor)`` from ``yosys -V`` output, or None if absent.
+
+    ``yosys -V`` prints e.g. ``Yosys 0.68+136 (git sha1 c30457480-dirty, ...)``.
+    Only the leading ``major.minor`` is compared; the ``+N`` commit count and the
+    git suffix are deliberately ignored, because the measured cliff is between
+    0.53 and 0.60 rather than at any particular build.
+    """
+    match = _YOSYS_VERSION_RE.search(text)
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def detect_yosys_version() -> tuple[int, int] | None:
+    """Return the version of the ``yosys`` on PATH, or None if undeterminable.
+
+    Returns None rather than raising when yosys is absent, unparseable or fails
+    to run. The pure-Python test suite runs on machines with no FPGA toolchain,
+    and a genuinely missing yosys fails later in the build with a clearer error
+    than this guard could produce.
+    """
+    executable = shutil.which("yosys")
+    if executable is None:
+        return None
+    try:
+        completed = subprocess.run(
+            [executable, "-V"], capture_output=True, text=True, timeout=30, check=False
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return parse_yosys_version(completed.stdout or completed.stderr or "")
+
+
+def require_yosys_version(version: tuple[int, int] | None) -> None:
+    """Abort the build if `version` is below `MINIMUM_YOSYS_VERSION`.
+
+    An unknown version (None) is permitted rather than fatal -- see
+    `detect_yosys_version`. This mirrors `require_nextpnr_opts`: fail loudly up
+    front rather than spend ten minutes producing no bitstream.
+    """
+    if version is None or version >= MINIMUM_YOSYS_VERSION:
+        return
+    have = ".".join(str(part) for part in version)
+    want = ".".join(str(part) for part in MINIMUM_YOSYS_VERSION)
+    raise SystemExit(
+        f"yosys {have} is too old: this design does not close timing below "
+        f"{want} and no bitstream is produced. Measured at 3ba7d8b from "
+        f"identical source: 0.53 -> 53.82 MHz FAIL, 0.68 -> 68.71 MHz PASS. "
+        "Install oss-cad-suite 2026-09-01 or newer, or put a newer yosys first "
+        "on PATH. See docs/handoffs/TIMING_CLOSURE_HANDOFF.md."
+    )
+
+
 def compose_nextpnr_opts(existing: str | None) -> str:
     """Return nextpnr options with the required timing weight present.
 
@@ -176,14 +262,24 @@ def require_nextpnr_opts(value: str) -> None:
         )
 
 
-def apply_build_environment(env: MutableMapping[str, str] | None = None) -> str:
+def apply_build_environment(
+    env: MutableMapping[str, str] | None = None, *, enforce_yosys: bool = False
+) -> str:
     """Install the composed nextpnr options into `env` and return them.
 
     `env` is explicit so tests never mutate the real process environment.
+
+    `enforce_yosys` is opt-in rather than on by default because this function is
+    exercised throughout the pure-Python test suite, which must not shell out to
+    a toolchain: CI's test job has no yosys at all, and defaulting to enforcement
+    would make `pytest` abort on any developer machine whose PATH happens to
+    resolve to an older yosys. The bitstream build passes it.
     """
     target = os.environ if env is None else env
     composed = compose_nextpnr_opts(target.get(NEXTPNR_OPTS_VAR))
     require_nextpnr_opts(composed)
+    if enforce_yosys:
+        require_yosys_version(detect_yosys_version())
     target[NEXTPNR_OPTS_VAR] = composed
     target.update(DETERMINISM_VARS)
     return composed

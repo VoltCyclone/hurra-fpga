@@ -1040,7 +1040,13 @@ def main() -> None:
     # Must precede the LUNA import: the placer timing weight is read from the
     # environment when the build plan is prepared, and this is the single
     # choke point every bitstream-producing invocation passes through.
-    apply_build_environment()
+    #
+    # ``enforce_yosys`` is passed *only* here. This is the bitstream path, so an
+    # unsupported synthesis tool should abort now rather than spend ten minutes
+    # producing no bitstream -- the design does not close timing below yosys
+    # 0.60. The test suite calls the same function without it, because it is
+    # pure Python and runs where no toolchain exists.
+    apply_build_environment(enforce_yosys=True)
 
     from luna import top_level_cli
 
