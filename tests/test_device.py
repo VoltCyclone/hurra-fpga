@@ -167,3 +167,27 @@ def test_clone_readiness_and_connection_drop_on_same_cycle_descriptor_mutation()
 
     simulation.add_testbench(bench)
     simulation.run()
+
+
+def test_endpoint_submodule_names_are_stable_across_elaborations():
+    """Synthesis must be reproducible, which means no name may come from id().
+
+    LUNA names endpoint submodules after their class and falls back to
+    ``f"{name}_{id(endpoint)}"`` for the second and later instance of the same
+    class (``luna/gateware/usb/usb2/device.py``). All three relay endpoints
+    share a base class, so two of the three used to be named after an object
+    address. That produced a different netlist every build: two runs from
+    identical source on an identical toolchain gave seed 9 at 59.69 MHz FAIL
+    and 62.21 MHz PASS, i.e. naming churn alone moved the pinned seed across
+    the 60.00 MHz constraint.
+
+    Both tops are kept alive simultaneously so their endpoints cannot share a
+    recycled address, which would mask a regression.
+    """
+    first, second = CloneTop(), CloneTop()
+    first_il = rtlil.convert(first, ports=[first.dut.connect])
+    second_il = rtlil.convert(second, ports=[second.dut.connect])
+
+    stale = sorted(set(re.findall(r"USBStreamInEndpoint_\d{4,}", first_il)))
+    assert not stale, f"endpoint named after id(): {stale}"
+    assert first_il == second_il, "elaboration is not reproducible"

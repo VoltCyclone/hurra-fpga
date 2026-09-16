@@ -22,6 +22,9 @@ See ``docs/TIMING_CLOSURE.md``.
 from __future__ import annotations
 
 import os
+import re
+import shutil
+import subprocess
 from collections.abc import MutableMapping
 
 NEXTPNR_OPTS_VAR = "AMARANTH_nextpnr_opts"
@@ -94,24 +97,45 @@ REQUIRED_NEXTPNR_FLAG = "--placer-heap-timingweight"
 #:
 #: Still valid only while the netlist is unchanged: any RTL edit reshuffles
 #: placement and the sweep should be redone. That is now cheap and meaningful,
-#: because the result is reproducible.
+#: because the result is finally reproducible end to end -- see
+#: ``device.py``'s ``_RELAY_ENDPOINT_CLASSES``. Until 2026-09-15 it was not:
+#: LUNA named three of the four relay endpoints after ``id(endpoint)``, so
+#: every build synthesised a *different* netlist and no sweep described the
+#: design rather than one throwaway netlist.
 #:
-#: Re-swept 2026-09-13 after the High Speed work (poll counters, the
-#: unresponsive-device detach, and the host_disconnect diagnostics) changed the
-#: netlist. Seed 6 survived the change but only barely, at 60.63 MHz against a
-#: 60.00 MHz constraint -- 1% margin, which the next edit would spend. 12 seeds,
+#: **Every sweep recorded here before 2026-09-15 measured a netlist that no
+#: longer exists, and could not have been reproduced even at the time.** The
+#: superseded 2026-09-13 entry read 8 of 12 passing, seed 9 best at 65.45 MHz.
+#:
+#: Re-swept 2026-09-15 on the first reproducible netlist, sha 3c1c3404c085e7c2
+#: as built inside the container from ``/work``, oss-cad-suite 2026-09-01
+#: (yosys 0.68+136). That sha is **path-sensitive** -- yosys embeds source
+#: paths in ``src`` attributes, so the same logic built elsewhere hashes
+#: differently; a native build from a different directory gave a different sha
+#: with identical logic (98 modules, 24249 cells) and the same fmax on all
+#: twelve seeds. Compare shas only across builds from the same path. 12 seeds
 #: run directly on the synthesised top.json (~70 s each, synthesis is identical
-#: across seeds), 8 of 12 passing:
+#: across seeds), **12 of 12 passing**:
 #:
-#:     9: 65.45   12: 65.37   8: 65.09   4: 63.89   11: 63.48   3: 61.70
-#:     6: 60.63   10: 60.14   5: 59.51*   2: 58.57*   1: 57.79*   7: 55.96*
-#:                                       (* fails the 60.00 MHz constraint)
+#:     7: 69.05   2: 67.64   4: 65.98   12: 65.63   1: 65.42   3: 64.82
+#:     5: 63.35   8: 62.20   10: 61.74  11: 61.58   6: 61.07   9: 60.95
+#:
+#: Do not read 12/12 as the fix having *improved* timing. It did not: it froze
+#: a netlist that was previously redrawn every build, and this draw is a good
+#: one. Sweeps of earlier random draws returned 8, 10 and 11 of 12, so 12/12
+#: sits at the top of the observed range rather than outside it. What changed
+#: is that the number is now a property of the design instead of a coin toss.
+#:
+#: The pin moved 9 -> 7 for the same reason. Seed 9 was inherited from a sweep
+#: of a different netlist, and on this one it is the *worst* of the twelve at
+#: 60.95 MHz (+1.58%), where seed 7 has +15.1%. Pinning the worst passing seed
+#: was costing the design its entire margin for no reason.
 #:
 #: Read the verdict nextpnr prints on the frequency line, not the presence of
 #: its --textcfg output: nextpnr writes the textcfg even when timing fails, so
 #: "the file exists" is not a pass signal. (In the full LUNA flow no *bitstream*
 #: appears, because ecppack never runs -- that one is a real signal.)
-DEFAULT_PLACER_SEED = 9
+DEFAULT_PLACER_SEED = 7
 
 #: The full option, including the weight and seed that were actually measured.
 #: A caller-supplied ``--seed`` is composed after this one and wins, because
@@ -145,6 +169,112 @@ DETERMINISM_VARS = {
 }
 
 
+#: Minimum yosys version that closes timing on this design.
+#:
+#: **The most load-bearing pin in this file, and it did not exist until
+#: 2026-09-15.** From byte-identical source at ``3ba7d8b``, measured full-flow
+#: at seed 9 with only the synthesis binary varied:
+#:
+#:     yosys 0.48+47  -> 56.57 MHz, no bitstream   (was the CI pin)
+#:     yosys 0.53+15  -> 53.82 MHz, no bitstream
+#:     yosys 0.60     -> 65.45 MHz, bitstream
+#:     yosys 0.68+136 -> 68.71 MHz, bitstream, 10/12 seeds
+#:
+#: A 2x2 cross against nextpnr 0.7 vs 0.11.1 puts ~+9-10 MHz on the yosys axis
+#: and only ~+2-3 MHz on the router axis -- newer yosys closes timing even on
+#: the *old* pinned nextpnr. Synthesis is the half that matters.
+#:
+#: This file pinned nextpnr options and solver threads for a long time while
+#: saying nothing about the synthesis tool. That is how one commit produced four
+#: different answers on four machines, why every run of the CI bitstream job was
+#: red, and why a toolchain artefact was misdiagnosed as an RTL regression.
+#:
+#: The *reason* newer yosys wins is unexplained. A 7.6x LUT7 macro difference
+#: (197 vs 26) is a real correlate but is refuted as the cause: a netlist with
+#: zero wide muxes still fails, and the passing 0.68 netlist keeps 291 L6MUX21.
+#: Do not build reasoning on it. See docs/handoffs/TIMING_CLOSURE_HANDOFF.md.
+MINIMUM_YOSYS_VERSION = (0, 60)
+
+_YOSYS_VERSION_RE = re.compile(r"Yosys\s+(\d+)\.(\d+)")
+
+
+def parse_yosys_version(text: str) -> tuple[int, int] | None:
+    """Return ``(major, minor)`` from ``yosys -V`` output, or None if absent.
+
+    ``yosys -V`` prints e.g. ``Yosys 0.68+136 (git sha1 c30457480-dirty, ...)``.
+    Only the leading ``major.minor`` is compared; the ``+N`` commit count and the
+    git suffix are deliberately ignored, because the measured cliff is between
+    0.53 and 0.60 rather than at any particular build.
+    """
+    match = _YOSYS_VERSION_RE.search(text)
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def resolve_yosys_executable() -> str | None:
+    """Return the yosys binary the *build* will run, or None if there is none.
+
+    LUNA's generated ``build_top.sh`` starts with ``: ${YOSYS:=yosys}``, so the
+    build honours ``$YOSYS`` and only falls back to a PATH lookup. This guard
+    has to resolve the same way or it is not guarding the build: the container
+    pins ``YOSYS`` to an absolute path inside the oss-cad-suite bundle while a
+    different, older yosys can sit earlier on PATH, and checking the wrong one
+    can either reject the toolchain that would have worked or bless the one
+    that will not.
+    """
+    override = os.environ.get("YOSYS")
+    if override:
+        # Honour it whether it is an absolute path or a bare name, exactly as
+        # the shell would; shutil.which() on an absolute path validates that it
+        # exists and is executable, which is what we want either way.
+        return shutil.which(override) or (override if os.path.isfile(override) else None)
+    return shutil.which("yosys")
+
+
+def detect_yosys_version() -> tuple[int, int] | None:
+    """Return the version of the yosys the build will use, or None if unknown.
+
+    Returns None rather than raising when yosys is absent, unparseable or fails
+    to run. The pure-Python test suite runs on machines with no FPGA toolchain,
+    and a genuinely missing yosys fails later in the build with a clearer error
+    than this guard could produce.
+    """
+    executable = resolve_yosys_executable()
+    if executable is None:
+        return None
+    try:
+        completed = subprocess.run(
+            [executable, "-V"], capture_output=True, text=True, timeout=30, check=False
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return parse_yosys_version(completed.stdout or completed.stderr or "")
+
+
+def require_yosys_version(version: tuple[int, int] | None) -> None:
+    """Abort the build if `version` is below `MINIMUM_YOSYS_VERSION`.
+
+    An unknown version (None) is permitted rather than fatal -- see
+    `detect_yosys_version`. This mirrors `require_nextpnr_opts`: fail loudly up
+    front rather than spend ten minutes producing no bitstream.
+    """
+    if version is None or version >= MINIMUM_YOSYS_VERSION:
+        return
+    have = ".".join(str(part) for part in version)
+    want = ".".join(str(part) for part in MINIMUM_YOSYS_VERSION)
+    raise SystemExit(
+        f"yosys {have} is too old: below {want} this design closes on only a "
+        "small minority of placer seeds, so a build is a coin toss rather than "
+        "a result. Measured on deterministic netlists, same source, same "
+        "nextpnr, twelve seeds each: 0.48 -> 3 of 12 pass; 0.68 -> 12 of 12. "
+        f"{want} is a reliability floor, not the point at which a bitstream "
+        "first becomes possible. Install oss-cad-suite 2026-09-01 or newer, or "
+        "set YOSYS to a newer binary. See CLAUDE.md, 'The yosys floor, "
+        "measured properly'."
+    )
+
+
 def compose_nextpnr_opts(existing: str | None) -> str:
     """Return nextpnr options with the required timing weight present.
 
@@ -176,14 +306,24 @@ def require_nextpnr_opts(value: str) -> None:
         )
 
 
-def apply_build_environment(env: MutableMapping[str, str] | None = None) -> str:
+def apply_build_environment(
+    env: MutableMapping[str, str] | None = None, *, enforce_yosys: bool = False
+) -> str:
     """Install the composed nextpnr options into `env` and return them.
 
     `env` is explicit so tests never mutate the real process environment.
+
+    `enforce_yosys` is opt-in rather than on by default because this function is
+    exercised throughout the pure-Python test suite, which must not shell out to
+    a toolchain: CI's test job has no yosys at all, and defaulting to enforcement
+    would make `pytest` abort on any developer machine whose PATH happens to
+    resolve to an older yosys. The bitstream build passes it.
     """
     target = os.environ if env is None else env
     composed = compose_nextpnr_opts(target.get(NEXTPNR_OPTS_VAR))
     require_nextpnr_opts(composed)
+    if enforce_yosys:
+        require_yosys_version(detect_yosys_version())
     target[NEXTPNR_OPTS_VAR] = composed
     target.update(DETERMINISM_VARS)
     return composed

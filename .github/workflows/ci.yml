@@ -95,45 +95,207 @@ jobs:
           make -C firmware/teensy_hs_mouse clean
           make -C firmware/teensy_hs_mouse TOOLCHAIN_BIN=/usr/bin DIAG_SEND_EVERY=8
 
-  # The real regression: place and route on the pinned seed, and fail if the
-  # 60 MHz ULPI domain does not close. nextpnr writes no bitstream on a timing
-  # failure, so the artefact existing is the pass signal -- but the log line is
-  # checked too, because a silent drop in margin is worth seeing in the diff.
-  gateware:
-    name: bitstream (ECP5, pinned seed)
+  # Build the pinned toolchain image once; every downstream job runs inside it.
+  # Pinning the image IS the fix for the class of bug that kept this job red:
+  # the same source produced 56.57 / 53.82 / 68.71 MHz on three different yosys
+  # versions, and nothing pinned the synthesis tool. There is no official
+  # YosysHQ image -- the suite ships as dated tarballs -- so we build one.
+  toolchain:
+    name: toolchain image (pinned oss-cad-suite)
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
         with:
-          python-version: "3.12"
-          cache: pip
-      - uses: YosysHQ/setup-oss-cad-suite@v3
-        with:
-          osscadsuite-version: "2025-01-01"
-      - run: python -m pip install -e '.[dev]'
-      - name: yosys and nextpnr versions
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
         run: |
-          which yosys nextpnr-ecp5 ecppack
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}/ecp5-toolchain:2026-09-01" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v6
+        with:
+          context: docker
+          push: true
+          tags: ${{ steps.meta.outputs.image }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Synthesis is identical across seeds, so it runs exactly ONCE and every seed
+  # below places the same netlist. Fanning out full builds would re-run yosys
+  # twelve times for nothing.
+  gateware-synth:
+    name: synthesise (once)
+    needs: toolchain
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ needs.toolchain.outputs.image }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: tool versions
+        run: |
           yosys -V
           nextpnr-ecp5 --version
-      - name: build bitstream
-        run: |
-          LUNA_PLATFORM=cynthion.gateware.platform:CynthionPlatformRev1D4 \
-            make build
-      - name: report timing
-        if: always()
-        run: |
-          # top.tim carries four "Max frequency" lines (two clocks x
-          # placement-estimate and post-routing); the usb domain's post-routing
-          # result is the third.
-          if [ -f build/top.tim ]; then
-            grep "Max frequency for clock" build/top.tim || true
-          fi
+      - name: synthesise
+        run: REPO="$GITHUB_WORKSPACE" OUT="$GITHUB_WORKSPACE/out" synth.sh
       - uses: actions/upload-artifact@v4
-        if: success()
         with:
-          name: bitstream
-          path: build/hurra-cynthion.bit
+          name: netlist
+          path: |
+            out/top.json
+            out/top.lpf
+            out/top.sha256
           if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: netlist-sha
+          path: out/top.sha256
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: synth-logs
+          path: |
+            out/top.tim
+            out/synth.log
+
+  # Horizontal fan-out: one job per seed, all in parallel. Safe to parallelise
+  # because the image pins the Eigen/OpenMP thread counts to 1 -- placement is
+  # then bit-identical regardless of concurrency or host load.
+  gateware-sweep:
+    name: "P&R seed ${{ matrix.seed }}"
+    needs: [toolchain, gateware-synth]
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ needs.toolchain.outputs.image }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        seed: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: netlist
+          path: net
+      - name: place and route
+        run: pnr.sh net/top.json net/top.lpf ${{ matrix.seed }} res
+      - uses: actions/upload-artifact@v4
+        with:
+          name: seed-${{ matrix.seed }}
+          path: res/seed${{ matrix.seed }}.result.json
+          if-no-files-found: error
+      - name: upload bitstream (passing seeds only)
+        uses: actions/upload-artifact@v4
+        if: hashFiles(format('res/seed{0}.bit', matrix.seed)) != ''
+        with:
+          name: bitstream-seed-${{ matrix.seed }}
+          path: res/seed${{ matrix.seed }}.bit
+
+  # The gate. Previously this job built ONE seed, so a margin regression from
+  # 12/12 passing to 4/12 would have gone green silently. Now the pinned seed
+  # must close AND the sweep must hold its pass count.
+  #
+  # Both checks only became honest on 2026-09-15, when synthesis was made
+  # reproducible (device.py's _RELAY_ENDPOINT_CLASSES). Before that every run
+  # synthesised a different netlist, so "the pinned seed closes" was a coin
+  # toss -- seed 9 was measured at 59.69 FAIL and 62.21 PASS on two netlists
+  # built from byte-identical source. A red gate meant nothing and a green one
+  # meant less.
+  gateware-gate:
+    name: bitstream (ECP5, seed sweep gate)
+    needs: gateware-sweep
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: seed-*
+          path: results
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: netlist-sha
+          path: sha
+      - name: evaluate sweep
+        env:
+          # Seed 7: best of the twelve at 69.05 MHz on netlist 3c1c3404c085e7c2.
+          # The previous pin, seed 9, came from a sweep of a netlist that no
+          # longer exists and is the WORST seed on this one (60.95 MHz).
+          PINNED_SEED: "7"
+          # 12/12 pass today. The floor sits below that deliberately: it is a
+          # margin-regression detector, not a restatement of the current
+          # number, and -nowidelut once took a comparable design 8/12 -> 4/12.
+          # Set it at the current count and every seed becomes load-bearing.
+          MIN_PASSING: "9"
+          # Must match the sweep matrix. The gate runs under always(), so a
+          # seed job that crashed, timed out or was cancelled uploads no
+          # artifact -- and a pass count taken over "the artifacts that turned
+          # up" would then be satisfied by 9 passes plus 3 vanished jobs, while
+          # printing a reassuring "9/9". The floor only means anything against
+          # a known denominator, so the full set is asserted before it applies.
+          EXPECTED_SEEDS: "1,2,3,4,5,6,7,8,9,10,11,12"
+        run: |
+          python3 - <<'PY'
+          import glob, json, os, pathlib, sys
+
+          sha = pathlib.Path("sha/top.sha256")
+          if sha.is_file():
+              print(f"  netlist sha256: {sha.read_text().strip()}")
+
+          results = []
+          for path in sorted(glob.glob("results/seed*.result.json")):
+              with open(path) as handle:
+                  results.append(json.load(handle))
+          if not results:
+              sys.exit("no seed results were produced")
+
+          results.sort(key=lambda r: r["seed"])
+          pinned = int(os.environ["PINNED_SEED"])
+          floor = int(os.environ["MIN_PASSING"])
+          expected = {int(s) for s in os.environ["EXPECTED_SEEDS"].split(",")}
+          passing = [r for r in results if r["verdict"] == "PASS"]
+
+          missing = sorted(expected - {r["seed"] for r in results})
+          unexpected = sorted({r["seed"] for r in results} - expected)
+
+          width = max(len(str(r["fmax"])) for r in results)
+          for r in results:
+              mark = "  <- pinned" if r["seed"] == pinned else ""
+              print(f'  seed {r["seed"]:>2}: {r["fmax"]:>{width}} MHz  {r["verdict"]}{mark}')
+          print(f"  {len(passing)}/{len(expected)} seeds pass at 60.00 MHz")
+
+          failures = []
+          if missing:
+              failures.append(
+                  f"no result for seed(s) {missing} -- those jobs did not "
+                  "report, so the pass count below is taken over an incomplete "
+                  "sweep and cannot be compared against the floor"
+              )
+          if unexpected:
+              failures.append(f"unexpected seed(s) {unexpected} not in EXPECTED_SEEDS")
+          pinned_result = next((r for r in results if r["seed"] == pinned), None)
+          if pinned_result is None:
+              failures.append(f"pinned seed {pinned} produced no result")
+          elif pinned_result["verdict"] != "PASS":
+              failures.append(
+                  f'pinned seed {pinned} did not close: {pinned_result["fmax"]} MHz'
+              )
+          if len(passing) < floor:
+              failures.append(
+                  f"only {len(passing)}/{len(results)} seeds pass, floor is {floor} -- "
+                  "margin regressed even if the pinned seed still closes"
+              )
+          if failures:
+              sys.exit("TIMING GATE FAILED:\n  " + "\n  ".join(failures))
+          worst = min(passing, key=lambda r: r["fmax"])
+          print(f'  worst passing seed: {worst["seed"]} at {worst["fmax"]} MHz')
+          print("TIMING GATE PASSED")
+          PY

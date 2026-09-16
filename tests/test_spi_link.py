@@ -796,6 +796,24 @@ def test_zero_delay_slave_still_decodes() -> None:
     assert payload == _RELATIVE_PAYLOAD.to_bytes()
 
 
+def test_slave_presenting_at_the_latching_edge_does_not_decode() -> None:
+    # The upper bound of the tV(SO) budget, which the three passing cases above
+    # do not pin. The latching edge is at t = 50.0 ns (three usb cycles), so a
+    # slave that only becomes valid *at* that edge has zero setup and must
+    # fail. Measured: 0/1/2 cycles decode, 3 cycles does not.
+    #
+    # This matters for MCU selection, because the quotable budget is the last
+    # PASSING value -- 33.3 ns -- not the 50.0 ns edge position. An MCU whose
+    # data-valid-after-clock spec sits between the two has no setup margin at
+    # all. Pinning the boundary here means a gateware change that moves the
+    # sample phase is caught in CI rather than on a bench.
+    rx_valid, _bad_sof_count, _payload = _decode_with_slave_delay(3)
+    assert not rx_valid, (
+        "a slave presenting MISO at the latching edge decoded; the sample phase "
+        "moved and the tV(SO) budget is no longer 33.3 ns"
+    )
+
+
 def test_th_so_minimum_slave_still_decodes() -> None:
     # A slave changing MISO as early as th(SO) allows: 1 cycle = 16.67 ns,
     # just past the 15 ns minimum. With the previous two tests this brackets
