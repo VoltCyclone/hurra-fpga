@@ -685,13 +685,13 @@ display bugs.
   board as one draw from a distribution with a 20% failure mode — including
   every gate in §9 that was accepted on one boot.
 
-  **The mitigation is not complete.** All 40 experiment trials used a
-  flash-triggered reset. On 2026-09-16 a board running the default build — gap
-  wait present — came up mis-framed after a **VBUS power reset** (plugging in
-  J11), with the ladder looping past recovery #959 without repairing. So the
-  20/20 result does not generalise to power-on, and the hazard is reduced by an
-  unknown amount rather than removed. Whatever explains the mechanism has to
-  explain that too.
+  **Coverage on a power-on reset is untested, not disproven.** All 40
+  experiment trials used a flash-triggered reset, so the 20/20 result speaks
+  only to that path. A mis-framed boot was once observed on the default build
+  while J11 was being connected, but that event involved a mis-plug rather than
+  a clean power-on and is therefore not evidence either way — it is recorded
+  here only so nobody re-derives it as a finding. Establishing the power-on rate
+  needs its own trials.
 
 - **Serial number source.** `SYSCON->DIEID` is *revision and die number*,
   identical across boards of the same revision — wrong for a serial. No UUID
