@@ -12,3 +12,7 @@ firmware/ch32h417/include/ch32h417_conf.h -whitespace
 firmware/ch32h417/include/ch32h417_it.h -whitespace
 firmware/ch32h417/include/ch32h417_port.h -whitespace
 firmware/ch32h417/vendor/** -whitespace
+
+# Preserve byte-exact imported MCXN947 files: the MCUXpresso SDK subset and
+# the NXP hal_nxp linker scripts and startup. See firmware/mcxn947/PROVENANCE.md.
+firmware/mcxn947/vendor/** -whitespace
