@@ -12,6 +12,15 @@ OUT="${OUT:-/out}"
 PLATFORM="${LUNA_PLATFORM:-cynthion.gateware.platform:CynthionPlatformRev1D4}"
 
 mkdir -p "$OUT"
+
+# Remove anything this script is about to regenerate. OUT persists across runs
+# (`make container` reuses ./out), so without this a LUNA failure leaves the
+# PREVIOUS top.json in place, the existence check below accepts it, and the
+# sweep silently measures the old netlist while reporting success -- the exact
+# class of quietly-wrong green result this whole pipeline exists to prevent.
+rm -f "$OUT"/top.json "$OUT"/top.lpf "$OUT"/top.tim "$OUT"/top.ys \
+      "$OUT"/top.rpt "$OUT"/top.sha256 "$OUT"/hurra-cynthion.bit
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 cd "$WORK"

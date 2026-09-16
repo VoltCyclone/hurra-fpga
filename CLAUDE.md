@@ -72,7 +72,10 @@ and actively *hurts* new yosys: on 0.60 it drops 8/12 seeds to 4/12 and 65.45 MH
 
 The 60 MHz `usb` (ULPI) domain closes at HEAD **provided the toolchain is right**. On
 oss-cad-suite 2026-09-01 the tree produces a real bitstream at 69.05 MHz (seed 7), **12 of
-12 seeds passing**. On the older toolchains above it produces none.
+12 seeds passing**. On the old CI pin it passes **3 of 12** — so an older toolchain is not
+"produces no bitstream", it is "produces one on a quarter of seeds", which is worse: a
+single green build there proves nothing. See "The yosys floor, measured properly" below,
+which supersedes the single-seed table above.
 
 **Every CI run in this repository's history is red on the `bitstream (ECP5, pinned seed)`
 job, and none of them were an RTL problem** — CI pinned oss-cad-suite 2025-01-01 (yosys

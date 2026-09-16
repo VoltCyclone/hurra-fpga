@@ -47,8 +47,14 @@ container-synth: container-image
 
 # Parallel fan-out. Safe to parallelise only because the image pins the
 # Eigen/OpenMP thread counts to 1.
-container-sweep:
+#
+# Depends on container-synth rather than only container-image: the fan-out
+# happens INSIDE the container over $(SEEDS), so there is nothing to gain from
+# make-level parallelism here, and without the dependency `make -j container`
+# is free to start the sweep before top.json exists. Prerequisites of a target
+# have no order among themselves under -j.
+container-sweep: container-synth
 	docker run --rm -v "$(CURDIR)/$(OUT):/out" $(IMAGE) \
 	  sweep.sh /out/top.json /out/top.lpf /out/sweep $(SEEDS)
 
-container: container-synth container-sweep
+container: container-sweep

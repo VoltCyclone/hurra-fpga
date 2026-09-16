@@ -18,6 +18,7 @@ from hurra_cynthion.build_env import (
     parse_yosys_version,
     require_nextpnr_opts,
     require_yosys_version,
+    resolve_yosys_executable,
 )
 
 
@@ -122,7 +123,12 @@ def test_parse_yosys_version_returns_none_when_absent():
 
 
 def test_require_yosys_version_rejects_versions_below_the_floor():
-    """0.48 and 0.53 produce no bitstream at all from this source."""
+    """Below the floor, closure is a coin toss rather than impossible.
+
+    0.48 passes 3 of 12 placer seeds on a deterministic netlist where 0.68
+    passes 12 of 12. The guard enforces a reliability floor; it is not
+    asserting that an older yosys can never emit a bitstream.
+    """
     for version in ((0, 48), (0, 53), (0, 59)):
         with pytest.raises(SystemExit) as excinfo:
             require_yosys_version(version)
@@ -166,3 +172,44 @@ def test_apply_build_environment_enforces_yosys_when_asked(monkeypatch):
     env: dict[str, str] = {}
     apply_build_environment(env, enforce_yosys=True)
     assert REQUIRED_NEXTPNR_FLAG in env[NEXTPNR_OPTS_VAR]
+
+
+# `resolve_yosys_executable` exists because LUNA's generated build_top.sh reads
+# `: ${YOSYS:=yosys}`, so the build runs $YOSYS and only falls back to PATH.
+# A guard that probed PATH unconditionally would be checking a different binary
+# than the one that synthesises -- which is exactly the situation inside the
+# container, where YOSYS is pinned absolute into the oss-cad-suite bundle.
+
+
+def test_resolve_yosys_prefers_the_YOSYS_override(monkeypatch, tmp_path):
+    pinned = tmp_path / "pinned-yosys"
+    pinned.write_text("#!/bin/sh\nexit 0\n")
+    pinned.chmod(0o755)
+    monkeypatch.setenv("YOSYS", str(pinned))
+    monkeypatch.setattr(
+        "shutil.which", lambda name: name if name == str(pinned) else "/usr/bin/yosys"
+    )
+    assert resolve_yosys_executable() == str(pinned)
+
+
+def test_resolve_yosys_falls_back_to_path_when_unset(monkeypatch):
+    monkeypatch.delenv("YOSYS", raising=False)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/yosys" if name == "yosys" else None)
+    assert resolve_yosys_executable() == "/usr/bin/yosys"
+
+
+def test_resolve_yosys_ignores_an_empty_override(monkeypatch):
+    """An exported-but-empty YOSYS is the shell default, not a selection.
+
+    ``: ${YOSYS:=yosys}`` substitutes when the variable is unset OR empty, so
+    the build would use PATH here and so must this.
+    """
+    monkeypatch.setenv("YOSYS", "")
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/yosys" if name == "yosys" else None)
+    assert resolve_yosys_executable() == "/usr/bin/yosys"
+
+
+def test_resolve_yosys_returns_none_when_nothing_is_installed(monkeypatch):
+    monkeypatch.delenv("YOSYS", raising=False)
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    assert resolve_yosys_executable() is None

@@ -235,6 +235,13 @@ jobs:
           # number, and -nowidelut once took a comparable design 8/12 -> 4/12.
           # Set it at the current count and every seed becomes load-bearing.
           MIN_PASSING: "9"
+          # Must match the sweep matrix. The gate runs under always(), so a
+          # seed job that crashed, timed out or was cancelled uploads no
+          # artifact -- and a pass count taken over "the artifacts that turned
+          # up" would then be satisfied by 9 passes plus 3 vanished jobs, while
+          # printing a reassuring "9/9". The floor only means anything against
+          # a known denominator, so the full set is asserted before it applies.
+          EXPECTED_SEEDS: "1,2,3,4,5,6,7,8,9,10,11,12"
         run: |
           python3 - <<'PY'
           import glob, json, os, pathlib, sys
@@ -253,15 +260,27 @@ jobs:
           results.sort(key=lambda r: r["seed"])
           pinned = int(os.environ["PINNED_SEED"])
           floor = int(os.environ["MIN_PASSING"])
+          expected = {int(s) for s in os.environ["EXPECTED_SEEDS"].split(",")}
           passing = [r for r in results if r["verdict"] == "PASS"]
+
+          missing = sorted(expected - {r["seed"] for r in results})
+          unexpected = sorted({r["seed"] for r in results} - expected)
 
           width = max(len(str(r["fmax"])) for r in results)
           for r in results:
               mark = "  <- pinned" if r["seed"] == pinned else ""
               print(f'  seed {r["seed"]:>2}: {r["fmax"]:>{width}} MHz  {r["verdict"]}{mark}')
-          print(f"  {len(passing)}/{len(results)} seeds pass at 60.00 MHz")
+          print(f"  {len(passing)}/{len(expected)} seeds pass at 60.00 MHz")
 
           failures = []
+          if missing:
+              failures.append(
+                  f"no result for seed(s) {missing} -- those jobs did not "
+                  "report, so the pass count below is taken over an incomplete "
+                  "sweep and cannot be compared against the floor"
+              )
+          if unexpected:
+              failures.append(f"unexpected seed(s) {unexpected} not in EXPECTED_SEEDS")
           pinned_result = next((r for r in results if r["seed"] == pinned), None)
           if pinned_result is None:
               failures.append(f"pinned seed {pinned} produced no result")

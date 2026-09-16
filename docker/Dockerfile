@@ -2,12 +2,18 @@
 #
 # Reproducible ECP5 toolchain for hurra-cynthion.
 #
-# The yosys version decides whether this design closes timing. From
-# byte-identical source, measured full-flow at seed 9:
+# The yosys version decides whether this design closes timing. Measured on
+# DETERMINISTIC netlists -- same source, same nextpnr, twelve placer seeds per
+# arm, only yosys differing:
 #
-#     yosys 0.48+47  -> 56.57 MHz, no bitstream   (the old CI pin)
-#     yosys 0.53+15  -> 53.82 MHz, no bitstream
-#     yosys 0.68+136 -> 68.71 MHz, bitstream, 10/12 seeds
+#     yosys 0.48+47  -> 3 of 12 seeds pass   (the old CI pin)
+#     yosys 0.68+136 -> 12 of 12 seeds pass
+#
+# Old yosys is not "never closes" -- it closes on a quarter of seeds, which is
+# worse, because it means a single green build proves nothing. An earlier
+# single-seed table here read 0.48 -> 56.57 MHz "no bitstream"; that was one
+# draw from a netlist that changed every build, and seed 9 alone spans
+# 59.69-68.71 MHz on one unchanged yosys.
 #
 # There is no official YosysHQ container image -- the suite ships as dated
 # tarballs and YosysHQ uses Docker only to build it. Community images carry
@@ -17,8 +23,13 @@ FROM python:3.12-slim-bookworm
 
 ARG OSS_CAD_SUITE_DATE=2026-09-01
 ARG OSS_CAD_SUITE_STAMP=20260901
+# Consumed by the version check at the end of this file. ENV, not just ARG:
+# the check runs in a heredoc subprocess, which inherits the environment but
+# not build arguments, so an ARG alone would make --build-arg a silent no-op.
 ARG MINIMUM_YOSYS_MAJOR=0
 ARG MINIMUM_YOSYS_MINOR=60
+ENV MINIMUM_YOSYS_MAJOR=${MINIMUM_YOSYS_MAJOR} \
+    MINIMUM_YOSYS_MINOR=${MINIMUM_YOSYS_MINOR}
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl \
@@ -72,7 +83,10 @@ RUN set -eu; \
     python3 -c "import amaranth, luna; print('amaranth', amaranth.__version__)"; \
     python3 - <<'PYEOF'
 import os, re, subprocess, sys
-floor = (int(os.environ.get("MIN_MAJ", "0")), int(os.environ.get("MIN_MIN", "60")))
+floor = (
+    int(os.environ["MINIMUM_YOSYS_MAJOR"]),
+    int(os.environ["MINIMUM_YOSYS_MINOR"]),
+)
 out = subprocess.run([os.environ["YOSYS"], "-V"], capture_output=True, text=True).stdout
 m = re.search(r"Yosys\s+(\d+)\.(\d+)", out)
 if m is None:

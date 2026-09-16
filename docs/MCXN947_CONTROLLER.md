@@ -8,8 +8,9 @@ re-sweep. That is the most important scoping fact here and belongs in the PR
 description.
 
 Companion to `RP2350_CONTROLLER.md`, which records the alternative that was
-evaluated and not chosen; §1 says why. Both directories are gitignored by
-design, so this is local-only.
+evaluated and not chosen; §1 says why. Both are tracked repository
+documentation. They are design records rather than plans of record: §10 lists
+what is derived rather than measured, and nothing here has been built.
 
 Grounded in: the repo; UM12018 Rev 2.0 (board UM); MCXN947 datasheet Rev 8.2
 (11 June 2026); errata MCXNx4x_0P02G Rev 1.0 and MCXN_1P02G Rev 4.0

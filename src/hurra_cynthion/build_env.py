@@ -212,15 +212,35 @@ def parse_yosys_version(text: str) -> tuple[int, int] | None:
     return int(match.group(1)), int(match.group(2))
 
 
+def resolve_yosys_executable() -> str | None:
+    """Return the yosys binary the *build* will run, or None if there is none.
+
+    LUNA's generated ``build_top.sh`` starts with ``: ${YOSYS:=yosys}``, so the
+    build honours ``$YOSYS`` and only falls back to a PATH lookup. This guard
+    has to resolve the same way or it is not guarding the build: the container
+    pins ``YOSYS`` to an absolute path inside the oss-cad-suite bundle while a
+    different, older yosys can sit earlier on PATH, and checking the wrong one
+    can either reject the toolchain that would have worked or bless the one
+    that will not.
+    """
+    override = os.environ.get("YOSYS")
+    if override:
+        # Honour it whether it is an absolute path or a bare name, exactly as
+        # the shell would; shutil.which() on an absolute path validates that it
+        # exists and is executable, which is what we want either way.
+        return shutil.which(override) or (override if os.path.isfile(override) else None)
+    return shutil.which("yosys")
+
+
 def detect_yosys_version() -> tuple[int, int] | None:
-    """Return the version of the ``yosys`` on PATH, or None if undeterminable.
+    """Return the version of the yosys the build will use, or None if unknown.
 
     Returns None rather than raising when yosys is absent, unparseable or fails
     to run. The pure-Python test suite runs on machines with no FPGA toolchain,
     and a genuinely missing yosys fails later in the build with a clearer error
     than this guard could produce.
     """
-    executable = shutil.which("yosys")
+    executable = resolve_yosys_executable()
     if executable is None:
         return None
     try:
@@ -244,11 +264,14 @@ def require_yosys_version(version: tuple[int, int] | None) -> None:
     have = ".".join(str(part) for part in version)
     want = ".".join(str(part) for part in MINIMUM_YOSYS_VERSION)
     raise SystemExit(
-        f"yosys {have} is too old: this design does not close timing below "
-        f"{want} and no bitstream is produced. Measured at 3ba7d8b from "
-        f"identical source: 0.53 -> 53.82 MHz FAIL, 0.68 -> 68.71 MHz PASS. "
-        "Install oss-cad-suite 2026-09-01 or newer, or put a newer yosys first "
-        "on PATH. See docs/handoffs/TIMING_CLOSURE_HANDOFF.md."
+        f"yosys {have} is too old: below {want} this design closes on only a "
+        "small minority of placer seeds, so a build is a coin toss rather than "
+        "a result. Measured on deterministic netlists, same source, same "
+        "nextpnr, twelve seeds each: 0.48 -> 3 of 12 pass; 0.68 -> 12 of 12. "
+        f"{want} is a reliability floor, not the point at which a bitstream "
+        "first becomes possible. Install oss-cad-suite 2026-09-01 or newer, or "
+        "set YOSYS to a newer binary. See CLAUDE.md, 'The yosys floor, "
+        "measured properly'."
     )
 
 
