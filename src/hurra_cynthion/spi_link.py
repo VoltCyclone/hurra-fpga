@@ -324,6 +324,15 @@ class SPISlotMaster(Elaboratable):
         # CH32's tV(SO) max 25 ns and th(SO) min 15 ns (Table 3-26) that is
         # +25.0 ns of setup and +31.7 ns of hold.
         #
+        # Do not quote 50.0 ns as the usable budget when selecting an MCU. It
+        # is the position of the latching edge, so a slave that only becomes
+        # valid *at* it has zero setup and fails. Swept in simulation: 0, 1 and
+        # 2 usb cycles (0 / 16.7 / 33.3 ns) decode; 3 cycles (50.0 ns) does
+        # not. The quotable number is the last passing one, **33.3 ns**, and
+        # the gap up to 50.0 ns is setup time, not headroom.
+        # ``test_slave_presenting_at_the_latching_edge_does_not_decode`` pins
+        # the boundary so a change to the sample phase fails CI.
+        #
         # Capturing in the rising-edge cycle from the raw pad sampled it at
         # t = 33.33 ns: +8.3 ns setup, +48.3 ns hold. Positive, but the whole
         # +8.3 ns had to cover board delay, package delay and FPGA input
