@@ -32,13 +32,17 @@ firmware/**/*.map
 firmware/**/*.o
 firmware/**/.build-defines
 
-# AI assistant workspaces: planning specs/plans, session memory, and
-# tool-local settings. Kept on disk, never tracked.
+# AI assistant workspaces: planning specs/plans, session memory, installed
+# skills and tool-local settings. Kept on disk, never tracked. These are a
+# property of one developer's machine, not of the design.
+.agents/
 .claude/settings.local.json
+.claude/skills/
 .codebase-memory/
 .remember/
 .superpowers/
 docs/superpowers/
+skills-lock.json
 
 # Local engineering history: dated hardware validation runs and
 # point-in-time investigation notes. Kept on disk, not published.
