@@ -65,13 +65,35 @@ layout.
 below the 15 MHz SCK — and the board's Pmod header J7 is wired to FC0 *and* is
 DNP, so it is doubly unusable. Use the mikroBUS socket.
 
-| J6 pin | signal | MCU pin | note |
-|---|---|---|---|
-| 3 | `ME_FC6_SPI_CS` | P3_23 | — |
-| 4 | `ME_FC6_SPI_CLK` | P3_21 | also Arduino J1 pin 15 |
-| 5 | `ME_FC6_SPI_MISO` | P3_22 | — |
-| 6 | `ME_FC6_SPI_MOSI` | P3_20 | also Arduino J1 pin 5 |
-| 8 | GND | — | bridge GND only, not 3V3 |
+| J6 pin | signal | MCU pin | FlexComm signal | PORT mux | note |
+|---|---|---|---|---|---|
+| 3 | `ME_FC6_SPI_CS` | P3_23 | `FC6_P3` = PCS0 | **ALT2** | the odd one out |
+| 4 | `ME_FC6_SPI_CLK` | P3_21 | `FC6_P1` = SCK | ALT3 | also Arduino J1 pin 15 |
+| 5 | `ME_FC6_SPI_MISO` | P3_22 | `FC6_P2` = SIN pad | ALT3 | MCU drives it; see PINCFG |
+| 6 | `ME_FC6_SPI_MOSI` | P3_20 | `FC6_P0` = SOUT pad | ALT3 | MCU reads it; see PINCFG |
+| 8 | GND | — | — | — | bridge GND only, not 3V3 |
+
+**The mux column is measured, and P3_23 really does differ from its three
+neighbours.** Reading `FC6_Pn`'s position in the `pin_signal` string (e.g.
+`PIO3_20/WUU0_IN27/TRIG_OUT0/FC8_P4/FC6_P0/...`) as an ALT index is wrong —
+that string also lists functions occupying no mux slot. Pairing every
+`/* Pin is configured as FCn_Pm */` comment in every FRDM/EVK `pin_mux.c` with
+the `kPORT_MuxAltN` it programs gives a rule with no counterexample across 787
+configured pins: a pin offering one FlexComm puts it at ALT2; a pin offering two
+puts the first at ALT2 and the second at ALT3. P3_20/21/22 list FC8 before FC6,
+so FC6 is ALT3; P3_23 lists FC6 alone, so there it is ALT2. Muxing the chip
+select to ALT3 with its neighbours leaves PCS0 unconnected and the slave never
+frames — and the symptom is not an error, it is total silence with every FPGA
+counter flat, which is indistinguishable from the link never being attempted.
+
+**`CFGR1[PINCFG]` must be 3, because the socket's net names assume the board is
+master.** J6's MOSI net lands on `FC6_P0`, which is the LPSPI **SOUT** pad, and
+its MISO net on `FC6_P2`, the **SIN** pad. (`FCn_P0` is SOUT: the SDK's own
+LPSPI slave example labels `PIO0_24/FC1_P0/...` as `LPSPI1_SOUT`.) As the
+*slave* we must read the MOSI net and drive the MISO net — the opposite of the
+default. `PINCFG` 0b11 is "SOUT is used for input data; SIN is used for output
+data", which is exactly that swap. At the default 0b00 the MCU would drive
+P3_20 into the FPGA's own output driver and listen on a wire nobody drives.
 
 `mcu_ready` on J5 pin 2 (`ME_INT`, P5_7) as plain GPIO. Nothing may be populated
 on Arduino J1 pins 5 or 15.
@@ -80,7 +102,15 @@ on Arduino J1 pins 5 or 15.
 gives LPSPI6–9 30 MHz, Standard Drive 25, Mid-Drive 25 — and takes LPSPI3–5 to
 12.5. A routine power optimisation silently becomes a protocol violation. Run
 Overdrive at 150 MHz. LP2 additionally requires SCK ≤ f_periph/4, so FlexComm 6
-must be clocked ≥ 60 MHz; do not attach it to FRO12M.
+must be clocked ≥ 60 MHz; do not attach it to FRO12M — **and not to FRO_HF
+either.** `BOARD_BootClockPLL150M` leaves FRO_HF at 48 MHz (its own YAML header
+says `{id: FRO_HF_clock.outFreq, value: 48 MHz}`; its body calls
+`CLOCK_SetupFROHFClocking(48000000U)`), which caps SCK at 12 MHz against the
+15 MHz the FPGA clocks. `kFRO_HF_DIV_to_FLEXCOMM6` is the attach ID anyone
+reaching for "the fast FRO" would pick and it is a silent protocol violation.
+PLL0 is already at 150 MHz from the same profile, so route it through PLLCLKDIV
+— untouched by the board profile, so set it explicitly — and halve it to
+75 MHz, which is SCK × 5. `link.h` static-asserts the ≥ 4× SCK relation.
 
 ### Frame phase — `usb_sync` on Arduino J3 pin 3
 
@@ -623,8 +653,25 @@ display bugs.
   `devices/MCXN947/drivers/romapi/` first, then the RM's PUF/ELS chapter. Use a
   fixed placeholder meanwhile, and **never put a PUF transaction on the boot path
   between `mcu_ready` and the foreground loop.**
-- **`TCR[BYSW]` byte order** — derived, not measured. Resolves at step 2.
-- **`FCR[TXWATER]`/`[RXWATER]` encoding** — needs the RM.
+- ~~**`TCR[BYSW]` byte order**~~ — **RESOLVED at step 2: set it.** The eDMA
+  moves 32-bit words out of a byte array on a little-endian core, so the word
+  reaching the FIFO for slot bytes b0..b3 is `b0 | b1<<8 | b2<<16 | b3<<24`,
+  and shifted MSB-first that puts b3 on the wire first. `fsl_lpspi.h`'s
+  `kLPSPI_SlaveByteSwap` comment states the case: for a 32-bit frame a buffer
+  "1 2 3 4 5 6 7 8" clocks out "4 3 2 1 8 7 6 5" without the flag and
+  "1 2 3 4 5 6 7 8" with it. `fsl_lpspi_edma.c` corroborates from the other
+  side — on the DMA path there is no software marshalling at all and the driver
+  sets `TCR[BYSW]` from that same flag. Confirmed in the built image: `TCR` is
+  the literal `0x004000FF`. Still to be confirmed on the bench, which is what
+  `spi_bad_sof` flat means.
+- **`FCR[TXWATER]`/`[RXWATER]` encoding** — field *widths* are settled from the
+  header (both 3 bits, `TXWATER` at bit 0, `RXWATER` at bit 16, so 0–7 against
+  an 8-deep FIFO). The threshold *semantics* still want the RM. Step 2 uses
+  `TXWATER = 7`, `RXWATER = 0` on the reading that the request asserts while
+  the TX FIFO holds ≤ TXWATER words: only that value keeps the FIFO full, and
+  §3's "the whole outgoing frame is staged before CS ever falls" is true only
+  if it is. A lower value would still work at these rates but would give that
+  argument away.
 - ~~**CTIMER2's exact IRQ symbol name**~~ — **RESOLVED at step 1.**
   `CTIMER2_IRQHandler`, vector slot 34 (`CTIMER2_IRQn`). But that name is a
   weak trampoline: the root to declare is `CTIMER2_DriverIRQHandler`. See §7

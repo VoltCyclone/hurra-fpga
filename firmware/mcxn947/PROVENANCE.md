@@ -3,10 +3,12 @@
 Target: **FRDM-MCXN947** (MCXN947VDF, dual Cortex-M33), replacing the CH32H417 on
 the PMOD-A injection link. Design: `docs/MCXN947_CONTROLLER.md`.
 
-**This tree is at migration step 1 of that document's section 9** — CPU0 only:
-clock, blink, `make check`. There is no SPI, no eDMA, no USB, no display and no
-CPU1 image. What is *absent* is recorded here too, because "we did not vendor it
-yet" and "we decided not to vendor it" are different claims.
+**This tree is at migration step 2 of that document's section 9** — CPU0 only:
+clock, blink, and LPSPI6 as an SPI slave on LP_FLEXCOMM6 driven by a
+self-loading eDMA0 scatter-gather ring that transmits a permanently IDLE slot.
+There is no RX retirement, no USB, no display and no CPU1 image. What is
+*absent* is recorded here too, because "we did not vendor it yet" and "we
+decided not to vendor it" are different claims.
 
 Everything under `vendor/` is imported unmodified and is exempted from the
 repository whitespace gate by `.gitattributes`. Do not reformat it.
@@ -39,6 +41,10 @@ Imported unchanged:
 | `vendor/mcux-sdk/devices/MCXN947/system_MCXN947_cm33_core0.{c,h}` | same |
 | `vendor/mcux-sdk/devices/MCXN947/drivers/fsl_{common,common_arm,reset,port}.h` | `devices/MCXN947/drivers/` |
 | `vendor/mcux-sdk/devices/MCXN947/drivers/fsl_{clock,spc,gpio}.{c,h}` | `devices/MCXN947/drivers/` |
+| `vendor/mcux-sdk/devices/MCXN947/drivers/fsl_reset.c` | `devices/MCXN947/drivers/` |
+| `vendor/mcux-sdk/devices/MCXN947/drivers/fsl_lpflexcomm.{c,h}` | `devices/MCXN947/drivers/` |
+| `vendor/mcux-sdk/devices/MCXN947/drivers/fsl_edma.{c,h}`, `fsl_edma_core.h`, `fsl_edma_soc.{c,h}` | `devices/MCXN947/drivers/` |
+| `vendor/mcux-sdk/devices/MCXN947/drivers/fsl_lpspi.h` | `devices/MCXN947/drivers/` (**header only** — see deviation 4) |
 | `vendor/mcux-sdk/boards/frdmmcxn947/project_template/{clock_config.c,clock_config.h,board.h}` | same |
 
 `periph/` is taken whole, not pruned: `MCXN947_cm33_core0.h` includes all 78
@@ -48,22 +54,29 @@ price of the guarantee.
 
 ### Excluded from upstream 1, and why
 
-- **`fsl_common.c`, `fsl_common_arm.c`, `fsl_reset.c`.** Their *headers* are
-  required (`fsl_common.h` includes `fsl_common_arm.h`, which includes
-  `fsl_reset.h`), but no step-1 code calls `SDK_Malloc`, `SDK_DelayAtLeastUs`,
-  `InstallIRQHandler` or `RESET_*`, and the image links without them. Add the
-  `.c` back when a step first needs it, rather than carrying three translation
-  units nobody has read.
+- **`fsl_common.c`, `fsl_common_arm.c`.** Their *headers* are required
+  (`fsl_common.h` includes `fsl_common_arm.h`, which includes `fsl_reset.h`),
+  but nothing here calls `SDK_Malloc`, `SDK_DelayAtLeastUs` or
+  `InstallIRQHandler`, and the image links without them. Both were copied in
+  while step 2 was being built and then deleted again once the link proved it
+  did not reference either — an unused vendored file is a file nobody has read.
+  Add them back when a step first needs one.
+
+  `fsl_reset.c` **is** now imported: `LP_FLEXCOMM_Init()` calls
+  `RESET_ClearPeripheralReset()` to bring FlexComm6 out of reset.
 - **`board.c`, `pin_mux.c`, `peripherals.c`** from `project_template`.
   `board.c` pulls in `fsl_debug_console.h`, `fsl_lpi2c.h` and
   `fsl_lpflexcomm.h` for what step 1 needs two register writes of; see the
   deviation below. `pin_mux.c` configures the camera, the display and the
   Arduino headers as well as the LEDs. `board.h` **is** imported, because it is
   the authoritative record of the FRDM LED pinout.
-- **Every driver the design lists for a later step** — `fsl_edma*`, `fsl_lpspi*`,
-  `fsl_lpflexcomm`, `fsl_ctimer`, `fsl_wwdt`, `fsl_inputmux*`, `fsl_flexio*`,
-  `fsl_cache`, `fsl_mailbox`, `fsl_sema42`. An unused vendored driver is a file
-  nobody has read; each arrives with the step that calls it.
+- **Every driver the design lists for a *later* step** — `fsl_ctimer`,
+  `fsl_wwdt`, `fsl_inputmux*`, `fsl_flexio*`, `fsl_cache`, `fsl_mailbox`,
+  `fsl_sema42`. An unused vendored driver is a file nobody has read; each
+  arrives with the step that calls it. `fsl_edma*` and `fsl_lpflexcomm` left
+  this list at step 2, which is the step that calls them.
+- **`fsl_lpspi.c` and `fsl_lpspi_edma.c`** — excluded deliberately, not
+  deferred; only `fsl_lpspi.h` is imported. See deviation 4.
 - **`middleware/usb/phy/usb_phy.{c,h}`**, `boot_multicore_slave.c`, and the
   ST7796S / DBI / FlexIO display stack. Steps 4, 5 and 7 respectively.
 - **`fsl_dbi_flexio_smartdma`** — rejected outright, not deferred. SmartDMA is a
@@ -166,20 +179,153 @@ Each is a change *we* made, or a vendor behaviour we deliberately did not adopt.
    into it in the meantime. Both `.ld` files stay byte-exact.
    `make check`'s `shared-window-reserved` rung asserts the defsym survived.
 
-4. **`fsl_lpspi.c`'s built-in ERR051588 workaround will not be used.** Recorded
-   ahead of step 2 because the design doc asks for it: the driver does reset the
-   transmit FIFO, but only inside its transactional slave API, which this
-   firmware does not use — it drives LPSPI6 from an eDMA0 TCD ring directly. The
-   recovery ladder in design doc section 4 is ours and will live in `src/`.
+4. **`fsl_lpspi.c` is not vendored at all; only `fsl_lpspi.h` is, and the LPSPI
+   slave bring-up is hand-written in `src/link.c`.** The design doc asked for
+   the ERR051588 half of this to be recorded, and step 2 settles the rest.
 
-5. **No local modification to any vendored file.** Every file under `vendor/`
+   `LPSPI_SlaveInit()` is close to what we want but not close enough to adopt:
+   it writes `TCR` wholesale from four fields (`CPOL | CPHA | LSBF | FRAMESZ`),
+   which clears `TCR[BYSW]`, and it ends by enabling the module — so using it
+   would mean calling it, disabling the module again, rewriting `TCR`, and
+   re-enabling, for no gain over the fifteen register writes `link_spi_init()`
+   performs in a single documented order. Excluding the `.c` also keeps its
+   transactional API, its handles and its interrupt dispatch out of a tree whose
+   stated priority is that the guarded-line count goes down.
+
+   The ERR051588 consequence stands as recorded: the driver *does* reset the
+   transmit FIFO, but only inside that transactional slave API, so no workaround
+   comes for free. The recovery ladder in design doc section 4 is ours.
+   `link_mcu_ready_set()` is split out of `link_init()` precisely so that
+   ladder's first and last rungs already exist.
+
+5. **`include/` is on the include path as `-isystem`, not `-I`.**
+   `injection_wire.h` is generated from `protocol/report_injection_wire.json`
+   by `tools/generate_report_injection_wire.py` and carries a do-not-edit
+   header; it does not survive `-Wconversion` (`return (uint16_t)data[0] |
+   ((uint16_t)data[1] << 8)` promotes to `int`). Warning about code we are
+   forbidden to edit would only invite someone to edit it. The CH32 tree made
+   the same call for the same file.
+
+6. **`src/spi_frame.{c,h}`, `test/spi_frame_test.c` and
+   `include/injection_wire.h` are byte-exact copies of the CH32 originals**, so
+   the two controllers can be diffed against each other until step 10 retires
+   `firmware/ch32h417/`. `spi_frame.c` is 141 lines with no MMIO and includes
+   only `spi_frame.h` and `<stddef.h>`, so it ports unchanged rather than being
+   reimplemented — the CRC-16, slot pack/unpack and sequence classification are
+   hand-written per language and a second hand-written C copy would be a third
+   implementation to keep in step, not a second.
+
+   The claim is *enforced*, not asserted: `make check` runs `check-copies`,
+   which `cmp`s all four files against `../ch32h417/`. A drifting copy is
+   exactly how the two ends of a hand-written codec silently disagree, and
+   `tests/test_wire_cross_language.py` still compiles the **CH32** tree
+   (`FIRMWARE_ROOT = REPO_ROOT / "firmware" / "ch32h417"`), so nothing else in
+   the repository would notice a divergence here.
+
+7. **No local modification to any vendored file.** Every file under `vendor/`
    was verified byte-identical to its upstream with `cmp` / `diff -r` after
    copying. Should that ever stop being true, the changed file and its rationale
    belong in this list, as `core/startup_v5f.S` is recorded in the CH32 tree.
 
 ---
 
-## Findings while reading the vendored sources
+## Findings while building step 2
+
+Four of these change what the firmware does, and none of them is in the design
+doc. Each was settled from files this tree imports, not from the Reference
+Manual, which is still login-gated and not on disk.
+
+- **`TCR[BYSW]` = 1** — design doc section 10 lists the byte order as "derived,
+  not measured" and says it resolves at step 2. It resolves to *set*, and the
+  vendor states the case directly. The eDMA moves 32-bit words out of a byte
+  array on a little-endian core, so the word reaching the FIFO for slot bytes
+  b0..b3 is `b0 | b1<<8 | b2<<16 | b3<<24`, and shifted MSB-first that puts b3
+  on the wire first. `fsl_lpspi.h`'s `kLPSPI_SlaveByteSwap` comment covers
+  exactly this: for a 32-bit frame a buffer "1 2 3 4 5 6 7 8" clocks out as
+  "4 3 2 1 8 7 6 5" without the flag and "1 2 3 4 5 6 7 8" with it.
+
+  `fsl_lpspi_edma.c` is the corroborating case rather than the same claim
+  twice: on the DMA path there is no software marshalling at all — the engine
+  reads memory straight into `TDR` — and the driver sets `TCR[BYSW]` from that
+  same flag (lines 237-238 and 834-836). That is our situation exactly.
+  Confirmed in the built image: `TCR` is the literal `0x004000FF`, i.e.
+  `BYSW` set and `FRAMESZ` 255.
+
+- **`CFGR1[PINCFG]` = 3, and nothing in the design doc predicts it.** The
+  mikroBUS socket names its nets for a board acting as *master*, so J6's MOSI
+  net lands on P3_20 = `FC6_P0` = the LPSPI **SOUT** pad, and its MISO net on
+  P3_22 = `FC6_P2` = the **SIN** pad. (`FCn_P0` is SOUT: the SDK's own LPSPI
+  slave example labels `PIO0_24/FC1_P0/...` as `LPSPI1_SOUT`.) We are the
+  slave, so we must *read* the MOSI net and *drive* the MISO net — the opposite
+  of the default. `PINCFG` 0b11 is "SOUT is used for input data; SIN is used
+  for output data", which is precisely that swap. Left at the default 0b00 the
+  MCU would drive P3_20 into the FPGA's own driver and listen on a wire nobody
+  drives.
+
+- **The four pin ALT numbers are not what the `pin_signal` string suggests, and
+  the chip select is the odd one out.** Reading `FC6_Pn`'s position in e.g.
+  `PIO3_20/WUU0_IN27/TRIG_OUT0/FC8_P4/FC6_P0/...` as an ALT index gives the
+  wrong answer on three of the four pins: the string also lists functions that
+  occupy no mux slot. Pairing every `/* Pin is configured as FCn_Pm */` comment
+  in every FRDM/EVK `pin_mux.c` with the `kPORT_MuxAltN` it programs gives a
+  rule with no counterexample in 787 configured pins:
+
+  | pin offers | ALT |
+  |---|---|
+  | one FlexComm | ALT2 (136 cases) |
+  | two FlexComms, the first | ALT2 (643 cases) |
+  | two FlexComms, the second | ALT3 (8 cases) |
+
+  P3_20/21/22 each list FC8 before FC6, so FC6 is **ALT3** on all three.
+  P3_23 lists FC6 *only*, so there FC6_P3 is **ALT2**. Getting that one pin
+  wrong leaves PCS0 unconnected, the slave never frames, and the symptom is not
+  an error but total silence with every FPGA counter flat — indistinguishable
+  from the link never having been attempted.
+
+- **FlexComm6 cannot be clocked from FRO_HF.** `BOARD_BootClockPLL150M` leaves
+  FRO_HF at **48 MHz** — its own YAML header says `{id: FRO_HF_clock.outFreq,
+  value: 48 MHz}` and its body calls `CLOCK_SetupFROHFClocking(48000000U)`. LP2
+  requires SCK <= f_periph/4, so 48 MHz caps SCK at 12 MHz against the 15 MHz
+  the FPGA clocks: `kFRO_HF_DIV_to_FLEXCOMM6` would be a silent protocol
+  violation, and it is the attach ID someone reaching for "the fast FRO" would
+  pick. PLL0 is already at 150 MHz from the same profile, so `link_spi_init()`
+  routes it through PLLCLKDIV — which the board profile does not touch, hence
+  set explicitly — and halves it to 75 MHz. `link.h` static-asserts the
+  >= 4x SCK relation so a later divider edit cannot quietly break it.
+
+- **PORT5/GPIO5 have no clock gate to enable.** `mcu_ready` is P5_7, and
+  `fsl_clock.h`'s `clock_ip_name_t` stops at `kCLOCK_Port4` / `kCLOCK_Gpio4` —
+  there is no `kCLOCK_Port5`. This is consistent with design doc section 2
+  calling P5_7 "an always-on VDD_BAT pad" when it rejects the pin for timer
+  capture, and with the SDK's own `mc_pmsm` example writing `PORT5->PCR[]` with
+  no clock enable anywhere. `link.c` therefore enables nothing for this pin.
+  **If that turns out to be wrong the failure is silent**: `mcu_ready` stays
+  low, the FPGA latches `transfer_ready` low, and every counter stays flat —
+  which is what a *passing* gate looks like. Read `injection_link.link_ready`
+  over JTAG to tell the two apart; it is driven straight from the synchronised
+  `mcu_ready` pad (`gateware.py:805`).
+
+- **eDMA errata 51327 does not apply here, which is a near-miss worth
+  recording.** That erratum requires `NBYTES` to be a multiple of 8 when
+  scatter-gather is used, and our minor loop is 4 bytes — exactly the value it
+  would forbid. `MCXN947_cm33_core0_features.h:535` defines
+  `FSL_FEATURE_EDMA_HAS_ERRATA_51327 (0)`, so `EDMA_CheckErrata()` compiles out
+  and the pattern is legal on this part. The 4-byte minor loop is not
+  incidental: it makes every transfer request-paced by the FIFO, whereas a
+  32-byte minor loop would run to completion once started and could overrun a
+  FIFO that is not empty.
+
+- **SDK `assert()` is live in this image** (`__assert_func` is linked; nothing
+  defines `NDEBUG`). Inherited from step 1's flags rather than introduced here,
+  but it now matters more, because the vendored eDMA and LP_FLEXCOMM entry
+  points assert on their arguments. All of the ones this code can reach are
+  satisfied by construction (channel index, non-NULL descriptors); a violated
+  one would hang in newlib rather than reset, since `nosys.specs` makes `_write`
+  fail.
+
+---
+
+## Findings while reading the vendored sources (step 1)
 
 Recorded here because the design doc's section 10 lists them as unverified and
 these were resolved by reading files this commit imports.

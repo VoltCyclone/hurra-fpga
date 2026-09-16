@@ -1,0 +1,115 @@
+// The FPGA injection link: LPSPI6 as an SPI slave on LP_FLEXCOMM6, fed by a
+// self-loading eDMA0 scatter-gather ring.
+//
+// Migration step 2 of docs/MCXN947_CONTROLLER.md section 9. At this step the
+// MCU never originates a message: both TX banks are seeded with a complete
+// IDLE keepalive and nothing ever refills them, so the same inert slot is
+// clocked out forever. RX lands in two banks that nothing reads yet; retiring
+// them is step 3.
+//
+// Declarations here are portable C. Only the definitions in link.c that touch
+// MMIO are inside `#if defined(MCXN947)`, so the transport predicates below
+// compile and are tested on the host.
+//
+// --- Why mcu_ready is RAISED at this step, not held low ---------------------
+//
+// Design doc section 9 step 2 gates on "every `spi_bad_*` and `spi_queue_full`
+// flat while `link_ready = 1`, `spi_slots` advancing at 8 kHz, and
+// `map_active` never leaving 0". The `link_ready = 1` term is the load-bearing
+// one and it is why this firmware raises the line rather than holding it low:
+//
+//   1. `spi_slots` does not depend on us at all. `slot_counter` is incremented
+//      on the fixed cadence boundary in src/hurra_cynthion/spi_link.py:281, in
+//      a block whose own comment reads "A fixed slot boundary is generated
+//      independently of transfer state" -- it sits outside the `if ~active`
+//      arm. It advances at 8 kHz with no MCU attached.
+//
+//   2. With `mcu_ready` low, no error counter CAN move. `transfer_ready` is
+//      latched from `mcu_ready` at slot start (spi_link.py:289) and every one
+//      of the four `bad_*` counters is gated on it (`if transfer_ready &
+//      (rx_sof != SOF)` at :433, and so on down the Elif chain).
+//      `rx_queue_full` is gated on `valid_return`, whose first term is
+//      `transfer_ready`. So with the line low the FPGA never validates a
+//      returned slot and a flat counter asserts nothing.
+//
+// Raising it turns `transfer_ready` on and makes all five counters
+// load-bearing. Safety does not come from the ready line; it comes from the
+// wire contract. `valid_return` ends with `& (rx_type != INJ_TYPE_IDLE)`
+// (spi_link.py:183), so a slot whose type byte is INJ_TYPE_IDLE is never
+// deliverable however well-formed it is: `rx_valid` is never asserted, nothing
+// reaches the injection map, and `map_active` cannot leave 0. An inert slot is
+// safe *because* the FPGA validates it, not because it declines to look.
+//
+// `link_slot_is_inert_idle()` below is that argument as a predicate, and
+// test/link_test.c is the argument as a test.
+
+#ifndef HURRA_MCXN947_LINK_H
+#define HURRA_MCXN947_LINK_H
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#include "injection_wire.h"
+#include "spi_frame.h"
+
+// Banks per direction. Two, so the ring alternates and the CPU can refill the
+// bank the DMA is not pointing at -- the steady-state invariant in design doc
+// section 4. Step 2 never refills either one; step 3 is what needs the rule.
+// Power of two, because link_next_bank() masks rather than divides.
+#define LINK_SLOT_BANKS 2u
+_Static_assert((LINK_SLOT_BANKS & (LINK_SLOT_BANKS - 1u)) == 0u,
+               "LINK_SLOT_BANKS must be a power of two");
+
+// One slot is moved as 32-bit words: eDMA minor loop of one word per LPSPI
+// FIFO request, major loop of eight. A 32-bit access width is not a
+// preference -- it is what makes TCR[BYSW] the setting that decides byte
+// order, and the two must be reasoned about together (see link.c).
+#define LINK_DMA_MINOR_BYTES 4u
+#define LINK_DMA_MAJOR_ITER (INJ_FRAME_SIZE / LINK_DMA_MINOR_BYTES)
+_Static_assert(INJ_FRAME_SIZE % LINK_DMA_MINOR_BYTES == 0u,
+               "a 32-byte slot must divide into whole 32-bit DMA transfers");
+_Static_assert(LINK_DMA_MINOR_BYTES * LINK_DMA_MAJOR_ITER == INJ_FRAME_SIZE,
+               "the eDMA major loop must move exactly one slot");
+
+// TCR[FRAMESZ] is "bits per frame minus one". The FPGA holds CS low for one
+// 256-bit slot, so the frame is the whole slot and the two must agree exactly:
+// a short FRAMESZ would restart the frame mid-slot and shift every later byte.
+#define LINK_SPI_FRAMESZ (INJ_FRAME_SIZE * 8u - 1u)
+_Static_assert(LINK_SPI_FRAMESZ == 255u, "the FPGA clocks 256 bits per CS");
+
+// --- Portable transport predicates (host-tested) ---------------------------
+
+// Write the IDLE keepalive this step transmits forever: SOF, INJ_TYPE_IDLE,
+// sequence 0, length 0, zero payload, correct CRC-16. Always writes all
+// INJ_FRAME_SIZE bytes.
+void link_build_idle_slot(uint8_t slot[INJ_FRAME_SIZE]);
+
+// True when `slot` is exactly what step 2 promises the FPGA: well formed
+// enough that no `spi_bad_*` counter can move, and IDLE, so `valid_return` is
+// false and it can never be delivered.
+//
+// This is not an approximation of the gateware predicate; it is the same
+// conjunction. spi_frame_unpack() returns SPI_FRAME_IDLE only when SOF matched,
+// the type is one the contract assigns, the length equals the per-type exact
+// length, the CRC verifies, AND the type is INJ_TYPE_IDLE -- which is
+// term-for-term `transfer_ready & (rx_sof == SOF) & known_type &
+// (rx_length == expected_length) & (rx_received_crc == rx_crc)` holding while
+// `(rx_type != INJ_TYPE_IDLE)` fails.
+bool link_slot_is_inert_idle(const uint8_t slot[INJ_FRAME_SIZE]);
+
+// Successor bank in the ring.
+uint8_t link_next_bank(uint8_t bank);
+
+// --- Hardware entry points (target only) -----------------------------------
+
+// Mux the mikroBUS J6 pins and `mcu_ready`, seed both TX banks, build and arm
+// the eDMA0 scatter-gather rings, enable LPSPI6, and only then raise
+// `mcu_ready`. Ordering is the safety invariant's boot ladder and is not an
+// implementation detail; see link.c.
+void link_init(void);
+
+// Drive `mcu_ready`. Called by link_init() at both ends of the ladder, and the
+// first and last rungs of the step-3 ERR051588 recovery.
+void link_mcu_ready_set(bool ready);
+
+#endif  // HURRA_MCXN947_LINK_H

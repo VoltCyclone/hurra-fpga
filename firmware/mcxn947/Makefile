@@ -1,9 +1,10 @@
-# FRDM-MCXN947 controller firmware -- migration step 1: CPU0 only.
+# FRDM-MCXN947 controller firmware -- migration step 2: CPU0 only.
 #
 # Builds ONE image. It brings the part to overdrive + 150 MHz, arms a 1 kHz
-# SysTick, and blinks the green LED. There is no SPI, no USB, no display and no
-# CPU1 image yet; each arrives with its own step in docs/MCXN947_CONTROLLER.md
-# section 9.
+# SysTick, blinks the green LED, and brings up LPSPI6 as an SPI slave on
+# LP_FLEXCOMM6 fed by a self-loading eDMA0 scatter-gather ring that transmits a
+# permanently IDLE slot. There is no USB, no display and no CPU1 image yet;
+# each arrives with its own step in docs/MCXN947_CONTROLLER.md section 9.
 #
 # `make all` is not the gate. --gc-sections will silently discard a translation
 # unit that nothing references, and the vector table declares every handler
@@ -46,7 +47,12 @@ VENDOR_HAL := vendor/hal_nxp
 LINKER_SCRIPT := $(VENDOR_HAL)/devices/MCXN947/gcc/MCXN947_cm33_core0_flash.ld
 STARTUP       := $(VENDOR_HAL)/devices/MCXN947/gcc/startup_MCXN947_cm33_core0.S
 
-INCLUDES := -Isrc \
+# `include/` holds the generated wire contract, so it is -isystem rather than
+# -I: injection_wire.h is machine-generated from
+# protocol/report_injection_wire.json, carries a do-not-edit header, and does
+# not survive -Wconversion. Warning about code we are forbidden to fix would
+# only invite someone to fix it. Same treatment as the CH32 tree.
+INCLUDES := -Isrc -isystem include \
 	-isystem $(VENDOR_SDK)/CMSIS/Core/Include \
 	-isystem $(VENDOR_SDK)/devices/MCXN947 \
 	-isystem $(VENDOR_SDK)/devices/MCXN947/periph \
@@ -136,6 +142,13 @@ LDFLAGS := $(ARCH) -T$(LINKER_SCRIPT) -Wl,--gc-sections \
 # archive, or is dropped from the object list on the assumption that the vector
 # table alone retains it. The mechanism is established now, while the list is
 # two lines long, rather than during the step that first needs it.
+#
+# Step 2 adds no root. Its eDMA0 rings are scatter-gather and self-loading, so
+# the link needs no ISR at all -- and with no console yet, an MCU-side liveness
+# counter would be unreadable anyway. The retention roots that matter here are
+# the ones step 3 adds when it turns on INTMAJOR for the RX channel, and the
+# name to root then is `EDMA_0_CH1_DriverIRQHandler`, not the vector-table
+# `EDMA_0_CH1_IRQHandler`, which is only a weak trampoline.
 CORE0_RETAIN := \
 	main=build/core0/main_core0.o \
 	SysTick_Handler=build/core0/heartbeat.o
@@ -155,11 +168,19 @@ CORE0_OBJECTS := \
 	build/core0/fsl_clock.o \
 	build/core0/fsl_spc.o \
 	build/core0/fsl_gpio.o \
+	build/core0/fsl_reset.o \
+	build/core0/fsl_lpflexcomm.o \
+	build/core0/fsl_edma.o \
+	build/core0/fsl_edma_soc.o \
 	build/core0/platform.o \
 	build/core0/heartbeat.o \
+	build/core0/spi_frame.o \
+	build/core0/dbg_uart.o \
+	build/core0/link.o \
 	build/core0/main_core0.o
 
-.PHONY: all check clean flash probes test test-platform test-heartbeat
+.PHONY: all check check-copies clean flash probes test test-platform \
+	test-heartbeat test-link test-spi-frame
 
 all: build/hurra-mcxn947-core0.bin
 
@@ -179,6 +200,20 @@ build/core0/platform.o: src/platform.c src/platform.h | build/core0
 	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
 build/core0/heartbeat.o: src/heartbeat.c src/heartbeat.h | build/core0
+	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
+
+build/core0/link.o: src/link.c src/link.h src/spi_frame.h src/platform.h src/dbg_uart.h \
+		include/injection_wire.h | build/core0
+	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
+
+# TEMPORARY step-2 bring-up diagnostic -- remove with src/dbg_uart.*
+build/core0/dbg_uart.o: src/dbg_uart.c src/dbg_uart.h | build/core0
+	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
+
+# Byte-exact copy of firmware/ch32h417/src/spi_frame.c; `make check-copies`
+# holds the two identical. Built with the app warning set, not the vendor one:
+# it is our code, just shared.
+build/core0/spi_frame.o: src/spi_frame.c src/spi_frame.h include/injection_wire.h | build/core0
 	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
 # --- vendor objects ---------------------------------------------------------
@@ -203,7 +238,28 @@ build/core0 build/host:
 CHECK_OBJECT_ARGS := $(foreach o,$(CORE0_OBJECTS),--object core0.elf:$(o))
 CHECK_RETAIN_ARGS := $(foreach r,$(CORE0_RETAIN),--retain core0.elf:$(r))
 
-check: all
+# The wire codec and the generated contract header are byte-exact copies of the
+# CH32 originals, so that the two controllers can be diffed against each other
+# until step 10 retires that tree. "Byte-exact" is worth nothing as a claim in
+# PROVENANCE.md and everything as an assertion, so assert it: a drifting copy
+# is how the two ends of a hand-written-per-language codec silently disagree.
+#
+# injection_wire.h additionally carries a do-not-edit header and is generated
+# from protocol/report_injection_wire.json by
+# tools/generate_report_injection_wire.py; this rung is what stops it being
+# hand-patched here.
+CH32_TREE := ../ch32h417
+COPIED_FILES := src/spi_frame.c src/spi_frame.h test/spi_frame_test.c
+
+check-copies:
+	@for f in $(COPIED_FILES); do \
+		cmp "$$f" "$(CH32_TREE)/$$f" || exit 1; \
+		echo "  PASS  byte-exact copy: $$f"; \
+	done
+	@cmp include/injection_wire.h $(CH32_TREE)/include/injection_wire.h || exit 1
+	@echo "  PASS  byte-exact copy: include/injection_wire.h"
+
+check: all check-copies
 	python3 tools/check_mcxn947_images.py --self-test
 	python3 tools/check_mcxn947_images.py --cross-compile $(CROSS_COMPILE) \
 		--core0 build/core0.elf \
@@ -223,7 +279,7 @@ check: all
 # They are the demonstration that the guard polarity holds: if a module ever
 # grows MMIO outside its guard, the host build of it stops compiling here.
 
-test: test-platform test-heartbeat
+test: test-platform test-heartbeat test-spi-frame test-link
 
 test-platform: build/host/platform_test
 	./build/host/platform_test
@@ -236,6 +292,20 @@ test-heartbeat: build/host/heartbeat_test
 
 build/host/heartbeat_test: test/heartbeat_test.c src/heartbeat.c src/heartbeat.h | build/host
 	$(HOST_CC) $(APP_WARNINGS) -Isrc test/heartbeat_test.c src/heartbeat.c -o $@
+
+test-spi-frame: build/host/spi_frame_test
+	./build/host/spi_frame_test
+
+build/host/spi_frame_test: test/spi_frame_test.c src/spi_frame.c src/spi_frame.h \
+		include/injection_wire.h | build/host
+	$(HOST_CC) $(APP_WARNINGS) -Isrc -isystem include test/spi_frame_test.c src/spi_frame.c -o $@
+
+test-link: build/host/link_test
+	./build/host/link_test
+
+build/host/link_test: test/link_test.c src/link.c src/spi_frame.c src/link.h \
+		src/spi_frame.h include/injection_wire.h | build/host
+	$(HOST_CC) $(APP_WARNINGS) -Isrc -isystem include test/link_test.c src/link.c src/spi_frame.c -o $@
 
 # --- flash -----------------------------------------------------------------
 #
