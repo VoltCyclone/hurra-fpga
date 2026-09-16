@@ -39,6 +39,15 @@ ENV PATH="${PATH}:/opt/oss-cad-suite/bin" \
     NEXTPNR_ECP5=/opt/oss-cad-suite/bin/nextpnr-ecp5 \
     ECPPACK=/opt/oss-cad-suite/bin/ecppack
 
+# A login shell (bash -lc, and some CI step shells) sources /etc/profile, which
+# RESETS PATH and discards the ENV above -- `yosys` then reports "command not
+# found" inside the very image that contains it. The absolute pins above keep
+# the build scripts working regardless, but interactive use and any `yosys -V`
+# step need this too.
+RUN printf 'export PATH="$PATH:/opt/oss-cad-suite/bin"\n' \
+      > /etc/profile.d/oss-cad-suite.sh \
+ && chmod 0644 /etc/profile.d/oss-cad-suite.sh
+
 # nextpnr's own --threads does not reach the HeAP placer's Eigen solver, which
 # diverges at its first iteration with core availability. Pinned, placement is
 # bit-identical even under oversubscription -- which is what makes fanning the

@@ -14,10 +14,14 @@ shift 3
 SEEDS=("$@")
 if [ "${#SEEDS[@]}" -eq 0 ]; then SEEDS=(1 2 3 4 5 6 7 8 9 10 11 12); fi
 
-# ~1.25 cores per nextpnr; stay at or under core count for wall-clock, though
-# correctness holds beyond it.
-JOBS="${JOBS:-$(( $(nproc) * 4 / 5 ))}"
+# Run every seed concurrently by default. Deriving this from nproc was a bug:
+# nproc honours cgroup/affinity limits and reports 1 inside a container, which
+# silently collapsed the whole fan-out to sequential. Concurrency is safe at any
+# level because the image pins the Eigen/OpenMP thread counts to 1, so placement
+# does not depend on how many jobs are in flight -- only wall-clock does.
+JOBS="${JOBS:-${#SEEDS[@]}}"
 if [ "$JOBS" -lt 1 ]; then JOBS=1; fi
+echo "sweeping ${#SEEDS[@]} seeds, ${JOBS} at a time (nproc reports $(nproc))" >&2
 
 mkdir -p "$OUT"
 printf '%s\n' "${SEEDS[@]}" \
