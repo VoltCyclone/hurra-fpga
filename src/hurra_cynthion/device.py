@@ -154,6 +154,32 @@ class DescriptorStoreCopyEngine(Elaboratable):
         return m
 
 
+#: One distinct subclass per relay endpoint, so that synthesis is reproducible.
+#:
+#: LUNA names endpoint submodules after their class, and falls back to
+#: ``f"{name}_{id(endpoint)}"`` for the second and later instance of the same
+#: class (``luna/gateware/usb/usb2/device.py``). ``id()`` is an object address,
+#: so every build emitted different instance names, a different RTLIL, and --
+#: because yosys cell naming feeds abc9's cut selection -- a different netlist.
+#: All four relay endpoints share a base class, so three of the four were named
+#: this way.
+#:
+#: That is not cosmetic here. Measured 2026-09-15: two builds from identical
+#: source and an identical pinned toolchain produced netlists of the same size
+#: but different content (sha f896e7d3 vs f2cf4f37), and seed 9 came out at
+#: 59.69 MHz FAIL on one and 62.21 MHz PASS on the other. Run-to-run naming
+#: churn alone moved the pinned seed across the 60.00 MHz constraint, so no
+#: build was reproducible and no seed sweep described the design rather than
+#: one throwaway netlist.
+#:
+#: Giving each endpoint its own class keeps LUNA on its stable-name path;
+#: the endpoints are otherwise unmodified.
+_RELAY_ENDPOINT_CLASSES = {
+    epnum: type(f"USBStreamInEndpoint{epnum}", (USBStreamInEndpoint,), {})
+    for epnum in RELAY_ENDPOINT_NUMBERS
+}
+
+
 class MouseCloneDevice(Elaboratable):
     """Present captured descriptors and reports as a PC-facing USB device.
 
@@ -226,7 +252,9 @@ class MouseCloneDevice(Elaboratable):
         setup = self._std_handler.interface.setup
 
         for index, epnum in enumerate(RELAY_ENDPOINT_NUMBERS):
-            ep = USBStreamInEndpoint(endpoint_number=epnum, max_packet_size=MAX_PACKET_SIZE)
+            ep = _RELAY_ENDPOINT_CLASSES[epnum](
+                endpoint_number=epnum, max_packet_size=MAX_PACKET_SIZE
+            )
             device.add_endpoint(ep)
             m.d.comb += ep.stream.stream_eq(relay.streams[index])
 
