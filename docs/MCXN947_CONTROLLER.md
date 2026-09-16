@@ -401,6 +401,22 @@ the link's arbitration budget.
 
 `.gitattributes`: add `firmware/mcxn947/vendor/** -whitespace`.
 
+**The two upstreams are different SDK vintages, which matters for the vector
+table.** Checked at step 1: hal_nxp's `startup_*.S` vector block against
+24.12.00's own startup is 172 entries in identical order, no slot inserted or
+removed, and slot indices agree with `IRQn_Type` at `EDMA_0_CH0` (1), `CTIMER2`
+(34), `LP_FLEXCOMM6` (41) and `QDC0_COMPARE` (124). Only *names* diverge, at
+slots this design does not use: hal_nxp says `ENC0_*`/`ENC1_*` where 24.12.00
+renamed the peripheral to QDC, so **anyone wiring a QDC interrupt must define
+the `ENC*` handler name while the NVIC enum reads `QDC*`**; and hal_nxp's
+`SM3`/`TRNG0` at slots 165-166 are reserved in 24.12.00.
+
+**Do not take board pin definitions from another MCXN947 project's SDK export.**
+A local one (`~/git/dm-mcx-streamdeck`) declares `BOARD_NAME "FRDM-MCXN947"`
+while mapping the RGB LED to GPIO3[2:4] active-high — the MCX-N9XX-EVK pinout.
+The FRDM board package in 24.12.00 is authoritative: **P0_10 red, P0_27 green,
+P1_2 blue, PORT mux ALT0, active LOW.**
+
 ### `--gc-sections` and `make check`
 
 The lesson transfers and is *worse* here: `startup_MCXN947_cm33_core*.S` declares
@@ -412,8 +428,26 @@ Geometry declared once in the Makefile and passed to both `merge_images.py` and
 `check_images.py`. `make check` asserts, for **both** images:
 
 1. Every `--undefined=` root is defined in its own image **and does not resolve
-   to `DefaultISR`** — one line of `nm`, and the single most likely silent
-   failure on this part.
+   to `DefaultISR`** — the single most likely silent failure on this part.
+   **An address comparison alone is not sufficient, and "one line of `nm`" was
+   wrong.** Measured at step 1: the startup has a *two-level* dispatch and
+   three distinct weak shapes.
+
+   ```
+   CTIMER2_DriverIRQHandler  W  0x4f8   == DefaultISR
+   CTIMER2_IRQHandler        W  0x598   weak trampoline, own address
+   HardFault_Handler         W  0x500   weak self-loop, own address
+   SysTick_Handler           T  0x1830  ours, strong
+   ```
+
+   The vector table names `<NAME>_IRQHandler`, which is a weak trampoline that
+   branches to `<NAME>_DriverIRQHandler`; only the *Driver* name is `.set` to
+   `DefaultISR`. So rooting the vector-table name and comparing addresses
+   returns PASS against NXP's own trampoline while the handler is unimplemented
+   — the exact failure the rung exists to catch. **For a peripheral vector the
+   root that means anything is `<NAME>_DriverIRQHandler`.** Test the `nm`
+   binding letter (weak vs strong) as well as the address, and that the named
+   owning object defines it.
 2. Object survival per core.
 3. Image geometry — and **core1's lowest LOAD PhysAddr equals `CORE1_OFFSET`**,
    read from the ELF rather than trusted from the Makefile. That is the
@@ -537,13 +571,22 @@ display bugs.
   between `mcu_ready` and the foreground loop.**
 - **`TCR[BYSW]` byte order** — derived, not measured. Resolves at step 2.
 - **`FCR[TXWATER]`/`[RXWATER]` encoding** — needs the RM.
-- **CTIMER2's exact IRQ symbol name** — read it out of the vendored
-  `startup_MCXN947_cm33_core0.S` vector table, since that is what
-  `--gc-sections` matches against.
+- ~~**CTIMER2's exact IRQ symbol name**~~ — **RESOLVED at step 1.**
+  `CTIMER2_IRQHandler`, vector slot 34 (`CTIMER2_IRQn`). But that name is a
+  weak trampoline: the root to declare is `CTIMER2_DriverIRQHandler`. See §7
+  rung 1.
 - **LPCAC does not cache SRAM** — strongly supported; confirm before step 6.
-  Detectable by design (frozen `slot_counter`).
-- **`NonCacheable` region in the vendored `.ld`s** — needed for two DMA engines
-  in two regions. Check before step 2.
+  Detectable by design (frozen `slot_counter`). Narrowed at step 1:
+  `SystemInit()` *enables* LPCAC (`SYSCON->LPCAC_CTRL &= ~DIS_LPCAC_MASK`), so
+  the question starts from "on by default in every image" rather than from an
+  unknown. `SystemInit()` also disables RAM ECC and the aGDET/dGDET chip-reset
+  path — worth knowing before trusting either.
+- ~~**`NonCacheable` region in the vendored `.ld`s**~~ — **RESOLVED at step 1:
+  there is no such region.** `*(NonCacheable.init)` and `*(NonCacheable)` are
+  collected into the ordinary `.data` output section in `m_data`, alongside
+  `CodeQuickAccess`/`DataQuickAccess`. The attribute buys nothing as the script
+  stands, so step 2's two-DMA-engine coherency story needs an MPU region or an
+  explicit placement decision — not this.
 - **ILI9341 `tWC` = 66 ns** — the figure behind `baudRateDiv = 6`; the panel
   datasheet is not on disk. (S035/ST7796S may differ; confirm for the actual
   panel.)
