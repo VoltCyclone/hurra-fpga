@@ -75,7 +75,21 @@ done
 
 ## Expected results
 
-Seed 9 is pinned (`DEFAULT_PLACER_SEED`). On this toolchain 10 of 12 seeds
-pass; seeds 7 and 10 fail at ~58.8 MHz, and the worst passing seed is 4 at
-60.98 MHz (+1.63%). The seed pin is load-bearing — any RTL edit invalidates the
-sweep and it must be redone.
+Seed 7 is pinned (`DEFAULT_PLACER_SEED`). On this toolchain and netlist
+`3c1c3404c085e7c2`, **all 12 seeds pass**, seed 7 best at 69.05 MHz (+15.1%)
+and seed 9 worst at 60.95 MHz (+1.58%).
+
+Those numbers are only meaningful because synthesis became reproducible on
+2026-09-15 (see `device.py`'s `_RELAY_ENDPOINT_CLASSES`). Before that, LUNA
+named three of the four relay endpoints after `id(endpoint)`, so **every build
+synthesised a different netlist** and any recorded sweep described one
+throwaway artefact. Sweeps of those random draws returned 8, 10 and 11 of 12,
+so 12/12 is the top of the observed range rather than an improvement — the
+fix froze a good draw, it did not make the design faster.
+
+The pin moved 9 → 7 because seed 9 was inherited from a sweep of a different
+netlist, and on this one it is the *worst* of the twelve.
+
+Any RTL edit changes the netlist by design and invalidates this sweep; redo it
+and re-record the sha. `synth.sh` prints the sha and writes `top.sha256` so a
+surprising sweep can be told apart from a changed netlist at a glance.

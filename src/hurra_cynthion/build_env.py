@@ -97,24 +97,40 @@ REQUIRED_NEXTPNR_FLAG = "--placer-heap-timingweight"
 #:
 #: Still valid only while the netlist is unchanged: any RTL edit reshuffles
 #: placement and the sweep should be redone. That is now cheap and meaningful,
-#: because the result is reproducible.
+#: because the result is finally reproducible end to end -- see
+#: ``device.py``'s ``_RELAY_ENDPOINT_CLASSES``. Until 2026-09-15 it was not:
+#: LUNA named three of the four relay endpoints after ``id(endpoint)``, so
+#: every build synthesised a *different* netlist and no sweep described the
+#: design rather than one throwaway netlist.
 #:
-#: Re-swept 2026-09-13 after the High Speed work (poll counters, the
-#: unresponsive-device detach, and the host_disconnect diagnostics) changed the
-#: netlist. Seed 6 survived the change but only barely, at 60.63 MHz against a
-#: 60.00 MHz constraint -- 1% margin, which the next edit would spend. 12 seeds,
-#: run directly on the synthesised top.json (~70 s each, synthesis is identical
-#: across seeds), 8 of 12 passing:
+#: **Every sweep recorded here before 2026-09-15 measured a netlist that no
+#: longer exists, and could not have been reproduced even at the time.** The
+#: superseded 2026-09-13 entry read 8 of 12 passing, seed 9 best at 65.45 MHz.
 #:
-#:     9: 65.45   12: 65.37   8: 65.09   4: 63.89   11: 63.48   3: 61.70
-#:     6: 60.63   10: 60.14   5: 59.51*   2: 58.57*   1: 57.79*   7: 55.96*
-#:                                       (* fails the 60.00 MHz constraint)
+#: Re-swept 2026-09-15 on the first reproducible netlist, sha 3c1c3404c085e7c2,
+#: oss-cad-suite 2026-09-01 (yosys 0.68+136). 12 seeds run directly on the
+#: synthesised top.json (~70 s each, synthesis is identical across seeds),
+#: **12 of 12 passing**:
+#:
+#:     7: 69.05   2: 67.64   4: 65.98   12: 65.63   1: 65.42   3: 64.82
+#:     5: 63.35   8: 62.20   10: 61.74  11: 61.58   6: 61.07   9: 60.95
+#:
+#: Do not read 12/12 as the fix having *improved* timing. It did not: it froze
+#: a netlist that was previously redrawn every build, and this draw is a good
+#: one. Sweeps of earlier random draws returned 8, 10 and 11 of 12, so 12/12
+#: sits at the top of the observed range rather than outside it. What changed
+#: is that the number is now a property of the design instead of a coin toss.
+#:
+#: The pin moved 9 -> 7 for the same reason. Seed 9 was inherited from a sweep
+#: of a different netlist, and on this one it is the *worst* of the twelve at
+#: 60.95 MHz (+1.58%), where seed 7 has +15.1%. Pinning the worst passing seed
+#: was costing the design its entire margin for no reason.
 #:
 #: Read the verdict nextpnr prints on the frequency line, not the presence of
 #: its --textcfg output: nextpnr writes the textcfg even when timing fails, so
 #: "the file exists" is not a pass signal. (In the full LUNA flow no *bitstream*
 #: appears, because ecppack never runs -- that one is a real signal.)
-DEFAULT_PLACER_SEED = 9
+DEFAULT_PLACER_SEED = 7
 
 #: The full option, including the weight and seed that were actually measured.
 #: A caller-supplied ``--seed`` is composed after this one and wins, because

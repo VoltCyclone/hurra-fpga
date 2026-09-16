@@ -151,6 +151,12 @@ jobs:
           path: |
             out/top.json
             out/top.lpf
+            out/top.sha256
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: netlist-sha
+          path: out/top.sha256
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
         if: always()
@@ -194,8 +200,15 @@ jobs:
           path: res/seed${{ matrix.seed }}.bit
 
   # The gate. Previously this job built ONE seed, so a margin regression from
-  # 10/12 passing to 4/12 would have gone green silently. Now the pinned seed
+  # 12/12 passing to 4/12 would have gone green silently. Now the pinned seed
   # must close AND the sweep must hold its pass count.
+  #
+  # Both checks only became honest on 2026-09-15, when synthesis was made
+  # reproducible (device.py's _RELAY_ENDPOINT_CLASSES). Before that every run
+  # synthesised a different netlist, so "the pinned seed closes" was a coin
+  # toss -- seed 9 was measured at 59.69 FAIL and 62.21 PASS on two netlists
+  # built from byte-identical source. A red gate meant nothing and a green one
+  # meant less.
   gateware-gate:
     name: bitstream (ECP5, seed sweep gate)
     needs: gateware-sweep
@@ -207,13 +220,28 @@ jobs:
           pattern: seed-*
           path: results
           merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: netlist-sha
+          path: sha
       - name: evaluate sweep
         env:
-          PINNED_SEED: "9"
-          MIN_PASSING: "8"
+          # Seed 7: best of the twelve at 69.05 MHz on netlist 3c1c3404c085e7c2.
+          # The previous pin, seed 9, came from a sweep of a netlist that no
+          # longer exists and is the WORST seed on this one (60.95 MHz).
+          PINNED_SEED: "7"
+          # 12/12 pass today. The floor sits below that deliberately: it is a
+          # margin-regression detector, not a restatement of the current
+          # number, and -nowidelut once took a comparable design 8/12 -> 4/12.
+          # Set it at the current count and every seed becomes load-bearing.
+          MIN_PASSING: "9"
         run: |
           python3 - <<'PY'
-          import glob, json, os, sys
+          import glob, json, os, pathlib, sys
+
+          sha = pathlib.Path("sha/top.sha256")
+          if sha.is_file():
+              print(f"  netlist sha256: {sha.read_text().strip()}")
 
           results = []
           for path in sorted(glob.glob("results/seed*.result.json")):

@@ -38,9 +38,17 @@ if [ ! -f "$OUT/top.json" ]; then
   exit 1
 fi
 
+# Synthesis is reproducible (see device.py's _RELAY_ENDPOINT_CLASSES), so this
+# sha identifies the netlist a sweep was measured against. Recording it turns
+# "the sweep moved" into "the netlist changed, of course it moved" at a glance,
+# without gating on it -- any legitimate RTL edit changes it by design.
+SHA="$(sha256sum "$OUT/top.json" | cut -d" " -f1)"
+printf '%s\n' "$SHA" > "$OUT/top.sha256"
+
 echo "yosys:   $("$YOSYS" -V | head -1)"
 echo "nextpnr: $("$NEXTPNR_ECP5" --version 2>&1 | head -1)"
 echo "netlist: $OUT/top.json ($(wc -c <"$OUT/top.json") bytes)"
+echo "sha256:  $SHA"
 if [ -f "$OUT/hurra-cynthion.bit" ]; then
   echo "pinned-seed bitstream: PRESENT ($(wc -c <"$OUT/hurra-cynthion.bit") bytes)"
 else
