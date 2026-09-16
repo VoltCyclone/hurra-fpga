@@ -16,6 +16,10 @@ dist/
 *.il
 *.vcd
 
+# Containerised build output: docker/synth.sh and docker/pnr.sh write the
+# netlist, per-seed logs and sweep results here. See docker/README.md.
+out/
+
 # Firmware build products. Sources and linker scripts are tracked; build
 # output is not, including *.hex. A committed image goes stale silently, and
 # this tree builds diagnostic variants (see DIAG_SEND_EVERY in

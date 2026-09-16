@@ -1,4 +1,10 @@
-.PHONY: build firmware firmware-check firmware-test lint package rtlil test verify
+.PHONY: build container container-image container-synth container-sweep firmware \
+        firmware-check firmware-test lint package rtlil test verify
+
+# Pinned ECP5 toolchain image. yosys >= 0.60 is load-bearing; see docker/README.md.
+IMAGE ?= ecp5-toolchain:2026-09-01
+OUT   ?= out
+SEEDS ?= 1 2 3 4 5 6 7 8 9 10 11 12
 
 build:
 	@test -n "$(LUNA_PLATFORM)" || { echo "Set LUNA_PLATFORM explicitly (see README.md)"; exit 2; }
@@ -28,3 +34,21 @@ test:
 	pytest
 
 verify: lint test rtlil firmware-test firmware-check firmware
+
+container-image:
+	docker build -t $(IMAGE) docker/
+
+# Synthesis is identical across seeds, so it runs once and every seed in the
+# sweep places the same netlist.
+container-synth: container-image
+	mkdir -p $(OUT)
+	docker run --rm -v "$(CURDIR):/work" -v "$(CURDIR)/$(OUT):/out" \
+	  -e REPO=/work -e OUT=/out $(IMAGE) synth.sh
+
+# Parallel fan-out. Safe to parallelise only because the image pins the
+# Eigen/OpenMP thread counts to 1.
+container-sweep:
+	docker run --rm -v "$(CURDIR)/$(OUT):/out" $(IMAGE) \
+	  sweep.sh /out/top.json /out/top.lpf /out/sweep $(SEEDS)
+
+container: container-synth container-sweep
