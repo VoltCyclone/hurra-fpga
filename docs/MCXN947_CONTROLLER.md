@@ -485,9 +485,27 @@ that step. (The current `firmware-ch32` job's exit 127 is *not* a Makefile
 double-dash bug — `CC` evaluates correctly with or without the tool present. The
 likely cause is the npm global-path step; moot, the job is being deleted.)
 
-Flash with **J-Link**, already installed: OpenOCD has no known-good MCXN947
-config and pyOCD is reported inconsistent on dual-core M33. `flash` is never a CI
-target.
+Flash with **LinkServer**, NXP's own tool. `flash` is never a CI target.
+
+**This section previously said J-Link, and that was wrong.** The FRDM-MCXN947
+ships its on-board MCU-Link running *CMSIS-DAP* firmware — it enumerates as NXP
+`0x1fc9:0x0143`, "MCU-LINK FRDM-MCXN947 (r0E7) CMSIS-DAP V3.128" — which
+`JLinkExe` cannot drive at all. Reaching J-Link would mean reflashing the
+MCU-Link with SEGGER firmware: reversible, but it takes the board away from
+MCUXpresso IDE and from every NXP example, in exchange for nothing.
+
+LinkServer is the vendor tool for that probe and that part, ships with
+MCUXpresso IDE, and identifies the target unaided:
+
+```
+  #  Description                                    Serial         Device    Board
+  1  MCU-LINK FRDM-MCXN947 (r0E7) CMSIS-DAP V3.128  AQE3AU1FLFDNJ  MCXN947   FRDM-MCXN947
+```
+
+`make -C firmware/mcxn947 flash` loads `core0.elf` — the ELF rather than the
+`.bin`, so the load addresses come from the linker script and there is no
+`--addr` to drift. Verified on hardware 2026-09-16: two sectors written, target
+reset, blink running. `make probes` lists what is attached.
 
 ---
 
@@ -592,7 +610,9 @@ display bugs.
   panel.)
 - **SJ20 pin 2-3** — one schematic glance before soldering to J3 pin 3.
 - **TinyUSB `rhport` numbering** — taken from `ci_hs_mcx.h`, not re-read.
-- **`JLINK_DEVICE = MCXN947_M33_0`** — plausible, unverified against the local
-  J-Link device list.
+- ~~**`JLINK_DEVICE = MCXN947_M33_0`**~~ — **MOOT: the flow is LinkServer, not
+  J-Link** (see §7). The name itself is confirmed correct, from the SDK's own
+  debug configs, which also give `MCXN947_M33_1` for core1 — relevant only if
+  someone reflashes the MCU-Link with SEGGER firmware.
 - **The MCX Nx4x Reference Manual itself** is login-gated and not on disk. Every
   "needs the RM" item above is blocked on obtaining it.

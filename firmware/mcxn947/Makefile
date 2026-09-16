@@ -159,7 +159,7 @@ CORE0_OBJECTS := \
 	build/core0/heartbeat.o \
 	build/core0/main_core0.o
 
-.PHONY: all check clean test test-platform test-heartbeat
+.PHONY: all check clean flash probes test test-platform test-heartbeat
 
 all: build/hurra-mcxn947-core0.bin
 
@@ -236,6 +236,36 @@ test-heartbeat: build/host/heartbeat_test
 
 build/host/heartbeat_test: test/heartbeat_test.c src/heartbeat.c src/heartbeat.h | build/host
 	$(HOST_CC) $(APP_WARNINGS) -Isrc test/heartbeat_test.c src/heartbeat.c -o $@
+
+# --- flash -----------------------------------------------------------------
+#
+# NEVER a CI target: it needs the board.
+#
+# LinkServer, not J-Link, and the design doc (§7) is wrong about this. The
+# FRDM-MCXN947 ships its on-board MCU-Link running CMSIS-DAP firmware --
+# enumerating as NXP 0x1fc9:0x0143 "MCU-LINK FRDM-MCXN947 (r0E7) CMSIS-DAP" --
+# which JLinkExe cannot drive. Using J-Link would mean reflashing the MCU-Link
+# with SEGGER firmware, which is reversible but takes the board away from
+# MCUXpresso IDE and from every NXP example.
+#
+# LinkServer is NXP's own tool for NXP's own probe on NXP's own part, it is
+# already installed, and it identifies the target unaided:
+#
+#     #  Description                                    Device    Board
+#     1  MCU-LINK FRDM-MCXN947 (r0E7) CMSIS-DAP V3.128  MCXN947   FRDM-MCXN947
+#
+# Point LINKSERVER at another install if yours differs.
+LINKSERVER ?= /Applications/LinkServer_24.12.21/LinkServer
+LINKSERVER_DEVICE ?= MCXN947:FRDM-MCXN947
+
+# Load the ELF rather than the .bin: it carries its own load addresses, so
+# there is no --addr to get wrong and no way for the flash offset to drift
+# from what the linker script decided.
+flash: all
+	$(LINKSERVER) flash $(LINKSERVER_DEVICE) load build/core0.elf
+
+probes:
+	$(LINKSERVER) probes
 
 clean:
 	rm -rf build
