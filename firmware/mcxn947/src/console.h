@@ -70,6 +70,10 @@ typedef struct {
     uint32_t uptime_ms;
     uint32_t cpu1_boot_count;
     uint32_t cpu1_heartbeat;
+    uint32_t snapshot_seq;
+    uint32_t snapshot_slot_counter;
+    uint32_t snapshot_read_failures;
+    uint32_t cpu1_seen_slot_counter;
     bool link_ready;
     bool cpu1_alive;
     bool cpu1_released;

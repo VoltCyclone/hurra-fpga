@@ -247,6 +247,10 @@ static void test_stats_reports_every_counter(void)
         .uptime_ms = 117u,
         .cpu1_boot_count = 118u,
         .cpu1_heartbeat = 119u,
+        .snapshot_seq = 120u,
+        .snapshot_slot_counter = 121u,
+        .snapshot_read_failures = 122u,
+        .cpu1_seen_slot_counter = 123u,
         .cpu1_alive = true,
         .cpu1_released = true,
         .link_ready = true,
@@ -276,6 +280,10 @@ static void test_stats_reports_every_counter(void)
     assert(captured("cpu1 alive"));
     assert(captured("boot=118"));
     assert(captured("heartbeat=119"));
+    assert(captured("snapshot_seq=120"));
+    assert(captured("snapshot_slots=121"));
+    assert(captured("snapshot_fail=122"));
+    assert(captured("seen_slots=123"));
     assert(captured("link ready"));
 }
 

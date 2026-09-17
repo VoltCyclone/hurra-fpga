@@ -89,6 +89,8 @@ static uint32_t usb_console_write(void *ctx, const char *data, uint32_t length)
 static void usb_console_stats(void *ctx, console_stats_t *out)
 {
     static uint32_t previous_cpu1_heartbeat;
+    static link_snapshot_t last_snapshot;
+    static uint32_t snapshot_read_failures;
 
     (void)ctx;
 
@@ -121,6 +123,16 @@ static void usb_console_stats(void *ctx, console_stats_t *out)
 
     out->uptime_ms = platform_ticks();
 
+    // CPU0 deliberately exercises the same bounded reader CPU1 uses. If the
+    // ISR wins all four attempts, keep reporting the previous complete copy
+    // and make the collision visible rather than formatting a torn sample.
+    if (!link_snapshot_read(&g_shared_window.snapshot, &last_snapshot)) {
+        snapshot_read_failures++;
+    }
+    out->snapshot_seq = last_snapshot.seq;
+    out->snapshot_slot_counter = last_snapshot.slot_counter;
+    out->snapshot_read_failures = snapshot_read_failures;
+
     // CPU1 is observed, never waited on and never fed into a health decision.
     // The words are naturally aligned 32-bit accesses; step 6 adds the seqlock
     // only for the larger multiword link snapshot.
@@ -132,11 +144,13 @@ static void usb_console_stats(void *ctx, console_stats_t *out)
         const uint32_t heartbeat = g_shared_window.cpu1_heartbeat;
         out->cpu1_boot_count = g_shared_window.cpu1_boot_count;
         out->cpu1_heartbeat = heartbeat;
+        out->cpu1_seen_slot_counter = g_shared_window.cpu1_seen_slot_counter;
         out->cpu1_alive = heartbeat != previous_cpu1_heartbeat;
         previous_cpu1_heartbeat = heartbeat;
     } else {
         out->cpu1_boot_count = 0u;
         out->cpu1_heartbeat = 0u;
+        out->cpu1_seen_slot_counter = 0u;
         out->cpu1_alive = false;
     }
 }

@@ -883,6 +883,7 @@ def shared_window_issues(
         ],
     ],
     declared: list[str],
+    expected_size: int,
     shared_start: int,
     shared_end: int,
 ) -> list[str]:
@@ -928,6 +929,12 @@ def shared_window_issues(
                 issues.append(f"{key}: declared shared symbol {name!r} is absent")
                 continue
             _, address, size = record
+            if size != expected_size:
+                issues.append(
+                    f"{key}: {name} has size {size:#x}, expected size "
+                    f"{expected_size:#x}"
+                )
+                continue
             if size == 0 or address < shared_start or address + size > shared_end:
                 issues.append(
                     f"{key}: {name} at {address:#010x} size {size:#x} is outside "
@@ -963,6 +970,7 @@ def check_shared_window(
     cross: str,
     elves: dict[str, str],
     declared: list[str],
+    expected_size: int,
     shared_start: int,
     shared_end: int,
 ) -> None:
@@ -976,7 +984,9 @@ def check_shared_window(
             return
         images[key] = (sections, symbols)
 
-    issues = shared_window_issues(images, declared, shared_start, shared_end)
+    issues = shared_window_issues(
+        images, declared, expected_size, shared_start, shared_end
+    )
     if issues:
         for issue in issues:
             report.fail("shared-window", issue)
@@ -984,7 +994,8 @@ def check_shared_window(
         detail = ", ".join(declared)
         report.ok(
             "shared-window",
-            f"{detail} shared at {shared_start:#010x}; no ordinary allocations",
+            f"{detail} shared at {shared_start:#010x}, size {expected_size:#x}; "
+            "no ordinary allocations",
         )
 
 
@@ -1324,12 +1335,18 @@ def _self_test() -> int:
         candidate_symbols = {
             "FLEXIO_IRQHandler": ("W", 0x500),
             "display_FlexIO_start": ("T", 0x1200),
+            "status_led_hw_set": ("T", 0x1300),
             "main": ("T", 0x1000),
         }
         expect(
             forbidden(candidate_symbols, [r"(?i)flexio"])
             == {r"(?i)flexio": ["display_FlexIO_start"]},
             "rung 5: strong peripheral definition rejected but startup weak stub allowed",
+        )
+        expect(
+            forbidden(candidate_symbols, [r"(?i)status_led"])
+            == {r"(?i)status_led": ["status_led_hw_set"]},
+            "rung 5: CPU1 status LED ownership is rejected in core0",
         )
 
     system_init_analyzer = globals().get("system_init_store_issues")
@@ -1365,29 +1382,42 @@ def _self_test() -> int:
     expect(shared_issues is not None, "step 5: shared-window checker is available")
     if shared_issues is not None:
         good_sections = [
-            (SHARED_WINDOW_SECTION, "NOBITS", 0x2004C000, 0x10, "WA"),
+            (SHARED_WINDOW_SECTION, "NOBITS", 0x2004C000, 0x30, "WA"),
             (".data", "PROGBITS", 0x2004E000, 0x20, "WA"),
         ]
-        good_symbols = {"g_shared_window": ("B", 0x2004C000, 0x10)}
+        good_symbols = {"g_shared_window": ("B", 0x2004C000, 0x30)}
         images = {
             CORE0: (good_sections, good_symbols),
             "core1.elf": (good_sections, good_symbols),
         }
         expect(
-            shared_issues(images, ["g_shared_window"], 0x2004C000, 0x2004E000) == [],
+            shared_issues(
+                images, ["g_shared_window"], 0x30, 0x2004C000, 0x2004E000
+            ) == [],
             "rung 4: matching shared symbol in both images accepted",
+        )
+        wrong_size = dict(images)
+        wrong_size[CORE0] = (
+            good_sections,
+            {"g_shared_window": ("B", 0x2004C000, 0x2C)},
+        )
+        expect(
+            any("expected size" in issue for issue in shared_issues(
+                wrong_size, ["g_shared_window"], 0x30, 0x2004C000, 0x2004E000
+            )),
+            "rung 4: shared-window ABI size drift rejected",
         )
         mismatched = dict(images)
         mismatched["core1.elf"] = (
             [
-                (SHARED_WINDOW_SECTION, "NOBITS", 0x2004C000, 0x14, "WA"),
+                (SHARED_WINDOW_SECTION, "NOBITS", 0x2004C000, 0x34, "WA"),
                 (".data", "PROGBITS", 0x2004E000, 0x20, "WA"),
             ],
-            {"g_shared_window": ("B", 0x2004C004, 0x10)},
+            {"g_shared_window": ("B", 0x2004C004, 0x30)},
         )
         expect(
             any("same address" in issue for issue in shared_issues(
-                mismatched, ["g_shared_window"], 0x2004C000, 0x2004E000
+                mismatched, ["g_shared_window"], 0x30, 0x2004C000, 0x2004E000
             )),
             "rung 4: cross-image shared-symbol drift rejected",
         )
@@ -1398,7 +1428,7 @@ def _self_test() -> int:
         )
         expect(
             any("ordinary section" in issue for issue in shared_issues(
-                intruding, ["g_shared_window"], 0x2004C000, 0x2004E000
+                intruding, ["g_shared_window"], 0x30, 0x2004C000, 0x2004E000
             )),
             "rung 4: ordinary RAM allocation in shared window rejected",
         )
@@ -1649,6 +1679,10 @@ def main(argv: list[str] | None = None) -> int:
         help="the only content symbol allowed in the shared window (repeatable)",
     )
     parser.add_argument(
+        "--shared-window-size",
+        help="required byte size of every declared shared symbol",
+    )
+    parser.add_argument(
         "--retain",
         action="append",
         default=[],
@@ -1684,6 +1718,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--core0-bin, --core1-bin and --merged-bin are required")
     if not args.shared_symbol:
         parser.error("at least one --shared-symbol is required")
+    if not args.shared_window_size:
+        parser.error("--shared-window-size is required")
 
     elves = {CORE0: args.core0, CORE1: args.core1}
     report = Report()
@@ -1737,6 +1773,7 @@ def main(argv: list[str] | None = None) -> int:
         args.cross_compile,
         elves,
         args.shared_symbol,
+        int(args.shared_window_size, 0),
         int(args.ram_shared_start, 0),
         int(args.ram_shared_end, 0),
     )

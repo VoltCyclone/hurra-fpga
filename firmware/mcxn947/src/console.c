@@ -147,6 +147,10 @@ static void cmd_stats(void)
     console_field("flood", s_flood_bytes);
     console_field("txdrop", s_dropped);
     console_field("up_ms", s.uptime_ms);
+    console_put("\r\n  snapshot ");
+    console_field("snapshot_seq", s.snapshot_seq);
+    console_field("snapshot_slots", s.snapshot_slot_counter);
+    console_field("snapshot_fail", s.snapshot_read_failures);
     console_put("\r\n  cpu1 ");
     if (s.cpu1_held_in_reset) {
         console_put("HELD-IN-RESET ");
@@ -156,6 +160,7 @@ static void cmd_stats(void)
     console_put(s.cpu1_alive ? "alive " : "DOWN ");
     console_field("boot", s.cpu1_boot_count);
     console_field("heartbeat", s.cpu1_heartbeat);
+    console_field("seen_slots", s.cpu1_seen_slot_counter);
     console_put("\r\n");
 }
 

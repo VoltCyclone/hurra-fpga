@@ -3,15 +3,16 @@
 Target: **FRDM-MCXN947** (MCXN947VDF, dual Cortex-M33), replacing the CH32H417 on
 the PMOD-A injection link. Design: `docs/MCXN947_CONTROLLER.md`.
 
-**This tree implements migration step 5 of that document's section 9** — two
+**This tree implements migration step 6 of that document's section 9** — two
 images: clock, blink, LPSPI6 as an SPI slave on LP_FLEXCOMM6 driven by a
 self-loading eDMA0 scatter-gather ring that transmits a permanently IDLE slot,
 retirement of every received slot through `src/link_retire.c`, ERR051588
 detection and recovery through `src/link_recovery.c`, and a TinyUSB CDC console
-on the ChipIdea High Speed controller behind J11. CPU1 is released last and
-does only the shared-window boot count and heartbeat; there is no display. What
-is *absent* is recorded here too, because "we did not vendor it yet" and "we
-decided not to vendor it" are different claims.
+on the ChipIdea High Speed controller behind J11. CPU1 is released last, reads
+CPU0's seqlock snapshot at about 20 Hz, echoes the slot count it actually saw,
+and drives only the blue LED from slot-counter bit 11; there is no display.
+What is *absent* is recorded here too, because "we did not vendor it yet" and
+"we decided not to vendor it" are different claims.
 
 **Step 5 hardware acceptance is complete.** Section 9's three configurations
 were measured on the bench on 2026-09-16, acceptance taken from the FPGA's own
@@ -481,6 +482,92 @@ Each is a change *we* made, or a vendor behaviour we deliberately did not adopt.
     including the erased-flash case it exists for. A skipped release is
     reported on the console as `NOT-RELEASED(no image)`, distinct from
     `HELD-IN-RESET`, so nobody reflashes a part that is already correct.
+
+16. **The step-6 snapshot uses `_pad[7]`, not the document's `_pad[3]`.** The
+    named fields in section 5 total 25 bytes; three padding bytes produce a
+    28-byte C struct, contradicting the same section's explicit 32-byte ABI.
+    Seven padding bytes make the stated size true while preserving every named
+    field and its order. An alignment attribute was rejected because it would
+    conceal the contract error rather than define the missing bytes. The
+    resulting shared window remains the approved 48 bytes: the existing fourth
+    word of the 16-byte step-5 prefix is now `cpu1_seen_slot_counter`, followed
+    by the 32-byte snapshot. Both C static assertions and rung 4 enforce those
+    sizes independently.
+
+---
+
+## Findings while building step 6
+
+- **Section 5's displayed snapshot layout is 28 bytes, not 32.** Its arithmetic
+  is `3 * 4 + 6 * 2 + 1 + 3 = 28`. The contract and the approved 48-byte shared
+  window both require 32, so `src/link_snapshot.h` uses `_pad[7]` and asserts
+  the result. `SHARED_WINDOW_SIZE` is passed from the Makefile to the artifact
+  checker, which independently rejects either ELF if `g_shared_window` is not
+  exactly 0x30 bytes. This is a design-document error, not a compiler-layout
+  quirk.
+
+- **Section 5 calls the module `shared_link_status.c`, but no such module ever
+  existed.** Step 6 uses the approved `src/link_snapshot.{c,h}` name. The
+  algorithm is still one unguarded implementation; only the barrier spelling
+  differs between MCXN947 and host builds.
+
+Step 6 has been built and host-tested only. Its LPCAC/coherency acceptance is a
+hardware measurement: CPU0's live snapshot count and CPU1's echoed count must
+track on the console while the blue LED cycles. No result is claimed here.
+
+---
+
+## Findings while building step 6
+
+- **SRAM is coherent across the two cores; the seqlock needs `__DMB()` for
+  ordering only.** Design doc §5 called this "strongly supported, UNVERIFIED"
+  and asked for a design where being wrong would be cheap and visible. Measured
+  on hardware 2026-09-16 over a 43 s window, CPU0 publishing at ~8 kHz and CPU1
+  reading at ~20 Hz: CPU1's echoed `slot_counter` tracked CPU0's live value
+  continuously, lagging 105 slots (13.1 ms, which is the sampling interval and
+  not staleness), with **`snapshot_fail = 0`** — not one bounded read gave up.
+  LPCAC stayed enabled and the window stayed at 0x2004C000; none of §5's
+  escalation steps (`__DSB()`, disabling LPCAC, moving to SRAMX) were needed.
+
+- **The echo beats the LED as an instrument.** §5 proposed watching
+  `slot_counter` on the panel, and §9 step 6 proposes the RGB LED. Both need a
+  human looking at the board and yield no number. `cpu1_seen_slot_counter` — a
+  word CPU1 writes with the value it actually read — turns the coherency
+  question into two numbers on the console that either track or do not. It is
+  the same category as the CPU1 heartbeat that §3 already endorses: data CPU0
+  observes and never waits on. The LED is still there and still blinks at
+  ~1.95 Hz; it is simply no longer the only evidence.
+
+- **§5's snapshot struct does not add up to the size it claims.** The named
+  fields total 28 bytes, so the `_pad[3]` shown gives 28 and not the 32 the
+  trailing comment asserts. `src/link_snapshot.h` keeps every named field and
+  widens the padding to `_pad[7]`, realizing the stated 32-byte ABI rather than
+  silently shipping a 28-byte struct or hiding the difference in an alignment
+  attribute. The module is also named `link_snapshot.{c,h}`; §5's
+  `shared_link_status.c` never existed in this tree.
+
+- **CPU1 gets the blue LED because the other two are taken.** §9 step 6 says
+  "the RGB LED" without saying which. CPU0 already drives green (P0_27) as its
+  foreground heartbeat, and §3 reserves red (P0_10) for CPU0 signalling a hard
+  link fault so that a dead CPU1 cannot hide one. Blue (P1_2) is what is left,
+  and it has the useful side effect of keeping CPU1 off Port 0 entirely at this
+  step.
+
+- **Both cores necessarily share the clock-gate registers, and the boot ladder
+  is what makes that safe.** CPU1 calling `CLOCK_EnableClock(kCLOCK_Port1)` is a
+  read-modify-write on a chip-wide SYSCON register — the same *category* of
+  write step 5 rejected in CPU1's SystemInit. The difference is real: enabling a
+  gate for a peripheral CPU1 exclusively owns affects nothing CPU0 uses, whereas
+  SystemInit re-ran chip policy (core LDO, glitch detect, RAM ECC, flash cache)
+  that CPU0 had already set. It is race-free specifically because §4(a) releases
+  CPU1 at rung 8, strictly after CPU0 has finished all of its own clock setup.
+  **This gets sharper at step 7**, where §2's display pins put CS (P0_12),
+  D/C (P0_7), WR (P0_9) and RD (P0_8) on Port 0 — the port whose GPIO registers
+  CPU0's LED code is still writing at 1 Hz. §2 notes that no J8 pin is on Port 3
+  "so there is zero physical overlap with the link", which is true and is not
+  the same claim as §4(b)'s "disjoint pins": the *pins* are disjoint, the *port
+  registers* are not. PSOR/PCOR are write-1-to-act and therefore safe for
+  disjoint bits; PDDR is an RMW and must stay inside the boot ordering.
 
 ---
 

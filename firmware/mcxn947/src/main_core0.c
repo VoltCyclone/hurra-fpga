@@ -1,5 +1,5 @@
-// CPU0 entry for the MCXN947 controller through migration step 5: clock,
-// blink, the FPGA link, USB console, shared window and final CPU1 release.
+// CPU0 entry for the MCXN947 controller through migration step 6: clock,
+// blink, the FPGA link, snapshot IPC, USB console and final CPU1 release.
 //
 // Nothing here touches MMIO -- platform.c and heartbeat.c own that behind their
 // guards -- so this file is portable by default, per the guard-polarity rule.

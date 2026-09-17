@@ -33,6 +33,8 @@ uint8_t link_next_bank(uint8_t bank)
 #include "fsl_lpspi.h"
 #include "fsl_port.h"
 
+#include "shared_window.h"
+
 // The step-3 portable halves. Both are MMIO-free and host-tested in their own
 // right; they are included inside the guard so that a host build of this file
 // still links against nothing but spi_frame.c, as test/link_test.c does.
@@ -627,6 +629,24 @@ static void link_drain_rx(void)
 
     while (s_rx_cursor != active) {
         link_retire_slot(s_rx_bank[s_rx_cursor]);
+
+        // shared_window_reset() runs after link_init() has enabled this ISR.
+        // Its magic-first invalidation prevents the reset from racing this
+        // writer; once magic is published, every retired slot gets exactly one
+        // snapshot publication at the MCU's own ~8 kHz retirement cadence.
+        if (g_shared_window.magic == SHARED_WINDOW_MAGIC) {
+            const link_retire_counters_t *counters = link_retire_counters();
+            link_snapshot_t snapshot = {0};
+            snapshot.slot_counter = counters->slots;
+            // At step 6 the MCU genuinely knows only that it has driven its
+            // link-ready line. Native report count, USB phase, descriptor/map
+            // generations, fault flags and last RX sequence have no source
+            // yet and remain zero rather than carrying invented values.
+            snapshot.link_flags = s_ready
+                                      ? (uint16_t)INJ_LINK_STATUS_FLAG_RELAY_READY
+                                      : 0u;
+            link_snapshot_publish(&g_shared_window.snapshot, &snapshot);
+        }
         s_rx_cursor = link_next_bank(s_rx_cursor);
     }
 }

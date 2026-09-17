@@ -323,8 +323,15 @@ typedef struct {
     uint16_t descriptor_generation, map_generation, fault_flags;
     uint8_t  last_rx_sequence;
     uint8_t  _pad[3];
-} link_snapshot_t;              /* 32 bytes */
+} link_snapshot_t;              /* 32 bytes -- but see below */
 ```
+
+**That comment and that `_pad` disagree.** The named fields total 28 bytes, so
+`_pad[3]` gives 28, not the 32 the comment claims. `link_snapshot.h` keeps every
+named field and widens the padding to `_pad[7]` to realize the stated 32-byte
+ABI, rather than quietly shipping a 28-byte struct or hiding the difference
+behind an alignment attribute. Found at step 6. The module is
+`src/link_snapshot.{c,h}`; the name `shared_link_status.c` below never existed.
 
 Writer (CPU0, 8 kHz): `seq++` (odd) -> `__DMB()` -> stores -> `__DMB()` ->
 `seq++` (even). Reader (CPU1, 20 Hz): retry while `s0 != s1 || (s0 & 1)`, bounded
@@ -357,13 +364,29 @@ every offset and asserts no torn read.
 One line for the PR: **we are publishing state, not sending messages, and the
 consumer is allowed to die.**
 
-**Cache coherency.** The Cortex-M33 here has no core data cache. LPCAC sits on
-the flash/NVM path; CACHE64 belongs to FlexSPI, unused. On that reading SRAM is
-coherent across cores and the seqlock needs `volatile` + `__DMB()` for *ordering
-only*. Strongly supported, **UNVERIFIED** against the RM — so design so that
-being wrong is cheap and visible: **put `slot_counter` on screen from the first
-render.** It advances 8,000 times a second, so a frozen `slot_counter` against a
-console reporting a healthy link is the unambiguous signature of a stale read.
+**Cache coherency — MEASURED AT STEP 6, and the reading was right.** The
+Cortex-M33 here has no core data cache. LPCAC sits on the flash/NVM path;
+CACHE64 belongs to FlexSPI, unused. On that reading SRAM is coherent across
+cores and the seqlock needs `volatile` + `__DMB()` for *ordering only*.
+Confirmed on hardware 2026-09-16: with CPU0 publishing at ~8 kHz and CPU1
+reading at ~20 Hz, CPU1's echoed `slot_counter` tracked CPU0's live value
+continuously over a 43 s window, lagging 105 slots (13.1 ms — the sampling
+interval, not staleness), with **zero failed reads**. No barrier beyond `__DMB()`
+was needed, LPCAC was left enabled, and the window stayed at 0x2004C000.
+
+The rest of this paragraph is kept because the escalation path is still the
+right one if this ever regresses. It was, before that measurement, **UNVERIFIED**
+against the RM — so design so that
+being wrong is cheap and visible: **put `slot_counter` on screen from the first render.** It advances 8,000 times a
+second, so a frozen `slot_counter` against a console reporting a healthy link is
+the unambiguous signature of a stale read.
+
+Step 6 went one better and does not depend on a human watching anything: CPU1
+echoes the `slot_counter` it actually read into `cpu1_seen_slot_counter`, and
+`stats` prints it next to CPU0's live value. The coherency question is then two
+numbers that either track or do not — loggable, diffable, and quotable in a
+commit message. It is the same category as the CPU1 heartbeat §3 already
+endorses: data CPU0 *observes* and never waits on, so the one-way rule holds.
 Escalate cheapest-first if it happens (`__DSB()`, then disable LPCAC, then move
 the window to SRAMX at 0x04000000). Do **not** pre-emptively disable LPCAC —
 turning off a real feature to fix a bug you have not observed is how you end up
@@ -703,7 +726,16 @@ counters over JTAG.
    command §3 asks for.
 6. **Snapshot IPC, no display yet** — CPU1 mirrors `slot_counter`'s low bits onto
    the RGB LED so the IPC is observable before the panel exists. This is where
-   the LPCAC question gets answered empirically.
+   the LPCAC question gets answered empirically. **DONE 2026-09-16, and the
+   LPCAC question is answered: SRAM is coherent across cores.**
+
+   Measured over a 43 s window with CPU0 publishing at ~8 kHz and CPU1 reading
+   at ~20 Hz: `spi_slots` 8000.23/s, every gated FPGA counter +0, `link_losses`
+   0, CPU1's echoed `slot_counter` tracking CPU0's live value with a 105-slot
+   (13.1 ms) lag, and **`snapshot_fail = 0`** — not one bounded read gave up.
+   The LED is blue (P1_2): CPU0 already owns green for its foreground heartbeat
+   and §3 reserves red for a hard link fault, so bit 11 of `slot_counter` at
+   ~1.95 Hz goes on the only one left.
 7. **Display.** *Gate: 20 Hz repaint with link counters still flat under a full
    repaint, and 5(c) still passing mid-render.*
 8. **Map uploader** — `entries_crc32`, CRC-32/ISO-HDLC (poly 0xEDB88320
@@ -798,12 +830,15 @@ display bugs.
   `CTIMER2_IRQHandler`, vector slot 34 (`CTIMER2_IRQn`). But that name is a
   weak trampoline: the root to declare is `CTIMER2_DriverIRQHandler`. See §7
   rung 1.
-- **LPCAC does not cache SRAM** — strongly supported; confirm before step 6.
-  Detectable by design (frozen `slot_counter`). Narrowed at step 1:
-  `SystemInit()` *enables* LPCAC (`SYSCON->LPCAC_CTRL &= ~DIS_LPCAC_MASK`), so
-  the question starts from "on by default in every image" rather than from an
-  unknown. `SystemInit()` also disables RAM ECC and the aGDET/dGDET chip-reset
-  path — worth knowing before trusting either.
+- ~~**LPCAC does not cache SRAM**~~ — **RESOLVED at step 6 by measurement.**
+  With LPCAC left enabled in both images and the shared window at 0x2004C000,
+  CPU1's echo of CPU0's `slot_counter` tracked it continuously for 43 s with
+  zero failed seqlock reads (§5). `volatile` plus `__DMB()` is sufficient and no
+  escalation was needed. Two step-1 observations still stand and are still worth
+  knowing: `SystemInit()` *enables* LPCAC
+  (`SYSCON->LPCAC_CTRL &= ~DIS_LPCAC_MASK`), and it also disables RAM ECC and
+  the aGDET/dGDET chip-reset path — which is part of why step 5 declined to let
+  CPU1 re-run it.
 - ~~**`NonCacheable` region in the vendored `.ld`s**~~ — **RESOLVED at step 1:
   there is no such region.** `*(NonCacheable.init)` and `*(NonCacheable)` are
   collected into the ordinary `.data` output section in `m_data`, alongside

@@ -1,4 +1,4 @@
-# FRDM-MCXN947 controller firmware -- migration step 5: two images.
+# FRDM-MCXN947 controller firmware -- migration step 6: snapshot IPC.
 #
 # CPU0 brings the part to overdrive + 150 MHz, arms a 1 kHz
 # SysTick, blinks the green LED, brings up LPSPI6 as an SPI slave on
@@ -7,7 +7,8 @@
 # transport in src/link_retire.c, detects and recovers ERR051588 through the
 # ladder in src/link_recovery.c, and presents a TinyUSB CDC console on the
 # ChipIdea High Speed controller behind J11. CPU1 is a separate image released
-# last; it touches only the shared heartbeat words. There is no display yet.
+# last; it reads the one-way snapshot, echoes the slot count it actually saw,
+# and drives the blue LED from slot-counter bit 11. There is no display yet.
 #
 # `make all` is not the gate. --gc-sections will silently discard a translation
 # unit that nothing references, and the vector table declares every handler
@@ -114,6 +115,7 @@ CORE0_RAM_START   := 0x20000000
 CORE0_RAM_END     := 0x2004C000
 RAM_SHARED_START  := 0x2004C000
 RAM_SHARED_END    := 0x2004E000
+SHARED_WINDOW_SIZE := 0x30
 CORE1_RAM_START   := 0x2004E000
 CORE1_RAM_END     := 0x20068000
 STACK_SIZE        := 0x0800
@@ -266,6 +268,7 @@ CORE0_OBJECTS := \
 	build/core0/dbg_uart.o \
 	build/core0/link_retire.o \
 	build/core0/link_recovery.o \
+	build/core0/link_snapshot.o \
 	build/core0/link.o \
 	build/core0/console.o \
 	build/core0/usb_descriptors.o \
@@ -283,13 +286,17 @@ CORE0_OBJECTS := \
 CORE1_OBJECTS := \
 	build/core1/startup.o \
 	build/core1/system_core1.o \
+	build/core1/fsl_gpio.o \
+	build/core1/link_snapshot.o \
 	build/core1/shared_window.o \
+	build/core1/status_led.o \
 	build/core1/main_core1.o
 
 .PHONY: all check check-copies clean flash flash-core0-only flash-merged \
 	verify-core1-blank probes test test-platform \
 	test-heartbeat test-link test-link-retire test-link-recovery test-spi-frame \
-	test-console test-core1-release test-shared-window test-merge-images
+	test-console test-core1-release test-shared-window test-link-snapshot test-status-led \
+	test-merge-images
 
 all: build/hurra-mcxn947.bin
 
@@ -321,7 +328,11 @@ build/core0/main_core0.o: src/main_core0.c src/core1_release.h src/heartbeat.h \
 build/core0/core1_release.o: src/core1_release.c src/core1_release.h | build/core0
 	$(CC) $(COMMON_CFLAGS) $(CORE1_VECTOR_DEFINE) $(APP_WARNINGS) -c $< -o $@
 
-build/core0/shared_window.o: src/shared_window.c src/shared_window.h | build/core0
+build/core0/shared_window.o: src/shared_window.c src/shared_window.h \
+		src/link_snapshot.h | build/core0
+	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
+
+build/core0/link_snapshot.o: src/link_snapshot.c src/link_snapshot.h | build/core0
 	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
 build/core0/platform.o: src/platform.c src/platform.h | build/core0
@@ -331,7 +342,8 @@ build/core0/heartbeat.o: src/heartbeat.c src/heartbeat.h src/platform.h | build/
 	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
 build/core0/link.o: src/link.c src/link.h src/link_retire.h src/link_recovery.h \
-		src/spi_frame.h src/platform.h src/dbg_uart.h \
+		src/spi_frame.h src/platform.h src/dbg_uart.h src/shared_window.h \
+		src/link_snapshot.h \
 		include/injection_wire.h | build/core0
 	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
@@ -368,7 +380,7 @@ build/core0/usb_descriptors.o: src/usb_descriptors.c src/tusb_config.h | build/c
 
 build/core0/usb_console.o: src/usb_console.c src/usb_console.h src/console.h \
 		src/dbg_uart.h src/link.h src/link_retire.h src/platform.h \
-		src/shared_window.h src/tusb_config.h | build/core0
+		src/shared_window.h src/link_snapshot.h src/tusb_config.h | build/core0
 	$(CC) $(COMMON_CFLAGS) $(GLUE_WARNINGS) -c $< -o $@
 
 # --- vendored TinyUSB ------------------------------------------------------
@@ -444,10 +456,21 @@ build/core1/startup.o: $(CORE1_STARTUP) | build/core1
 build/core1/system_core1.o: src/system_core1.c | build/core1
 	$(CC) $(CORE1_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
-build/core1/shared_window.o: src/shared_window.c src/shared_window.h | build/core1
+build/core1/fsl_gpio.o: $(VENDOR_SDK)/devices/MCXN947/drivers/fsl_gpio.c | build/core1
+	$(CC) $(CORE1_CFLAGS) $(VENDOR_WARNINGS) -c $< -o $@
+
+build/core1/link_snapshot.o: src/link_snapshot.c src/link_snapshot.h | build/core1
 	$(CC) $(CORE1_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
-build/core1/main_core1.o: src/main_core1.c src/shared_window.h | build/core1
+build/core1/shared_window.o: src/shared_window.c src/shared_window.h \
+		src/link_snapshot.h | build/core1
+	$(CC) $(CORE1_CFLAGS) $(APP_WARNINGS) -c $< -o $@
+
+build/core1/status_led.o: src/status_led.c src/status_led.h | build/core1
+	$(CC) $(CORE1_CFLAGS) $(APP_WARNINGS) -c $< -o $@
+
+build/core1/main_core1.o: src/main_core1.c src/shared_window.h \
+		src/link_snapshot.h src/status_led.h | build/core1
 	$(CC) $(CORE1_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
 build/core0 build/core1 build/host:
@@ -462,7 +485,7 @@ CHECK_RETAIN_ARGS := \
 	$(foreach r,$(CORE0_RETAIN),--retain core0.elf:$(r)) \
 	$(foreach r,$(CORE1_RETAIN),--retain core1.elf:$(r))
 
-CORE0_FORBIDDEN := (?i)flexio (?i)edma1 EDMA_1_ ST7796S DBI
+CORE0_FORBIDDEN := (?i)flexio (?i)edma1 EDMA_1_ ST7796S DBI (?i)status_led
 CORE1_FORBIDDEN := (?i)lpspi6 LP_FLEXCOMM6 (?i)edma0 EDMA_0_ CTIMER2 SPC GDET ITRC
 CHECK_FORBIDDEN_ARGS := \
 	$(foreach p,$(CORE0_FORBIDDEN),--forbid 'core0.elf:$(p)') \
@@ -508,6 +531,7 @@ check: all check-copies
 		--ram-shared-start $(RAM_SHARED_START) \
 		--ram-shared-end $(RAM_SHARED_END) \
 		--shared-symbol g_shared_window \
+		--shared-window-size $(SHARED_WINDOW_SIZE) \
 		--stack-size $(STACK_SIZE) --heap-size $(HEAP_SIZE) \
 		$(CHECK_RETAIN_ARGS) $(CHECK_OBJECT_ARGS) $(CHECK_FORBIDDEN_ARGS)
 
@@ -519,7 +543,7 @@ check: all check-copies
 
 test: test-platform test-heartbeat test-spi-frame test-link test-link-retire \
 	test-link-recovery test-console test-core1-release test-shared-window \
-	test-merge-images
+	test-link-snapshot test-status-led test-merge-images
 
 test-merge-images:
 	python3 test/merge_mcxn947_images_test.py
@@ -582,8 +606,22 @@ test-shared-window: build/host/shared_window_test
 	./build/host/shared_window_test
 
 build/host/shared_window_test: test/shared_window_test.c src/shared_window.c \
-		src/shared_window.h | build/host
+		src/shared_window.h src/link_snapshot.h | build/host
 	$(HOST_CC) $(APP_WARNINGS) -Isrc test/shared_window_test.c src/shared_window.c -o $@
+
+test-link-snapshot: build/host/link_snapshot_test
+	./build/host/link_snapshot_test
+
+build/host/link_snapshot_test: test/link_snapshot_test.c src/link_snapshot.c \
+		src/link_snapshot.h | build/host
+	$(HOST_CC) $(APP_WARNINGS) -DLINK_SNAPSHOT_TESTING -Isrc \
+		test/link_snapshot_test.c src/link_snapshot.c -o $@
+
+test-status-led: build/host/status_led_test
+	./build/host/status_led_test
+
+build/host/status_led_test: test/status_led_test.c src/status_led.c src/status_led.h | build/host
+	$(HOST_CC) $(APP_WARNINGS) -Isrc test/status_led_test.c src/status_led.c -o $@
 
 build/host/link_recovery_test: test/link_recovery_test.c src/link_recovery.c \
 		src/link_recovery.h | build/host

@@ -15,9 +15,10 @@ void shared_window_reset(void)
     g_shared_window.magic = 0u;
     g_shared_window.cpu1_boot_count = 0u;
     g_shared_window.cpu1_heartbeat = 0u;
-    g_shared_window._reserved = 0u;
+    g_shared_window.cpu1_seen_slot_counter = 0u;
+    g_shared_window.snapshot = (link_snapshot_t){0};
 
     // Magic is the publication store: readers never observe a valid window
-    // whose step-5 payload still contains NOLOAD residue.
+    // whose prefix or snapshot still contains NOLOAD residue.
     g_shared_window.magic = SHARED_WINDOW_MAGIC;
 }
