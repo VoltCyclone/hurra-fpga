@@ -85,7 +85,20 @@ INCLUDES := -Isrc -isystem include \
 
 COMMON_CFLAGS := $(CORE0_ARCH) $(CORE0_DEFINES) $(INCLUDES) $(EXTRA_CFLAGS) -Os \
 	-ffunction-sections -fdata-sections -fno-common
-CORE1_CFLAGS := $(CORE1_ARCH) $(CORE1_DEFINES) -DMCUX_DBI_LEGACY=0 \
+# MCUX_DBI_LEGACY stays at its default of 1, and that is load-bearing.
+#
+# With MCUX_DBI_LEGACY=0, ST7796S_WriteCommand() hands its parameter BYTE array
+# straight to FLEXIO_MCULCD_WriteDataArrayBlocking(), which on a 16-bit bus does
+# `size /= 2U` and reinterprets the bytes as uint16_t. A one-byte parameter
+# therefore becomes ZERO bus beats and is never transmitted: COLMOD, MADCTL,
+# TEON and the CSCON unlock keys all silently vanish, and CASET/RASET lose half
+# their bytes. Parameterless commands are unaffected, which is why SLPOUT and
+# DISPON worked while the panel showed nothing but its random power-on GRAM.
+#
+# The legacy path widens each parameter byte into its own 16-bit beat
+# (fsl_st7796s.c: `uint16_t param_data = params[i]`), which is correct, and is
+# the path NXP's own working frdmmcxn947 display examples use.
+CORE1_CFLAGS := $(CORE1_ARCH) $(CORE1_DEFINES) \
 	$(INCLUDES) $(EXTRA_CFLAGS) -Os \
 	-ffunction-sections -fdata-sections -fno-common
 APP_WARNINGS      := -std=c11 -Wall -Wextra -Werror -Wconversion -Wshadow
@@ -302,7 +315,6 @@ CORE1_OBJECTS := \
 	build/core1/fsl_flexio.o \
 	build/core1/fsl_flexio_mculcd.o \
 	build/core1/fsl_flexio_mculcd_edma.o \
-	build/core1/fsl_dbi.o \
 	build/core1/fsl_dbi_flexio_edma.o \
 	build/core1/fsl_st7796s.o \
 	build/core1/link_snapshot.o \
@@ -498,9 +510,6 @@ build/core1/fsl_flexio_mculcd.o: $(VENDOR_SDK)/devices/MCXN947/drivers/fsl_flexi
 	$(CC) $(CORE1_CFLAGS) $(VENDOR_WARNINGS) -c $< -o $@
 
 build/core1/fsl_flexio_mculcd_edma.o: $(VENDOR_SDK)/devices/MCXN947/drivers/fsl_flexio_mculcd_edma.c | build/core1
-	$(CC) $(CORE1_CFLAGS) $(VENDOR_WARNINGS) -c $< -o $@
-
-build/core1/fsl_dbi.o: $(VENDOR_SDK)/components/video/display/dbi/fsl_dbi.c | build/core1
 	$(CC) $(CORE1_CFLAGS) $(VENDOR_WARNINGS) -c $< -o $@
 
 build/core1/fsl_dbi_flexio_edma.o: $(VENDOR_SDK)/components/video/display/dbi/flexio/fsl_dbi_flexio_edma.c | build/core1

@@ -66,6 +66,13 @@ core1_release_status_t core1_release(void);
 // debugger, and is a harsher test than a debugger halt: reset is asynchronous
 // and can land mid-store to the shared window.
 void core1_halt(void);
+
+// Hand CPU1 the GPIO pins it owns. MUST be called by CPU0 before
+// core1_release(): GPIO's per-pin PCNS filter resets to secure-access-only and
+// CPU1 is a non-secure master, so without this every CPU1 GPIO write is
+// discarded and every read returns zero, silently. See the comment on the
+// definition for the measurements behind that.
+void core1_grant_gpio_nonsecure(void);
 #endif
 
 #endif  // HURRA_MCXN947_CORE1_RELEASE_H

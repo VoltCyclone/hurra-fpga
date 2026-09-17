@@ -74,8 +74,7 @@ static FLEXIO_MCULCD_Type s_flexio_lcd = {
 };
 
 static edma_handle_t s_tx_dma;
-static flexio_mculcd_edma_handle_t s_flexio_handle;
-static dbi_iface_t s_dbi_iface;
+static dbi_flexio_edma_xfer_handle_t s_dbi_xfer;
 static st7796s_handle_t s_panel;
 static volatile bool s_blit_busy;
 // Blits that actually reached ST7796S_WritePixels, and calls refused before
@@ -238,12 +237,10 @@ static bool display_transport_init(void)
     EDMA_SetChannelMux(DMA1, DISPLAY_DMA_CHANNEL,
                        kDma1RequestMuxFlexIO0ShiftRegister0Request);
 
-    if (DBI_FLEXIO_EDMA_CreateHandle(&s_dbi_iface, &s_flexio_lcd,
-                                     &s_flexio_handle, &s_tx_dma,
-                                     NULL) != kStatus_Success) {
+    if (DBI_FLEXIO_EDMA_CreateXferHandle(&s_dbi_xfer, &s_flexio_lcd, &s_tx_dma,
+                                         NULL) != kStatus_Success) {
         return false;
     }
-    DBI_IFACE_SetMemoryDoneCallback(&s_dbi_iface, display_memory_done, NULL);
     return true;
 }
 
@@ -294,12 +291,17 @@ bool display_panel_init(void)
         .flipDisplay = true,
         .bgrFilter = true,
     };
-    if (ST7796S_Init(&s_panel, &panel_config, &s_dbi_iface) !=
-            kStatus_Success ||
+    if (ST7796S_Init(&s_panel, &panel_config, &g_dbiFlexioEdmaXferOps,
+                     &s_dbi_xfer) != kStatus_Success ||
         ST7796S_EnableDisplay(&s_panel, true) != kStatus_Success) {
         s_panel_failed = true;
         return false;
     }
+
+    // Legacy DBI hangs the completion callback off the panel handle rather than
+    // off a dbi_iface_t. Without this the eDMA path never clears s_blit_busy
+    // and the first fill spins forever.
+    ST7796S_SetMemoryDoneCallback(&s_panel, display_memory_done, NULL);
 
     s_panel_ready = true;
     return true;

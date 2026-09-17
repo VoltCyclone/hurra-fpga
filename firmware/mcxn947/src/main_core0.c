@@ -68,6 +68,12 @@ int main(void)
     // and CPU0 boot-looped until core1_image_valid() existed. The console
     // reports which happened; nothing here decides anything on the result,
     // because deciding on it would make the link depend on CPU1 after all.
+
+    // Strictly before the release: CPU1 cannot grant itself GPIO access, and a
+    // CPU1 that starts without it runs normally while every pin it drives stays
+    // dead.
+    core1_grant_gpio_nonsecure();
+
     (void)core1_release();
 
     // SysTick_Handler blinks; the eDMA0 channel 1 ISR retires; the USB1_HS ISR

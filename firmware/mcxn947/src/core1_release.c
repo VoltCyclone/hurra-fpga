@@ -45,6 +45,12 @@ bool core1_image_valid(uint32_t initial_msp, uint32_t reset_vector)
 
 #if defined(MCXN947)
 
+// Guarded, so the host build of this file for core1_release_test still sees no
+// vendor headers. Needed for the PCNS handover below; the CPUCTRL/CPBOOT work
+// keeps its hand-rolled pointers so the release logic stays host-testable.
+#include "fsl_clock.h"
+#include "fsl_gpio.h"
+
 #if !defined(CORE1_VECTOR_ADDR)
 #error "CORE1_VECTOR_ADDR must come from the Makefile's CORE1_OFFSET"
 #endif
@@ -60,6 +66,53 @@ bool core1_image_valid(uint32_t initial_msp, uint32_t reset_vector)
 // exists to catch: a silent no-op here leaves a working link and a black
 // screen, with every counter healthy and nothing anywhere saying CPU1 was
 // never released.
+// CPU1 cannot drive a GPIO pin until CPU0 hands that pin over, and this is
+// the handover. Without it CPU1's GPIO writes are silently discarded and its
+// reads return zero -- no bus fault, no status bit, nothing.
+//
+// Measured on this board: from CPU1, PORT and FLEXIO work perfectly
+// (PORT0->PCR[7] = 0x1000, PORT2->PCR[8] = 0x1600, FLEXIO0->CTRL = 0xC0000005)
+// and the GPIO clocks are on (SYSCON->AHBCLKCTRL0 = 0x04DBE7FF, bits 19/20/23
+// set), yet GPIO0->PDDR reads 0 while CPU0 visibly drives P0_27 at the same
+// address. Every GPIO view behaves the same -- non-secure, ALIAS1 and both
+// secure aliases -- and none of them fault.
+//
+// Why: GPIO carries its own per-pin secure filter, PCNS ("pin control
+// nonsecure", offset 0x10), which resets to 0 -- every pin secure-access-only.
+// AHBSC->MASTER_SEC_LEVEL resets with CPU1's field at 0b00, non-secure and
+// non-privileged, so CPU1 issues non-secure transactions and the filter drops
+// them read-as-zero / write-ignored. PORT and FLEXIO have no equivalent filter,
+// which is exactly why they were unaffected and GPIO was not. Every NXP
+// multicore example for this part calls GPIO_EnablePinControlNonSecure() from
+// core0 before starting core1, for precisely this reason.
+//
+// This is why the ST7796S panel was black: CS (P0_12), D/C (P0_7) and RST
+// (P4_7) are GPIO, so CPU1 drove none of them. The FlexIO data lines and the WR
+// strobe were correct the whole time, feeding a controller that was never
+// selected and never reset -- and an 8080 write is unacknowledged, so every
+// counter read healthy.
+//
+// Grant only the pins CPU1 owns. P0_27 is CPU0's heartbeat LED and stays
+// secure-only; leaving it out is what keeps this a handover rather than a
+// blanket opening. PCNS is a plain RMW on a register CPU1 cannot reach, and it
+// runs before the release below, so the two cores never contend for it.
+//
+// GPIOn->LOCK bit 0 freezes PCNS until the next reset. Nothing here sets it;
+// if anything ever does, it must run after this.
+void core1_grant_gpio_nonsecure(void)
+{
+    CLOCK_EnableClock(kCLOCK_Gpio0);
+    CLOCK_EnableClock(kCLOCK_Gpio1);
+    CLOCK_EnableClock(kCLOCK_Gpio4);
+
+    // P0_7 D/C and P0_12 CS.
+    GPIO_EnablePinControlNonSecure(GPIO0, (1u << 7) | (1u << 12));
+    // P1_2 CPU1's blue status LED.
+    GPIO_EnablePinControlNonSecure(GPIO1, (1u << 2));
+    // P4_7 panel reset.
+    GPIO_EnablePinControlNonSecure(GPIO4, (1u << 7));
+}
+
 core1_release_status_t core1_release(void)
 {
     // Two words of flash, read once. If they are not a plausible vector pair

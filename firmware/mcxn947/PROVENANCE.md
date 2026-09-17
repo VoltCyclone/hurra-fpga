@@ -1198,8 +1198,14 @@ these were resolved by reading files this commit imports.
   directly.
 
 - **`board.h` puts `BOARD_LCD_DC_GPIO_PIN` on P0_10, the red LED**, while design
-  doc section 2 assigns display D/C to P0_7. Not chased here — flagged for
-  whoever writes step 7.
+  doc section 2 assigns display D/C to P0_7. **Resolved: P0_7 is correct.**
+  Zephyr's `boards/nxp/frdm_mcxn947/frdm_mcxn947.dtsi` names every J8 signal
+  machine-readably — `rs-gpios = <&gpio0 7>`, `cs-gpios = <&gpio0 12>`,
+  `reset-gpios = <&gpio4 7>`, `enwr-pin = <1>`, `rd-pin = <0>`,
+  `data-pin-start = <16>` — and UM12018 Table 21 agrees. `board.h`'s P0_10 is
+  unrelated to J8; P0_10 is ARD_D9 on the Arduino header. Our pin assignments
+  match NXP's own `pin_mux.c` field for field, PCR values included, so **pin
+  assignment is not a candidate for display faults — stop re-deriving it.**
 
 - **`~/git/dm-mcx-streamdeck/` is a different, older SDK and must not be used as
   a source for this tree.** Every overlapping file differs from 24.12.00: its
@@ -1209,3 +1215,76 @@ these were resolved by reading files this commit imports.
   defined), and its `board.h` maps the RGB LED to GPIO3[2:4] active-high — the
   MCX-N9XX-EVK pinout — under `BOARD_NAME "FRDM-MCXN947"`. Nothing in this tree
   came from it.
+
+## Step 7 display, actually working (2026-09-17)
+
+- **CPU1 cannot touch GPIO until CPU0 hands it each pin, and the failure is
+  silent.** GPIO is TrustZone-aware and carries its own per-pin secure filter,
+  `PCNS` ("pin control nonsecure", GPIO offset 0x10), which **resets to 0 —
+  every pin secure-access-only**. CPU1 has no SAU and can only issue non-secure
+  transactions: `AHBSC->MASTER_SEC_LEVEL` (offset 0xFD0) resets to 0x80000000,
+  putting CPU1's field [3:2] at 00b, non-secure and non-privileged. RGPIO
+  therefore discards CPU1's writes and returns zero on its reads, with no bus
+  fault and no status bit anywhere.
+
+  Measured from CPU1 before the fix: `GPIO0->PDDR` read 0x00000000 while CPU0
+  was visibly driving P0_27, and all four views behaved identically —
+  non-secure, ALIAS1, and both secure aliases. Meanwhile `PORT0->PCR[7]` read
+  0x1000, `PORT2->PCR[8]` read 0x1600 and `FLEXIO0->CTRL` read 0xC0000005, all
+  correct. **PORT and FLEXIO have no equivalent per-pin filter**, which is
+  exactly why they worked and GPIO did not. Not AHBSC slave rules — GPIO0 and
+  PORT0 both reset to 0b11, and `MISC_CTRL_REG[3:2]` leaves bus checking
+  disabled after the boot ROM. Not clocks: `SYSCON->AHBCLKCTRL0` read
+  0x04DBE7FF, bits 19/20/23 set.
+
+  `core1_grant_gpio_nonsecure()` in `core1_release.c` is the handover, called
+  from `main_core0.c` strictly before `core1_release()`. It grants only the pins
+  CPU1 owns; P0_27 stays secure, so CPU1 still reads that bit as 0, which is
+  correct. `PCNS` is writable only by a secure-privileged master, so CPU1 could
+  never grant itself. Every NXP multicore example does the same thing.
+
+  **Consequence while it was broken:** CS (P0_12), D/C (P0_7) and RST (P4_7) are
+  GPIO, so CPU1 drove none of them. The FlexIO data lines and WR strobe were
+  correct throughout, feeding a panel that was never selected and never reset.
+  **The free diagnostic is the blue LED**: CPU1 drives P1_2 via GPIO1, so a dark
+  blue LED while `stats` shows CPU1 alive means CPU1's GPIO is dead. Check that
+  before anything else.
+
+- **`MCUX_DBI_LEGACY` must stay at its default of 1.** Step 7 built core1 with
+  `-DMCUX_DBI_LEGACY=0`, which routes `ST7796S_WriteCommand()` through
+  `DBI_IFACE_WriteCmdData` → `FLEXIO_MCULCD_WriteDataArrayBlocking()`. On a
+  16-bit bus that function does `size /= 2U` and reinterprets the parameter
+  **byte** array as `uint16_t`. **A one-byte parameter becomes ZERO bus beats
+  and is never transmitted.** `COLMOD`, `MADCTL`, `TEON` and the `CSCON` unlock
+  keys all vanished; `CASET`/`RASET` sent 2 beats instead of 4, losing both end
+  addresses. Only `param_len == 0` commands survived — `SWRESET`, `SLPOUT`,
+  `INVON`, `TEOFF`, `DISPON`/`DISPOFF`.
+
+  So the panel woke and lit but was never configured, and displayed its
+  power-on GRAM, which the ST7796S datasheet (§9.2.22) states is random and is
+  cleared by neither software nor hardware reset. That is the "frozen static"
+  symptom, and it survived every bus-rate, DMA-path and pin-level change
+  because none of them touched parameter framing.
+
+  The legacy path widens each parameter byte into its own beat
+  (`fsl_st7796s.c`: `uint16_t param_data = params[i]`), which is correct and is
+  what NXP's own working `frdmmcxn947` display examples use. Switching back
+  means the legacy API: `dbi_flexio_edma_xfer_handle_t`,
+  `DBI_FLEXIO_EDMA_CreateXferHandle()`, `ST7796S_Init(..., &g_dbiFlexioEdmaXferOps,
+  &handle)` and `ST7796S_SetMemoryDoneCallback()` on the panel handle rather
+  than `DBI_IFACE_SetMemoryDoneCallback()` on a `dbi_iface_t`. `fsl_dbi.c`
+  implements only the non-legacy helpers and is dropped from `CORE1_OBJECTS`;
+  left in, `--gc-sections` discards it whole and `make check` rejects that.
+
+- **An 8080 write is unacknowledged, so counters prove nothing about the glass.**
+  Through both of the faults above, `panel=ok`, `blitrej=0`, blits climbed and
+  every eDMA transfer completed. `frames` cannot answer it either. The only
+  honest checks are a flat full-screen fill and a command with a visible effect
+  (`DISPOFF`/`DISPON`). Note that `DISPON` is **parameterless**, so it proves
+  the command phase only — it was obeyed for the entire time the data phase was
+  dead.
+
+- **Measured after both fixes:** ~7 fps at 25 blits/frame, below section 9's
+  20 Hz target. The cost is legacy DBI framing each parameter byte as its own
+  CS-framed blocking transfer, so `SelectArea` runs ~10 round trips per blit.
+  Not addressed here; the display is non-load-bearing and the link is unaffected.
