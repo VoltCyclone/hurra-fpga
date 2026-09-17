@@ -3,14 +3,31 @@
 Target: **FRDM-MCXN947** (MCXN947VDF, dual Cortex-M33), replacing the CH32H417 on
 the PMOD-A injection link. Design: `docs/MCXN947_CONTROLLER.md`.
 
-**This tree is at migration step 4 of that document's section 9** — CPU0 only:
-clock, blink, LPSPI6 as an SPI slave on LP_FLEXCOMM6 driven by a self-loading
-eDMA0 scatter-gather ring that transmits a permanently IDLE slot, retirement of
-every received slot through `src/link_retire.c`, ERR051588 detection and
-recovery through `src/link_recovery.c`, and a TinyUSB CDC console on the
-ChipIdea High Speed controller behind J11. There is no display and no CPU1
-image. What is *absent* is recorded here too, because "we did not vendor it yet"
-and "we decided not to vendor it" are different claims.
+**This tree implements migration step 5 of that document's section 9** — two
+images: clock, blink, LPSPI6 as an SPI slave on LP_FLEXCOMM6 driven by a
+self-loading eDMA0 scatter-gather ring that transmits a permanently IDLE slot,
+retirement of every received slot through `src/link_retire.c`, ERR051588
+detection and recovery through `src/link_recovery.c`, and a TinyUSB CDC console
+on the ChipIdea High Speed controller behind J11. CPU1 is released last and
+does only the shared-window boot count and heartbeat; there is no display. What
+is *absent* is recorded here too, because "we did not vendor it yet" and "we
+decided not to vendor it" are different claims.
+
+**Step 5 hardware acceptance is complete.** Section 9's three configurations
+were measured on the bench on 2026-09-16, acceptance taken from the FPGA's own
+registers over JTAG, each over a window rather than as a single reading:
+
+| configuration | slots/s | gated FPGA counters | CPU1 |
+|---|---|---|---|
+| (a) core1 region erased, blank-check confirmed | 7999.97 | all +0 over 42.9 s | not released, reported |
+| (b) both images flashed | 7995.75 | all +0 over 42.9 s | alive, 720 heartbeats/s |
+| (c) both flashed, CPU1 held in reset mid-execution | 7999.92 | all +0 over 42.9 s | frozen, heartbeat delta 0 |
+
+`spi_bad_sof`, `spi_bad_crc`, `spi_bad_length`, `spi_bad_type` and
+`spi_queue_full` were flat in all three, `link_losses` did not move, and no
+counter on the MCU's own console grew during any window. Configuration (a)
+**failed on the first attempt** — see the boot-loop finding below — and passes
+only because of `core1_image_valid()`.
 
 Everything under `vendor/` is imported unmodified and is exempted from the
 repository whitespace gate by `.gitattributes`. Do not reformat it.
@@ -39,8 +56,10 @@ Imported unchanged:
 | `vendor/mcux-sdk/COPYING-BSD-3` | `COPYING-BSD-3` |
 | `vendor/mcux-sdk/devices/MCXN947/periph/` | `devices/MCXN947/periph/` (78 headers) |
 | `vendor/mcux-sdk/devices/MCXN947/MCXN947_cm33_core0{,_COMMON,_features}.h` | same |
+| `vendor/mcux-sdk/devices/MCXN947/MCXN947_cm33_core1{,_COMMON,_features}.h` | same |
 | `vendor/mcux-sdk/devices/MCXN947/fsl_device_registers.h` | same |
 | `vendor/mcux-sdk/devices/MCXN947/system_MCXN947_cm33_core0.{c,h}` | same |
+| `vendor/mcux-sdk/devices/MCXN947/system_MCXN947_cm33_core1.{c,h}` | same (**reference only; deviation 12**) |
 | `vendor/mcux-sdk/devices/MCXN947/drivers/fsl_{common,common_arm,reset,port}.h` | `devices/MCXN947/drivers/` |
 | `vendor/mcux-sdk/devices/MCXN947/drivers/fsl_{clock,spc,gpio}.{c,h}` | `devices/MCXN947/drivers/` |
 | `vendor/mcux-sdk/devices/MCXN947/drivers/fsl_reset.c` | `devices/MCXN947/drivers/` |
@@ -99,8 +118,9 @@ price of the guarantee.
   `src/usb_console.c`. See deviation 9 for why that is defensible rather than
   a shortcut: two independent upstreams state the same sequence register for
   register.
-- **`boot_multicore_slave.c`** and the ST7796S / DBI / FlexIO display stack.
-  Steps 5 and 7 respectively.
+- **`boot_multicore_slave.c`** — rejected at step 5 rather than imported; see
+  deviation 13. The ST7796S / DBI / FlexIO display stack remains deferred to
+  step 7.
 - **`fsl_dbi_flexio_smartdma`** — rejected outright, not deferred. SmartDMA is a
   third bus master and admitting it would put an engine nobody has reasoned
   about against the link's arbitration budget (design doc section 7).
@@ -135,10 +155,8 @@ directory at all — only `mcuxpresso/startup_mcxn947_cm33_core{0,1}.{c,cpp}`,
 which are the MCUXpresso-IDE managed-linker startups. The design doc's section 7
 claim is confirmed.
 
-**The core1 pair is imported but not built.** Step 5 is the first step that
-links it. It is here now so that the two scripts can be read side by side while
-reasoning about the shared window, and so that step 5 is a Makefile change
-rather than another vendoring commit.
+**The core1 pair is linked by migration step 5.** It forms a separate ELF at
+0x000C0000; no embedded-blob section from the core0 linker script is used.
 
 ### Mixing the two upstreams is safe, and this is the check that says so
 
@@ -421,6 +439,160 @@ Each is a change *we* made, or a vendor behaviour we deliberately did not adopt.
     before USB enumeration has even been attempted. `src/usb_console.c` prints
     a one-line USB status report on that UART at 1 Hz for the same reason: a
     console cannot report its own absence.
+
+12. **The vendored `system_MCXN947_cm33_core1.c` is deliberately not linked.**
+    It remains byte-exact in the tree as the reference we deviated from. Its
+    weak `SystemInit()` does not merely initialize CPU1: it writes ten
+    chip-wide locations in SYSCON, SPC0, GDET0/1 and ITRC0, including an RMW of
+    `SPC0->CORELDO_CFG` after CPU0 has raised `mcu_ready`. `src/system_core1.c`
+    supplies the strong replacement and touches only CPU1's `SCB->CPACR` CP0/1
+    access bits and `SCB->VTOR`; `CORE1_RETAIN` asserts that this object owns
+    the linked `SystemInit` symbol. We **declined to put those chip-wide writes
+    on CPU1**. We did **not** measure whether replaying NXP's sequence while the
+    8 kHz link was live would have been tolerated.
+
+13. **`boot_multicore_slave.c` is reimplemented as `src/core1_release.c`, not
+    vendored.** The design doc says it is already in the vendor set; it is not.
+    More importantly, the SDK file is gated on `__MULTICORE_MASTER` and refers
+    to `__core_m33slave_START__`, which the byte-exact core0 linker script does
+    not define because this build uses two separate images. Our module performs
+    the same CPBOOT/CPUCTRL transaction from one CPUCTRL read, using the
+    Makefile's `CORE1_OFFSET`. Rung 6 disassembles the linked function and
+    checks both register addresses, store order, exactly one CPUCTRL read, both
+    stores' dependency on that snapshot, and the exact boot/key/reset literals.
+
+14. **Core1 uses `-mfloat-abi=soft`, not core0's hard-float ABI.** The requested
+    `-mcpu=cortex-m33+nodsp` is correct, and `MCXN947_cm33_core1_COMMON.h`
+    declares both `__DSP_PRESENT` and `__FPU_PRESENT` as zero. Combining that
+    header with `-mfloat-abi=hard -mfpu=fpv5-sp-d16` makes CMSIS stop the build:
+    "Compiler generates FPU instructions for a device without an FPU". Core1
+    keeps the explicit `-mfpu=fpv5-sp-d16` selection for build symmetry but
+    uses the soft ABI, selecting the toolchain's `v8-m.main/nofp` libraries and
+    preventing FPU instructions. Suppressing CMSIS's check would encode a false
+    hardware claim in the image.
+
+15. **CPU0 refuses to release CPU1 onto a region that is not a plausible
+    image.** `core1_image_valid()` checks the two words at 0x000C0000: the
+    initial MSP must lie inside CPU1's `m_data` and be 8-byte aligned, and the
+    reset vector must lie inside CPU1's flash window with bit 0 set. This has
+    no counterpart in the SDK or the design document, and it is not caution: it
+    is the difference between configuration (a) passing and CPU0 boot-looping
+    (see the findings below). The predicate is portable and host-tested,
+    including the erased-flash case it exists for. A skipped release is
+    reported on the console as `NOT-RELEASED(no image)`, distinct from
+    `HELD-IN-RESET`, so nobody reflashes a part that is already correct.
+
+---
+
+## Findings while building step 5
+
+- **The design's literal forbidden-symbol wording cannot pass either byte-exact
+  startup.** Both startup files define weak trampolines for the part's complete
+  vector table. Core0 therefore necessarily contains weak `FLEXIO` and
+  `EDMA_1_*` symbols, while core1 necessarily contains weak `EDMA_0_*`,
+  `CTIMER2`, `GDET`, `ITRC` and `SPC` symbols. These are unhandled vector stubs,
+  not peripheral ownership. Rung 5 rejects matching **strong definitions** and
+  explicitly ignores only weak bindings; its self-test proves both halves of
+  that discrimination.
+
+- **A symbol-name ban on `SPC` / `GDET` / `ITRC` is not by itself a static
+  guarantee against NXP's SystemInit sequence.** Those register macros compile
+  into numeric MMIO addresses and need not survive as ELF symbol names. The
+  actual guarantee combines the rung-1 ownership assertion that strong
+  `SystemInit` comes from `build/core1/system_core1.o` with a rung-5
+  disassembly allowlist: exactly two stores, to SCB CPACR and VTOR, in that
+  order. Object survival and the absence of the vendor system object from
+  `CORE1_OBJECTS` complete the chain. The name bans remain useful for catching
+  future strong handlers/drivers, but are not overstated as proving direct-MMIO
+  absence on their own.
+
+- **The requested hard-FPU flags contradict the core1 device description.**
+  This was found by the real target compile, not inferred from the core name;
+  deviation 14 records the safe resolution.
+
+- **The release checker must inspect emitted code, not source intent — and it
+  is the checker that must bend.** GCC 14.2.1 at `-Os` encodes both 0x50000000
+  and 0x000C0000 as Thumb-2 modified immediates, so neither reaches the literal
+  pool, and a rung 6 that read only `.word` entries failed a perfectly correct
+  image. An intermediate draft "fixed" this from the firmware side, with a
+  branch-over literal load in inline assembly so the constant would appear
+  where the checker was looking. That was backwards: it contorted shipped code
+  to satisfy a test, and it came packaged with a silent early return (below).
+  The fix belongs in `analyze_core1_release()`, which now collects `mov`/`movw`
+  immediates alongside pool words, and in the self-test, which carries the real
+  `objdump` output of the built function verbatim as a vector. Whether a
+  constant arrives as a pool word or an immediate is a codegen detail no
+  assertion may depend on.
+
+- **`core1_release()` takes no argument, and that is a safety property.** It
+  briefly took the boot address as a parameter and returned early when the
+  argument disagreed with `CORE1_VECTOR_ADDR`. A silent no-op there is exactly
+  the failure rung 6 exists to catch: a working link and a black screen, every
+  counter healthy, nothing anywhere saying CPU1 was never released. The address
+  is `CORE1_OFFSET` by definition, so the parameter only created a second place
+  for it to be wrong. The `-D` now reaches exactly one translation unit.
+
+- **RELEASING CPU1 ONTO AN ERASED REGION RESETS THE WHOLE CHIP.** This is the
+  serious finding of step 5 and it falsifies the design document's invariant as
+  written. Section 4 claims that if CPU1 "was never flashed at all, the FPGA
+  link runs normally"; measured on the bench, it does not. With the core1
+  region blank, both vector words read 0xFFFFFFFF, CPU1 faults on its first
+  fetch, escalates to LOCKUP, and takes CPU0 down with it — **CPU0 boot-looped
+  continuously**, re-running `link_init()` forever, with the link never
+  reaching steady state. Configuration (a) of section 9 step 5 failed outright
+  on the first attempt.
+
+  `core1_image_valid()` (deviation 15) is the fix: CPU0 reads the two vector
+  words and declines to release CPU1 unless they are a plausible pair. That is
+  a validity check on a flash image, not a handshake — it reads two words and
+  waits for nothing — so section 8's objection to MCMgr does not apply. With
+  the check in place configuration (a) passes with every counter flat.
+
+  **The lockup-to-reset path itself is inferred, not confirmed against the RM.**
+  What is measured is the pair of outcomes: blank core1 region boot-loops CPU0,
+  valid core1 image does not, with nothing else changed. The mechanism named
+  here is the obvious reading of that, and the RM is not on disk (section 10).
+
+- **A halted MCU is indistinguishable from the boot-random frame offset, from
+  the FPGA side.** When LinkServer leaves the part stopped, `mcu_ready` floats
+  high, so the FPGA believes the link is up, validates every returned slot, and
+  gets nothing — producing `spi_bad_sof` saturated 1:1 with `spi_slots`, which
+  section 10 documents as the signature of the boot-random frame offset. The
+  two are told apart by the debug UART: a mis-framed board still reaches its
+  foreground loop and still prints its periodic report, and a halted one prints
+  nothing at all. This cost one full gate run before it was recognised.
+
+- **LinkServer leaves the target halted unless its log says `restart on
+  reset`.** Both `flash ... erase` followed by `flash ... load`, and the
+  single-command `flash ... load -e`, wrote the image correctly and then left
+  the part stopped at the boot-ROM stall; only a plain `load` printed `restart
+  on reset` and actually ran. Treat that line as the success condition, not the
+  `Finished writing Flash successfully` above it. Separately, LinkServer's
+  default `--update-mode check` stalled for over three minutes on this setup
+  and had to be killed twice; `-u none` completes in about eight seconds and is
+  now the Makefile default.
+
+- **`cpu1halt` / `cpu1start` exist because the debugger could not do it.**
+  Section 9 step 5 configuration (c) asks for CPU1 halted in the debugger.
+  LinkServer's gdbserver attached to `cm33_core1` without ever stopping it —
+  the heartbeat kept advancing at 720/s through a supposed halt, so an early
+  (c) "pass" was really a second measurement of (b) — and it reported
+  `pc = 0x00000000` while reading the shared window correctly over the same
+  connection. CPU0 re-asserting CPU1's reset is deterministic, repeatable,
+  needs no debugger, and is harsher than a debugger halt because reset is
+  asynchronous and can land mid-store. CPU0 already owns that reset line, so
+  this is not a command *to* CPU1 and does not breach section 3's one-way
+  data-only IPC rule. Section 3 asks for re-release to sit behind an explicit
+  console command in any case; `cpu1start` is that command.
+
+- **Every hardware reading must come from a board you just deliberately reset,
+  captured from the moment of reset.** A board whose recent history includes a
+  debugger attach reports nonsense: one mid-session sample showed no UART
+  output, no USB enumeration and saturated `spi_bad_sof`, which read as a hard
+  failure and was simply a part left halted by an earlier attach. The same
+  configuration measured clean immediately afterwards when the capture started
+  at the reset. This is the step-5 restatement of section 10's rule that a
+  single reading is one draw from a distribution.
 
 ---
 

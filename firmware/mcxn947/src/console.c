@@ -93,12 +93,14 @@ static void cmd_help(void)
                 "  help     this list\r\n"
                 "  stats    link counters, to be compared against the FPGA's\r\n"
                 "  version  firmware identity\r\n"
-                "  flood    saturate this pipe until a key is pressed\r\n");
+                "  flood    saturate this pipe until a key is pressed\r\n"
+                "  cpu1halt hold CPU1 in reset (the link must not notice)\r\n"
+                "  cpu1start release CPU1 again\r\n");
 }
 
 static void cmd_version(void)
 {
-    console_put("hurra-adapter mcxn947 step4 (cpu0: link + console)\r\n");
+    console_put("hurra-adapter mcxn947 step5 (cpu0: link + console; cpu1: idle)\r\n");
 }
 
 static void cmd_stats(void)
@@ -145,6 +147,15 @@ static void cmd_stats(void)
     console_field("flood", s_flood_bytes);
     console_field("txdrop", s_dropped);
     console_field("up_ms", s.uptime_ms);
+    console_put("\r\n  cpu1 ");
+    if (s.cpu1_held_in_reset) {
+        console_put("HELD-IN-RESET ");
+    } else if (!s.cpu1_released) {
+        console_put("NOT-RELEASED(no image) ");
+    }
+    console_put(s.cpu1_alive ? "alive " : "DOWN ");
+    console_field("boot", s.cpu1_boot_count);
+    console_field("heartbeat", s.cpu1_heartbeat);
     console_put("\r\n");
 }
 
@@ -153,6 +164,22 @@ static void cmd_flood(void)
     s_flood = true;
     s_flood_bytes = 0u;
     console_put("flooding; send any byte to stop\r\n");
+}
+
+static void cmd_cpu1(bool start)
+{
+    void (*const action)(void *) =
+        start ? (s_ops.cpu1_start) : (s_ops.cpu1_halt);
+    if (action == NULL) {
+        console_put("no CPU1 on this build\r\n");
+        return;
+    }
+    action(s_ops.ctx);
+    // Deliberately reports the request, not an outcome. Confirming that CPU1
+    // actually stopped or started would mean waiting on CPU1, and the whole
+    // point of this split is that CPU0 never does. Read `stats` to see what
+    // the heartbeat did.
+    console_put(start ? "cpu1 release requested\r\n" : "cpu1 held in reset\r\n");
 }
 
 static bool console_equal(const char *a, const char *b)
@@ -185,6 +212,10 @@ static void console_dispatch(void)
         cmd_version();
     } else if (console_equal(s_line, "flood")) {
         cmd_flood();
+    } else if (console_equal(s_line, "cpu1halt")) {
+        cmd_cpu1(false);
+    } else if (console_equal(s_line, "cpu1start")) {
+        cmd_cpu1(true);
     } else {
         console_put("unknown command; try help\r\n");
     }

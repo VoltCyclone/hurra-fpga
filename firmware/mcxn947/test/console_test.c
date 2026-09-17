@@ -55,11 +55,47 @@ static void capture_stats(void *ctx, console_stats_t *out)
 
 static capture_t g_capture;
 
+static uint32_t g_cpu1_halts;
+static uint32_t g_cpu1_starts;
+
+static void capture_cpu1_halt(void *ctx)
+{
+    (void)ctx;
+    g_cpu1_halts++;
+}
+
+static void capture_cpu1_start(void *ctx)
+{
+    (void)ctx;
+    g_cpu1_starts++;
+}
+
 static void setup(uint32_t budget)
 {
     memset(&g_capture, 0, sizeof(g_capture));
     g_capture.budget = budget;
     g_stats_calls = 0u;
+    g_cpu1_halts = 0u;
+    g_cpu1_starts = 0u;
+
+    const console_ops_t ops = {
+        .write = capture_write,
+        .stats = capture_stats,
+        .cpu1_halt = capture_cpu1_halt,
+        .cpu1_start = capture_cpu1_start,
+        .ctx = &g_capture,
+    };
+    console_init(&ops);
+}
+
+// Same console, built for a target that has no CPU1 to operate.
+static void setup_without_cpu1(uint32_t budget)
+{
+    memset(&g_capture, 0, sizeof(g_capture));
+    g_capture.budget = budget;
+    g_stats_calls = 0u;
+    g_cpu1_halts = 0u;
+    g_cpu1_starts = 0u;
 
     const console_ops_t ops = {
         .write = capture_write,
@@ -209,6 +245,10 @@ static void test_stats_reports_every_counter(void)
         .framing_recoveries = 115u,
         .gap_wait_timeouts = 116u,
         .uptime_ms = 117u,
+        .cpu1_boot_count = 118u,
+        .cpu1_heartbeat = 119u,
+        .cpu1_alive = true,
+        .cpu1_released = true,
         .link_ready = true,
     };
     feed("stats\r");
@@ -233,7 +273,69 @@ static void test_stats_reports_every_counter(void)
     assert(captured("framing=115"));
     assert(captured("gapto=116"));
     assert(captured("up_ms=117"));
+    assert(captured("cpu1 alive"));
+    assert(captured("boot=118"));
+    assert(captured("heartbeat=119"));
     assert(captured("link ready"));
+}
+
+static void test_cpu1halt_and_cpu1start_reach_the_callbacks(void)
+{
+    setup(0xFFFFFFFFu);
+    feed("cpu1halt\r");
+    assert(g_cpu1_halts == 1u);
+    assert(g_cpu1_starts == 0u);
+    assert(captured("cpu1 held in reset"));
+
+    // And `stats` must then distinguish "an operator stopped it" from "there
+    // is no image to run".
+    memset(&g_stats, 0, sizeof(g_stats));
+    g_stats.cpu1_held_in_reset = true;
+    feed("stats\r");
+    assert(captured("cpu1 HELD-IN-RESET"));
+
+    feed("cpu1start\r");
+    assert(g_cpu1_starts == 1u);
+    assert(captured("cpu1 release requested"));
+}
+
+// The console must never claim to have done something it could not do. On a
+// build with no CPU1 wired up, both commands say so instead of printing a
+// success message over a no-op.
+static void test_cpu1_commands_report_when_unavailable(void)
+{
+    setup_without_cpu1(0xFFFFFFFFu);
+    feed("cpu1halt\r");
+    assert(g_cpu1_halts == 0u);
+    assert(captured("no CPU1 on this build"));
+}
+
+// A CPU1 that was never released must not read as merely "DOWN". The two are
+// different faults with different fixes -- a crashed image versus no image at
+// all -- and the whole reason CPU0 now checks before releasing is that the
+// second one used to reset the part.
+static void test_stats_distinguishes_no_image_from_crashed(void)
+{
+    setup(0xFFFFFFFFu);
+    memset(&g_stats, 0, sizeof(g_stats));
+    g_stats.cpu1_alive = false;
+    g_stats.cpu1_released = false;
+    feed("stats\r");
+    assert(captured("cpu1 NOT-RELEASED(no image) DOWN"));
+}
+
+static void test_stats_reports_cpu1_down(void)
+{
+    setup(0xFFFFFFFFu);
+    memset(&g_stats, 0, sizeof(g_stats));
+    g_stats.cpu1_boot_count = 7u;
+    g_stats.cpu1_heartbeat = 99u;
+    g_stats.cpu1_alive = false;
+    g_stats.cpu1_released = true;
+    feed("stats\r");
+    assert(captured("cpu1 DOWN"));
+    assert(captured("boot=7"));
+    assert(captured("heartbeat=99"));
 }
 
 static void test_stats_reports_link_down(void)
@@ -360,6 +462,10 @@ int main(void)
     test_control_bytes_are_dropped();
     test_overflow_is_reported_not_truncated();
     test_stats_reports_every_counter();
+    test_stats_reports_cpu1_down();
+    test_cpu1halt_and_cpu1start_reach_the_callbacks();
+    test_cpu1_commands_report_when_unavailable();
+    test_stats_distinguishes_no_image_from_crashed();
     test_stats_reports_link_down();
     test_help_and_version();
     test_greet();

@@ -15,6 +15,8 @@
 #include "link.h"
 #include "link_retire.h"
 #include "platform.h"
+#include "core1_release.h"
+#include "shared_window.h"
 
 #include "fsl_clock.h"
 #include "fsl_device_registers.h"
@@ -86,6 +88,8 @@ static uint32_t usb_console_write(void *ctx, const char *data, uint32_t length)
 
 static void usb_console_stats(void *ctx, console_stats_t *out)
 {
+    static uint32_t previous_cpu1_heartbeat;
+
     (void)ctx;
 
     link_retire_counters_t counters;
@@ -116,6 +120,25 @@ static void usb_console_stats(void *ctx, console_stats_t *out)
     out->link_ready = diagnostics.ready;
 
     out->uptime_ms = platform_ticks();
+
+    // CPU1 is observed, never waited on and never fed into a health decision.
+    // The words are naturally aligned 32-bit accesses; step 6 adds the seqlock
+    // only for the larger multiword link snapshot.
+    const core1_release_status_t release_status = core1_release_last_status();
+    out->cpu1_released = release_status == CORE1_RELEASED;
+    out->cpu1_held_in_reset = release_status == CORE1_HELD_IN_RESET;
+
+    if (g_shared_window.magic == SHARED_WINDOW_MAGIC) {
+        const uint32_t heartbeat = g_shared_window.cpu1_heartbeat;
+        out->cpu1_boot_count = g_shared_window.cpu1_boot_count;
+        out->cpu1_heartbeat = heartbeat;
+        out->cpu1_alive = heartbeat != previous_cpu1_heartbeat;
+        previous_cpu1_heartbeat = heartbeat;
+    } else {
+        out->cpu1_boot_count = 0u;
+        out->cpu1_heartbeat = 0u;
+        out->cpu1_alive = false;
+    }
 }
 
 // --- Clock and PHY ----------------------------------------------------------
@@ -256,9 +279,23 @@ static void usb_console_report(void)
 
 // --- Entry points -----------------------------------------------------------
 
+static void usb_console_cpu1_halt(void *ctx)
+{
+    (void)ctx;
+    core1_halt();
+}
+
+static void usb_console_cpu1_start(void *ctx)
+{
+    (void)ctx;
+    (void)core1_release();
+}
+
 static const console_ops_t s_console_ops = {
     .write = usb_console_write,
     .stats = usb_console_stats,
+    .cpu1_halt = usb_console_cpu1_halt,
+    .cpu1_start = usb_console_cpu1_start,
     .ctx = NULL,
 };
 

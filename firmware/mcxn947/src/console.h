@@ -1,11 +1,12 @@
 // The CDC console: line editing and command dispatch.
 //
-// Migration step 4 of docs/MCXN947_CONTROLLER.md section 9, and the portable
-// half of it. Nothing in this module touches MMIO or the USB stack -- it
-// speaks to both through the `console_ops_t` callbacks below -- so it
-// host-compiles and test/console_test.c drives every command with a captured
-// output buffer. usb_console.c is the guarded half that supplies the
-// callbacks and pumps TinyUSB.
+// Migration step 4 of docs/MCXN947_CONTROLLER.md section 9 introduced this
+// portable half; step 5 extends its stats with observed CPU1 liveness.
+// Nothing in this module touches MMIO or the USB stack -- it speaks to both
+// through the `console_ops_t` callbacks below -- so it host-compiles and
+// test/console_test.c drives every command with a captured output buffer.
+// usb_console.c is the guarded half that supplies the callbacks and pumps
+// TinyUSB.
 //
 // Design doc section 7 says the two genuinely new modules of this migration
 // are "100% portable by construction". This is one of them, and the split is
@@ -67,13 +68,29 @@ typedef struct {
     uint32_t gap_wait_timeouts;
 
     uint32_t uptime_ms;
+    uint32_t cpu1_boot_count;
+    uint32_t cpu1_heartbeat;
     bool link_ready;
+    bool cpu1_alive;
+    bool cpu1_released;
+    bool cpu1_held_in_reset;
 } console_stats_t;
 
 typedef struct {
     // Accepts up to `length` bytes, returns how many it took. Must not block.
     uint32_t (*write)(void *ctx, const char *data, uint32_t length);
     void (*stats)(void *ctx, console_stats_t *out);
+
+    // Stop CPU1, and start it again. Both may be NULL on a build with no CPU1
+    // (and are on the host), in which case the commands report that rather
+    // than pretending to work.
+    //
+    // Design doc section 3 requires re-release to sit behind an explicit
+    // console command: an automatic one "turns a display bug into a
+    // self-concealing reset loop". `cpu1halt` is its counterpart and is the
+    // instrument section 9 step 5 configuration (c) is measured with.
+    void (*cpu1_halt)(void *ctx);
+    void (*cpu1_start)(void *ctx);
     void *ctx;
 } console_ops_t;
 

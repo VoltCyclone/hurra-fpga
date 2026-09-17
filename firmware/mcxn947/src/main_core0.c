@@ -1,13 +1,12 @@
-// CPU0 entry for the MCXN947 controller, migration step 3: clock, blink, the
-// FPGA injection link, and the retirement of what the link receives.
+// CPU0 entry for the MCXN947 controller through migration step 5: clock,
+// blink, the FPGA link, USB console, shared window and final CPU1 release.
 //
 // Nothing here touches MMIO -- platform.c and heartbeat.c own that behind their
 // guards -- so this file is portable by default, per the guard-polarity rule.
 //
-// Deliberately absent, and each arriving with its own step: the CPU1 release
-// and the shared window (step 5), the map uploader (step 8) and the watchdog
-// (step 9). TX is still permanently IDLE: originating a command is step 8/9,
-// not this one.
+// Deliberately absent, and each arriving with its own step: the display work
+// (step 7), map uploader (step 8) and watchdog (step 9). TX is still
+// permanently IDLE: originating a command is step 8/9, not this one.
 //
 // The console arrived at step 4 and its placement in this function IS the
 // safety invariant. Design doc section 4(a): `mcu_ready` is raised at rung 4
@@ -26,9 +25,11 @@
 // red LED for CPU0 signalling a hard link fault, and moving the green one onto
 // link state would make a stalled foreground look like a dead link.
 
+#include "core1_release.h"
 #include "heartbeat.h"
 #include "link.h"
 #include "platform.h"
+#include "shared_window.h"
 #include "usb_console.h"
 
 int main(void)
@@ -42,11 +43,32 @@ int main(void)
     // inside is the safety invariant's boot ladder; see link.c.
     link_init();
 
+    // Rung 5 is after mcu_ready by construction. This section is NOLOAD in
+    // both images, so CPU0 must publish a known window before CPU1 can observe
+    // or update it.
+    shared_window_reset();
+
     // Rung 6. After the link, always. A host that never appears, a J11 that is
     // not plugged in, a PHY PLL that never locks -- none of them can reach the
     // link from here, because the link was already running when this was
     // called.
     usb_console_init();
+
+    // Rung 7 (CPU0's watchdog) arrives at migration step 9.
+
+    // Rung 8 is deliberately the final boot action, and it is conditional. Moving it above link_init
+    // would make mcu_ready depend on CPU1 startup; moving it above the shared
+    // reset would let CPU0 erase live CPU1 state; moving it above USB would
+    // violate section 4(a)'s measured ladder. A blank, halted, or crashing CPU1
+    // must therefore be indistinguishable to the already-live FPGA link.
+    //
+    // It refuses to release CPU1 onto a region that does not hold a plausible
+    // vector pair. That is not caution, it is measured: with the core1 region
+    // erased, releasing CPU1 unconditionally locks it up and resets this core,
+    // and CPU0 boot-looped until core1_image_valid() existed. The console
+    // reports which happened; nothing here decides anything on the result,
+    // because deciding on it would make the link depend on CPU1 after all.
+    (void)core1_release();
 
     // SysTick_Handler blinks; the eDMA0 channel 1 ISR retires; the USB1_HS ISR
     // moves packets. This loop only services the things that tolerate latency.

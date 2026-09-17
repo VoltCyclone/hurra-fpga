@@ -244,6 +244,21 @@ Guaranteed structurally, not by discipline:
 Step 4 strictly precedes step 8. There is no execution order in which CPU1 can
 influence whether the link comes up.
 
+**Step 8 is conditional, and the invariant above is false without that
+condition.** Measured at step 5: with the core1 region erased, both words of
+CPU1's vector table read 0xFFFFFFFF, CPU1 faults on its first instruction
+fetch, escalates to LOCKUP, and **resets the whole part** — CPU0 boot-looped
+continuously and the link never reached steady state. So "was never flashed at
+all" is precisely the clause that did not hold. CPU0 therefore reads the two
+vector words first and releases CPU1 only if they are a plausible pair
+(`core1_image_valid()`, `firmware/mcxn947/src/core1_release.c`). That is a
+validity check on a flash image, not a handshake with CPU1 — it reads two words
+and waits for nothing — so §8's objection to MCMgr does not apply to it.
+
+The lockup-to-reset path itself is **inferred**: what was measured is that a
+blank core1 region boot-loops CPU0 and a valid one does not, with nothing else
+changed. Confirming the mechanism needs the RM (§10).
+
 **(b) CPU1 owns no resource the link path needs** — different serial peripheral,
 different DMA controller, different SRAM region, different flash image, disjoint
 IRQ set, disjoint pins. Enforced statically by §7 rung 5.
@@ -414,9 +429,19 @@ chosen to vendor. What would change this: Ethernet coming off the deferred list
    drivers (`fsl_common`, `clock`, `reset`, `spc`, `gpio`, `port`, `edma`,
    `lpspi`, `lpflexcomm`, `ctimer`, `wwdt`, `inputmux`, `flexio*`), CMSIS core,
    ~~`middleware/usb/phy/usb_phy.{c,h}` (the only file from `middleware/usb/`)~~,
-   `project_template/{clock_config,board}.{c,h}`, `boot_multicore_slave.c`, and
-   the display stack: `components/display/st7796s`,
-   `components/video/display/dbi/fsl_dbi`, `.../dbi/flexio/fsl_dbi_flexio_edma`.
+   `project_template/{clock_config,board}.{c,h}`, ~~`boot_multicore_slave.c`~~,
+   and the display stack: `components/display/st7796s`,
+   `components/video/display/dbi/fsl_dbi.{c,h}`,
+   `.../dbi/flexio/fsl_dbi_flexio_edma`.
+
+   **Two corrections here, both from step 5.** `boot_multicore_slave.c` is
+   *not* "already in the vendor set" — it was never vendored, and it is not
+   vendorable as it stands: it is gated on `__MULTICORE_MASTER` and refers to
+   `__core_m33slave_START__`, which the byte-exact core0 linker script does not
+   define because this build produces two separate images rather than an
+   embedded blob. It is reimplemented as `src/core1_release.c` exactly as §8
+   prescribes. And `fsl_dbi` is a file pair directly under
+   `components/video/display/dbi/`, not a directory of that name.
 
    **`usb_phy.{c,h}` cannot be "the only file from `middleware/usb/`", and was
    rejected at step 4 rather than taken.** Measured: `usb_phy.c`'s first
@@ -547,10 +572,24 @@ MCUXpresso IDE, and identifies the target unaided:
   1  MCU-LINK FRDM-MCXN947 (r0E7) CMSIS-DAP V3.128  AQE3AU1FLFDNJ  MCXN947   FRDM-MCXN947
 ```
 
-`make -C firmware/mcxn947 flash` loads `core0.elf` — the ELF rather than the
-`.bin`, so the load addresses come from the linker script and there is no
-`--addr` to drift. Verified on hardware 2026-09-16: two sectors written, target
-reset, blink running. `make probes` lists what is attached.
+`make -C firmware/mcxn947 flash` loads `core0.elf` and `core1.elf` — ELFs
+rather than `.bin`s, so the load addresses come from the linker scripts and
+there is no `--addr` to drift. Verified on hardware 2026-09-16. `make probes`
+lists what is attached.
+
+**Two operational facts measured at step 5, both of which cost a gate run.**
+LinkServer's default `--update-mode check` probes the MCU-Link's own firmware
+before talking to the target and stalled here for over three minutes, twice;
+`-u none` completes in about eight seconds and is the Makefile default. And
+LinkServer only *runs* what it wrote when its log ends with `restart on reset`
+— both `erase` followed by `load`, and the single-command `load -e`, programmed
+the part correctly and then left it stopped at the boot-ROM stall. That matters
+far beyond flashing, because **a halted MCU is indistinguishable from the
+boot-random frame offset from the FPGA side**: `mcu_ready` floats high, the
+FPGA validates every returned slot, and `spi_bad_sof` saturates 1:1 with
+`spi_slots`, which §10 lists as that hazard's signature. The debug UART tells
+them apart — a mis-framed board still prints its periodic report, a halted one
+prints nothing.
 
 ---
 
@@ -632,12 +671,36 @@ counters over JTAG.
 4. **TinyUSB CDC console on CPU0.** *Gate: enumerates at HS, `stats` matches
    JTAG.* **Re-run the step-2 gate under bulk console load** — this is the
    empirical check on §3's core-placement decision.
-5. **Two-image build; CPU1 released, doing nothing.** *Gate — the invariant's
-   acceptance test, in three configurations:* (a) core1 region erased -> link
-   runs, counters flat; (b) both flashed -> same, plus heartbeat advances;
-   (c) both flashed, CPU1 halted in the debugger -> identical to (a).
-   **If any of the three fails, stop. The split is wrong and no amount of display
-   code will fix it.**
+5. **Two-image build; CPU1 released, doing nothing.** **DONE 2026-09-16**, and
+   configuration (a) failed on the first attempt exactly as this step warns it
+   might. *Gate — the invariant's acceptance test, in three configurations:*
+   (a) core1 region erased -> link runs, counters flat; (b) both flashed ->
+   same, plus heartbeat advances; (c) both flashed, CPU1 halted -> identical
+   to (a). **If any of the three fails, stop. The split is wrong and no amount
+   of display code will fix it.**
+
+   Measured, FPGA counters over JTAG, each over a ~43 s window:
+
+   | configuration | slots/s | gated counters | CPU1 |
+   |---|---|---|---|
+   | (a) core1 erased (blank-checked) | 7999.97 | all +0 | not released |
+   | (b) both flashed | 7995.75 | all +0 | alive, 720 hb/s |
+   | (c) CPU1 stopped mid-execution | 7999.92 | all +0 | heartbeat frozen |
+
+   **(a) boot-looped CPU0 until `core1_image_valid()` existed** — see §4(a).
+   That is the step working as intended: the gate caught a false invariant
+   before any display code was written.
+
+   **(c) is measured with a console command, not a debugger.** LinkServer's
+   gdbserver attached to `cm33_core1` without ever halting it — the heartbeat
+   advanced at 720/s straight through a supposed halt, so the first (c) result
+   was really a second reading of (b) — while reporting `pc = 0x00000000` and
+   reading the shared window correctly over the same connection. `cpu1halt`
+   has CPU0 re-assert CPU1's reset: deterministic, repeatable, no debugger, and
+   harsher than a halt because reset is asynchronous and can land mid-store.
+   CPU0 already owns that reset line, so it is not a command *to* CPU1 and the
+   one-way IPC rule of §3 is intact. `cpu1start` is the explicit re-release
+   command §3 asks for.
 6. **Snapshot IPC, no display yet** — CPU1 mirrors `slot_counter`'s low bits onto
    the RGB LED so the IPC is observable before the panel exists. This is where
    the LPCAC question gets answered empirically.
@@ -692,6 +755,18 @@ display bugs.
   a clean power-on and is therefore not evidence either way — it is recorded
   here only so nobody re-derives it as a finding. Establishing the power-on rate
   needs its own trials.
+
+- **CPU1 is not the same core as CPU0, and §3 assigns it the display anyway.**
+  Measured at step 5 from the vendored headers:
+  `MCXN947_cm33_core1_COMMON.h` declares `__FPU_PRESENT 0`, `__DSP_PRESENT 0`
+  and `__MPU_PRESENT 0` where the core0 header declares 1 and 1; LinkServer's
+  own device description calls it `cm33_nodsp`. Core1 is therefore built
+  `-mcpu=cortex-m33+nodsp -mfloat-abi=soft` (CMSIS stops the build outright if
+  given core0's hard-float ABI, which is how this was found). Two consequences
+  for later steps: any floating point in display code is software-emulated on
+  the weaker core, and **the missing MPU means the `NonCacheable` problem below
+  cannot be solved with an MPU region on CPU1** — which is where the display's
+  eDMA1 buffers live.
 
 - **Serial number source.** `SYSCON->DIEID` is *revision and die number*,
   identical across boards of the same revision — wrong for a serial. No UUID

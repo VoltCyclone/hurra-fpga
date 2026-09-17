@@ -1,14 +1,13 @@
-# FRDM-MCXN947 controller firmware -- migration step 4: CPU0 only.
+# FRDM-MCXN947 controller firmware -- migration step 5: two images.
 #
-# Builds ONE image. It brings the part to overdrive + 150 MHz, arms a 1 kHz
+# CPU0 brings the part to overdrive + 150 MHz, arms a 1 kHz
 # SysTick, blinks the green LED, brings up LPSPI6 as an SPI slave on
 # LP_FLEXCOMM6 fed by a self-loading eDMA0 scatter-gather ring that transmits a
 # permanently IDLE slot, retires every received slot through the portable
 # transport in src/link_retire.c, detects and recovers ERR051588 through the
-# ladder in src/link_recovery.c, and -- new at step 4 -- presents a TinyUSB CDC
-# console on the ChipIdea High Speed controller behind J11. There is no display
-# and no CPU1 image yet; each arrives with its own step in
-# docs/MCXN947_CONTROLLER.md section 9.
+# ladder in src/link_recovery.c, and presents a TinyUSB CDC console on the
+# ChipIdea High Speed controller behind J11. CPU1 is a separate image released
+# last; it touches only the shared heartbeat words. There is no display yet.
 #
 # `make all` is not the gate. --gc-sections will silently discard a translation
 # unit that nothing references, and the vector table declares every handler
@@ -37,20 +36,33 @@ HOST_CC ?= cc
 # Cortex-M33 with the single-precision FPU and DSP extension the part
 # implements (__FPU_PRESENT / __DSP_PRESENT in
 # vendor/mcux-sdk/devices/MCXN947/MCXN947_cm33_core0_COMMON.h).
-ARCH := -mcpu=cortex-m33 -mthumb -mfloat-abi=hard -mfpu=fpv5-sp-d16
+CORE0_ARCH := -mcpu=cortex-m33 -mthumb -mfloat-abi=hard -mfpu=fpv5-sp-d16
+# The two cores are NOT the same core. MCXN947_cm33_core1_COMMON.h declares
+# __FPU_PRESENT 0, __DSP_PRESENT 0 and __MPU_PRESENT 0 where the core0 header
+# declares 1, 1; LinkServer's own device description calls core1 "cm33_nodsp".
+# So core1 gets +nodsp and a soft float ABI -- CMSIS stops the build outright
+# if given core0's hard-float ABI, which is the correct behaviour and how this
+# was found. No -mfpu here: it is inert under a soft ABI and naming one would
+# imply a choice that is not being made. The missing MPU matters later --
+# section 10's two-DMA coherency story cannot be solved with an MPU region on
+# this core. Recorded as a step-5 finding in PROVENANCE.md.
+CORE1_ARCH := -mcpu=cortex-m33+nodsp -mthumb -mfloat-abi=soft
 
 # CPU_MCXN947VDF_cm33_core0 is what fsl_device_registers.h switches on; it is
 # the part fitted to FRDM-MCXN947 and is the macro the SDK's own frdmmcxn947
 # examples define. MCXN947 is *our* guard macro -- MMIO lives inside
 # `#if defined(MCXN947)`, so a new file with no guard is portable by default.
-DEFINES := -DCPU_MCXN947VDF_cm33_core0 -DMCXN947
+CORE0_DEFINES := -DCPU_MCXN947VDF_cm33_core0 -DMCXN947
+CORE1_DEFINES := -DCPU_MCXN947VDF_cm33_core1 -DMCXN947
 
 VENDOR_SDK := vendor/mcux-sdk
 VENDOR_HAL := vendor/hal_nxp
 VENDOR_TUSB := vendor/tinyusb
 
-LINKER_SCRIPT := $(VENDOR_HAL)/devices/MCXN947/gcc/MCXN947_cm33_core0_flash.ld
-STARTUP       := $(VENDOR_HAL)/devices/MCXN947/gcc/startup_MCXN947_cm33_core0.S
+CORE0_LINKER_SCRIPT := $(VENDOR_HAL)/devices/MCXN947/gcc/MCXN947_cm33_core0_flash.ld
+CORE1_LINKER_SCRIPT := $(VENDOR_HAL)/devices/MCXN947/gcc/MCXN947_cm33_core1_flash.ld
+CORE0_STARTUP := $(VENDOR_HAL)/devices/MCXN947/gcc/startup_MCXN947_cm33_core0.S
+CORE1_STARTUP := $(VENDOR_HAL)/devices/MCXN947/gcc/startup_MCXN947_cm33_core1.S
 
 # `include/` holds the generated wire contract, so it is -isystem rather than
 # -I: injection_wire.h is machine-generated from
@@ -65,8 +77,10 @@ INCLUDES := -Isrc -isystem include \
 	-isystem $(VENDOR_SDK)/boards/frdmmcxn947/project_template \
 	-isystem $(VENDOR_TUSB)/src
 
-COMMON_CFLAGS := $(ARCH) $(DEFINES) $(INCLUDES) $(EXTRA_CFLAGS) -Os -ffunction-sections \
-	-fdata-sections -fno-common
+COMMON_CFLAGS := $(CORE0_ARCH) $(CORE0_DEFINES) $(INCLUDES) $(EXTRA_CFLAGS) -Os \
+	-ffunction-sections -fdata-sections -fno-common
+CORE1_CFLAGS := $(CORE1_ARCH) $(CORE1_DEFINES) $(INCLUDES) $(EXTRA_CFLAGS) -Os \
+	-ffunction-sections -fdata-sections -fno-common
 APP_WARNINGS      := -std=c11 -Wall -Wextra -Werror -Wconversion -Wshadow
 # Vendor sources are byte-exact imports and are not held to the app's warning
 # set. -Wno-unused-* covers file-local helpers and prototypes unused in this
@@ -78,7 +92,7 @@ VENDOR_WARNINGS   := -Wall -Wextra -Wno-unused-function -Wno-unused-variable \
 
 # Flash and RAM geometry. Declared here ONCE and passed to the checker, so the
 # Makefile and the gate cannot drift apart. Every value is read out of
-# $(LINKER_SCRIPT):
+# $(CORE0_LINKER_SCRIPT):
 #
 #   m_interrupts   ORIGIN = 0x00000000          (TEXT_START)
 #   m_text         ORIGIN + 0x400, LENGTH = TEXT_SIZE - 0x400
@@ -90,16 +104,18 @@ VENDOR_WARNINGS   := -Wall -Wextra -Wno-unused-function -Wno-unused-variable \
 #
 # RPMSG_SHMEM_SIZE is 0x2000 because we link with __use_shmem__=1 (below), so
 # m_data ends at 0x2004C000 and 0x2004C000..0x2004E000 is reserved. We are
-# reusing RPMsg's *address reservation*, not RPMsg: it is where the CPU0 ->
-# CPU1 snapshot goes at step 6, and reserving it now keeps CPU0's data from
-# growing into it in the meantime. Both vendored .ld files stay byte-exact.
+# reusing RPMsg's *address reservation*, not RPMsg: step 5 puts CPU1 liveness
+# there and step 6 appends the snapshot. Both vendored .ld files stay byte-exact.
 CORE0_FLASH_START := 0x00000000
 CORE0_FLASH_END   := 0x000C0000
 CORE1_OFFSET      := 0x000C0000
+FLASH_LIMIT       := 0x00100000
 CORE0_RAM_START   := 0x20000000
 CORE0_RAM_END     := 0x2004C000
 RAM_SHARED_START  := 0x2004C000
 RAM_SHARED_END    := 0x2004E000
+CORE1_RAM_START   := 0x2004E000
+CORE1_RAM_END     := 0x20068000
 STACK_SIZE        := 0x0800
 HEAP_SIZE         := 0x0400
 
@@ -113,11 +129,23 @@ HEAP_SIZE         := 0x0400
 # suppressed. They name a true fact -- newlib's exit path is linked and its
 # syscall stubs always fail -- and suppressing them now would hide the signal
 # when a later step actually calls into stdio.
-LDFLAGS := $(ARCH) -T$(LINKER_SCRIPT) -Wl,--gc-sections \
+CORE0_LDFLAGS := $(CORE0_ARCH) -T$(CORE0_LINKER_SCRIPT) -Wl,--gc-sections \
 	-Wl,-Map=build/core0.map \
 	-Wl,--defsym,__use_shmem__=1 \
 	-Wl,--no-warn-rwx-segments \
 	--specs=nano.specs --specs=nosys.specs
+
+CORE1_LDFLAGS := $(CORE1_ARCH) -T$(CORE1_LINKER_SCRIPT) -Wl,--gc-sections \
+	-Wl,-Map=build/core1.map \
+	-Wl,--defsym,__use_shmem__=1 \
+	-Wl,--no-warn-rwx-segments \
+	--specs=nano.specs --specs=nosys.specs
+
+# Reaches exactly ONE translation unit -- core1_release.c, the only code that
+# needs CPU1's boot address. core1_release() takes no argument precisely so
+# that this literal has a single home; passing it as a parameter would create
+# a second place for it to be wrong and a silent no-op when the two disagree.
+CORE1_VECTOR_DEFINE := -DCORE1_VECTOR_ADDR=$(CORE1_OFFSET)
 
 # Retention roots, as SYMBOL=OWNING_OBJECT.
 #
@@ -186,9 +214,19 @@ retain_symbol = $(word 1,$(subst =, ,$(1)))
 CORE0_RETAIN_LDFLAGS := \
 	$(foreach r,$(CORE0_RETAIN),-Wl,--undefined=$(call retain_symbol,$(r)))
 
-# Object list. This is the source of truth for what must survive into the
-# image; `make check` asserts that every one of these contributes at least one
-# symbol to core0.elf.
+# SystemInit is rooted as well as main: the ownership check makes the decision
+# not to link NXP's chip-wide core1 SystemInit a property of the ELF, not a
+# review promise. See PROVENANCE.md deviation 12.
+CORE1_RETAIN := \
+	main=build/core1/main_core1.o \
+	SystemInit=build/core1/system_core1.o
+
+CORE1_RETAIN_LDFLAGS := \
+	$(foreach r,$(CORE1_RETAIN),-Wl,--undefined=$(call retain_symbol,$(r)))
+
+# Object lists. These are the source of truth for what must survive into each
+# image; `make check` asserts that every listed object contributes at least one
+# symbol to its ELF.
 #
 # fsl_edma_soc.c left this list at step 3 and its .c is no longer vendored --
 # only fsl_edma_soc.h, which fsl_edma.h includes. The file defines NOTHING but
@@ -238,24 +276,52 @@ CORE0_OBJECTS := \
 	build/core0/usbd_control.o \
 	build/core0/cdc_device.o \
 	build/core0/dcd_ci_hs.o \
+	build/core0/shared_window.o \
+	build/core0/core1_release.o \
 	build/core0/main_core0.o
 
-.PHONY: all check check-copies clean flash probes test test-platform \
-	test-heartbeat test-link test-link-retire test-link-recovery test-spi-frame \
-	test-console
+CORE1_OBJECTS := \
+	build/core1/startup.o \
+	build/core1/system_core1.o \
+	build/core1/shared_window.o \
+	build/core1/main_core1.o
 
-all: build/hurra-mcxn947-core0.bin
+.PHONY: all check check-copies clean flash flash-core0-only flash-merged \
+	verify-core1-blank probes test test-platform \
+	test-heartbeat test-link test-link-retire test-link-recovery test-spi-frame \
+	test-console test-core1-release test-shared-window test-merge-images
+
+all: build/hurra-mcxn947.bin
 
 build/hurra-mcxn947-core0.bin: build/core0.elf
 	$(OBJCOPY) -O binary $< $@
 
-build/core0.elf: $(CORE0_OBJECTS) $(LINKER_SCRIPT) | build/core0
-	$(CC) $(LDFLAGS) $(CORE0_RETAIN_LDFLAGS) -o $@ $(CORE0_OBJECTS)
+build/hurra-mcxn947-core1.bin: build/core1.elf
+	$(OBJCOPY) -O binary $< $@
+
+build/hurra-mcxn947.bin: build/hurra-mcxn947-core0.bin \
+		build/hurra-mcxn947-core1.bin tools/merge_mcxn947_images.py
+	python3 tools/merge_mcxn947_images.py $< build/hurra-mcxn947-core1.bin \
+		$(CORE1_OFFSET) $@ $(FLASH_LIMIT)
+
+build/core0.elf: $(CORE0_OBJECTS) $(CORE0_LINKER_SCRIPT) | build/core0
+	$(CC) $(CORE0_LDFLAGS) $(CORE0_RETAIN_LDFLAGS) -o $@ $(CORE0_OBJECTS)
+	$(SIZE) $@
+
+build/core1.elf: $(CORE1_OBJECTS) $(CORE1_LINKER_SCRIPT) | build/core1
+	$(CC) $(CORE1_LDFLAGS) $(CORE1_RETAIN_LDFLAGS) -o $@ $(CORE1_OBJECTS)
 	$(SIZE) $@
 
 # --- application objects ----------------------------------------------------
 
-build/core0/main_core0.o: src/main_core0.c src/heartbeat.h src/platform.h | build/core0
+build/core0/main_core0.o: src/main_core0.c src/core1_release.h src/heartbeat.h \
+		src/link.h src/platform.h src/shared_window.h src/usb_console.h | build/core0
+	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
+
+build/core0/core1_release.o: src/core1_release.c src/core1_release.h | build/core0
+	$(CC) $(COMMON_CFLAGS) $(CORE1_VECTOR_DEFINE) $(APP_WARNINGS) -c $< -o $@
+
+build/core0/shared_window.o: src/shared_window.c src/shared_window.h | build/core0
 	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
 build/core0/platform.o: src/platform.c src/platform.h | build/core0
@@ -302,7 +368,7 @@ build/core0/usb_descriptors.o: src/usb_descriptors.c src/tusb_config.h | build/c
 
 build/core0/usb_console.o: src/usb_console.c src/usb_console.h src/console.h \
 		src/dbg_uart.h src/link.h src/link_retire.h src/platform.h \
-		src/tusb_config.h | build/core0
+		src/shared_window.h src/tusb_config.h | build/core0
 	$(CC) $(COMMON_CFLAGS) $(GLUE_WARNINGS) -c $< -o $@
 
 # --- vendored TinyUSB ------------------------------------------------------
@@ -333,7 +399,7 @@ build/core0/cdc_device.o: $(VENDOR_TUSB)/src/class/cdc/cdc_device.c | build/core
 build/core0/dcd_ci_hs.o: $(VENDOR_TUSB)/src/portable/chipidea/ci_hs/dcd_ci_hs.c | build/core0
 	$(CC) $(COMMON_CFLAGS) $(VENDOR_WARNINGS) -c $< -o $@
 
-# Bring-up diagnostic UART. Retained deliberately THROUGH step 4, against the
+# Bring-up diagnostic UART. Retained deliberately THROUGH step 5, against the
 # note in dbg_uart.c saying it goes when the CDC console arrives.
 #
 # Two reasons, both measured rather than sentimental. The console is on the
@@ -355,7 +421,7 @@ build/core0/spi_frame.o: src/spi_frame.c src/spi_frame.h include/injection_wire.
 
 # --- vendor objects ---------------------------------------------------------
 
-build/core0/startup.o: $(STARTUP) | build/core0
+build/core0/startup.o: $(CORE0_STARTUP) | build/core0
 	$(CC) $(COMMON_CFLAGS) -c $< -o $@
 
 build/core0/system.o: $(VENDOR_SDK)/devices/MCXN947/system_MCXN947_cm33_core0.c | build/core0
@@ -367,13 +433,40 @@ build/core0/clock_config.o: $(VENDOR_SDK)/boards/frdmmcxn947/project_template/cl
 build/core0/fsl_%.o: $(VENDOR_SDK)/devices/MCXN947/drivers/fsl_%.c | build/core0
 	$(CC) $(COMMON_CFLAGS) $(VENDOR_WARNINGS) -c $< -o $@
 
-build/core0 build/host:
+# --- core1 image ------------------------------------------------------------
+
+build/core1/startup.o: $(CORE1_STARTUP) | build/core1
+	$(CC) $(CORE1_CFLAGS) -c $< -o $@
+
+# This is our core-private-only SystemInit, not the vendored reference. Linking
+# the SDK implementation would replay chip-wide power/security policy after
+# mcu_ready is already high.
+build/core1/system_core1.o: src/system_core1.c | build/core1
+	$(CC) $(CORE1_CFLAGS) $(APP_WARNINGS) -c $< -o $@
+
+build/core1/shared_window.o: src/shared_window.c src/shared_window.h | build/core1
+	$(CC) $(CORE1_CFLAGS) $(APP_WARNINGS) -c $< -o $@
+
+build/core1/main_core1.o: src/main_core1.c src/shared_window.h | build/core1
+	$(CC) $(CORE1_CFLAGS) $(APP_WARNINGS) -c $< -o $@
+
+build/core0 build/core1 build/host:
 	mkdir -p $@
 
 # --- the gate ---------------------------------------------------------------
 
-CHECK_OBJECT_ARGS := $(foreach o,$(CORE0_OBJECTS),--object core0.elf:$(o))
-CHECK_RETAIN_ARGS := $(foreach r,$(CORE0_RETAIN),--retain core0.elf:$(r))
+CHECK_OBJECT_ARGS := \
+	$(foreach o,$(CORE0_OBJECTS),--object core0.elf:$(o)) \
+	$(foreach o,$(CORE1_OBJECTS),--object core1.elf:$(o))
+CHECK_RETAIN_ARGS := \
+	$(foreach r,$(CORE0_RETAIN),--retain core0.elf:$(r)) \
+	$(foreach r,$(CORE1_RETAIN),--retain core1.elf:$(r))
+
+CORE0_FORBIDDEN := (?i)flexio (?i)edma1 EDMA_1_ ST7796S DBI
+CORE1_FORBIDDEN := (?i)lpspi6 LP_FLEXCOMM6 (?i)edma0 EDMA_0_ CTIMER2 SPC GDET ITRC
+CHECK_FORBIDDEN_ARGS := \
+	$(foreach p,$(CORE0_FORBIDDEN),--forbid 'core0.elf:$(p)') \
+	$(foreach p,$(CORE1_FORBIDDEN),--forbid 'core1.elf:$(p)')
 
 # The wire codec and the generated contract header are byte-exact copies of the
 # CH32 originals, so that the two controllers can be diffed against each other
@@ -400,15 +493,23 @@ check: all check-copies
 	python3 tools/check_mcxn947_images.py --self-test
 	python3 tools/check_mcxn947_images.py --cross-compile $(CROSS_COMPILE) \
 		--core0 build/core0.elf \
+		--core1 build/core1.elf \
 		--core0-bin build/hurra-mcxn947-core0.bin \
+		--core1-bin build/hurra-mcxn947-core1.bin \
+		--merged-bin build/hurra-mcxn947.bin \
 		--core0-flash-start $(CORE0_FLASH_START) \
 		--core0-flash-end $(CORE0_FLASH_END) \
+		--core1-offset $(CORE1_OFFSET) \
+		--flash-limit $(FLASH_LIMIT) \
 		--core0-ram-start $(CORE0_RAM_START) \
 		--core0-ram-end $(CORE0_RAM_END) \
+		--core1-ram-start $(CORE1_RAM_START) \
+		--core1-ram-end $(CORE1_RAM_END) \
 		--ram-shared-start $(RAM_SHARED_START) \
 		--ram-shared-end $(RAM_SHARED_END) \
+		--shared-symbol g_shared_window \
 		--stack-size $(STACK_SIZE) --heap-size $(HEAP_SIZE) \
-		$(CHECK_RETAIN_ARGS) $(CHECK_OBJECT_ARGS)
+		$(CHECK_RETAIN_ARGS) $(CHECK_OBJECT_ARGS) $(CHECK_FORBIDDEN_ARGS)
 
 # --- host tests -------------------------------------------------------------
 #
@@ -417,7 +518,11 @@ check: all check-copies
 # grows MMIO outside its guard, the host build of it stops compiling here.
 
 test: test-platform test-heartbeat test-spi-frame test-link test-link-retire \
-	test-link-recovery test-console
+	test-link-recovery test-console test-core1-release test-shared-window \
+	test-merge-images
+
+test-merge-images:
+	python3 test/merge_mcxn947_images_test.py
 
 test-platform: build/host/platform_test
 	./build/host/platform_test
@@ -466,6 +571,20 @@ test-console: build/host/console_test
 build/host/console_test: test/console_test.c src/console.c src/console.h | build/host
 	$(HOST_CC) $(APP_WARNINGS) -Isrc test/console_test.c src/console.c -o $@
 
+test-core1-release: build/host/core1_release_test
+	./build/host/core1_release_test
+
+build/host/core1_release_test: test/core1_release_test.c src/core1_release.c \
+		src/core1_release.h | build/host
+	$(HOST_CC) $(APP_WARNINGS) -Isrc test/core1_release_test.c src/core1_release.c -o $@
+
+test-shared-window: build/host/shared_window_test
+	./build/host/shared_window_test
+
+build/host/shared_window_test: test/shared_window_test.c src/shared_window.c \
+		src/shared_window.h | build/host
+	$(HOST_CC) $(APP_WARNINGS) -Isrc test/shared_window_test.c src/shared_window.c -o $@
+
 build/host/link_recovery_test: test/link_recovery_test.c src/link_recovery.c \
 		src/link_recovery.h | build/host
 	$(HOST_CC) $(APP_WARNINGS) -Isrc test/link_recovery_test.c src/link_recovery.c -o $@
@@ -491,11 +610,42 @@ build/host/link_recovery_test: test/link_recovery_test.c src/link_recovery.c \
 LINKSERVER ?= /Applications/LinkServer_24.12.21/LinkServer
 LINKSERVER_DEVICE ?= MCXN947:FRDM-MCXN947
 
-# Load the ELF rather than the .bin: it carries its own load addresses, so
-# there is no --addr to get wrong and no way for the flash offset to drift
-# from what the linker script decided.
-flash: all
-	$(LINKSERVER) flash $(LINKSERVER_DEVICE) load build/core0.elf
+# -u none is not an optimisation, it is the difference between working and
+# hanging. LinkServer defaults to `--update-mode check`, which probes the
+# MCU-Link's own firmware version before it will talk to the target. Measured
+# 2026-09-16 on this setup: the default stalled for over three minutes with no
+# output and had to be killed, twice; the same command with `-u none`
+# completed in about eight seconds. The target was live and healthy throughout
+# both attempts -- the FPGA's link_ready stayed high -- so the stall is in the
+# probe handshake, not the part. Pass `-u auto` by hand on the rare occasion
+# the probe firmware actually needs updating.
+LINKSERVER_FLAGS ?= -u none
+
+# ELFs carry their own load addresses. One LinkServer transaction programs
+# them in CPU0-then-CPU1 order and resets only after both are present.
+flash: build/core0.elf build/core1.elf
+	$(LINKSERVER) flash $(LINKSERVER_FLAGS) $(LINKSERVER_DEVICE) load build/core0.elf build/core1.elf
+
+# Gate configuration (a): erase the whole device, then install only CPU0.
+# CPU0 must still raise mcu_ready and run the link with the core1 region blank.
+#
+# `load -e` and NOT a separate `erase` followed by `load`. Measured
+# 2026-09-16: the two-command form left the target sitting at the boot-ROM
+# stall -- its log is missing the `restart on reset` line the single-command
+# form prints -- so the part never ran the image that had just been written.
+# That failure is deceptive from the FPGA side: mcu_ready floats high with the
+# MCU halted, so link_ready reads 1 and every returned slot is garbage,
+# producing spi_bad_sof saturated 1:1 with spi_slots. That is pixel-identical
+# to the boot-random frame offset of design doc section 10, and it cost a gate
+# run to tell the two apart. One transaction, one reset, no ambiguity.
+flash-core0-only: build/core0.elf
+	$(LINKSERVER) flash $(LINKSERVER_FLAGS) $(LINKSERVER_DEVICE) load -e build/core0.elf
+
+flash-merged: build/hurra-mcxn947.bin
+	$(LINKSERVER) flash $(LINKSERVER_FLAGS) $(LINKSERVER_DEVICE) load --addr 0x0 $<
+
+verify-core1-blank:
+	$(LINKSERVER) flash $(LINKSERVER_FLAGS) $(LINKSERVER_DEVICE) blank --addr $(CORE1_OFFSET) --size 0x40000
 
 probes:
 	$(LINKSERVER) probes
