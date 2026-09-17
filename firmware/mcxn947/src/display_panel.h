@@ -28,5 +28,8 @@ bool display_panel_blit(uint16_t x, uint16_t y, uint16_t width,
                         uint16_t height, const uint16_t *rgb565);
 bool display_panel_blit_busy(void);
 bool display_panel_ok(void);
+void display_panel_delay_us(uint32_t microseconds);
+uint32_t display_panel_blit_count(void);
+uint32_t display_panel_reject_count(void);
 
 #endif  // HURRA_MCXN947_DISPLAY_PANEL_H

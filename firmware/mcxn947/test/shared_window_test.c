@@ -22,7 +22,7 @@ int main(void)
     assert(g_shared_window.cpu1_seen_slot_counter == 0u);
     const link_snapshot_t zero = {0};
     assert(memcmp((const void *)&g_shared_window.snapshot, &zero, sizeof(zero)) == 0);
-    assert(sizeof(shared_window_t) == 56u);
+    assert(sizeof(shared_window_t) == 64u);
     printf("shared_window_test: ok\n");
     return 0;
 }

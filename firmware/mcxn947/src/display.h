@@ -10,6 +10,14 @@
 #include "link_snapshot.h"
 #include "text_grid.h"
 
+// Colour painted over the whole panel at init. Red while the bus is being
+// brought up, because a red screen is unmistakable evidence that pixels reach
+// the glass; set it to 0x0000 once the renderer is trusted.
+#define DISPLAY_FILL_ON_INIT 0xf800u
+
+// How long the init fill stays up before the first text frame.
+#define DISPLAY_FILL_HOLD_US 3000000u
+
 #define DISPLAY_SLOT_VALUE_ROW 3u
 
 enum {

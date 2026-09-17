@@ -144,6 +144,8 @@ static void usb_console_stats(void *ctx, console_stats_t *out)
         const uint32_t heartbeat = g_shared_window.cpu1_heartbeat;
         out->cpu1_boot_count = g_shared_window.cpu1_boot_count;
         out->cpu1_frames = g_shared_window.cpu1_frames;
+        out->cpu1_blits = g_shared_window.cpu1_blits;
+        out->cpu1_blit_rejects = g_shared_window.cpu1_blit_rejects;
         out->cpu1_display_flags = g_shared_window.cpu1_display_flags;
         out->cpu1_heartbeat = heartbeat;
         out->cpu1_seen_slot_counter = g_shared_window.cpu1_seen_slot_counter;
@@ -152,6 +154,8 @@ static void usb_console_stats(void *ctx, console_stats_t *out)
     } else {
         out->cpu1_boot_count = 0u;
         out->cpu1_frames = 0u;
+        out->cpu1_blits = 0u;
+        out->cpu1_blit_rejects = 0u;
         out->cpu1_display_flags = 0u;
         out->cpu1_heartbeat = 0u;
         out->cpu1_seen_slot_counter = 0u;

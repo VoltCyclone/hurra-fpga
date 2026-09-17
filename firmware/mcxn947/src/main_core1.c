@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include "display.h"
+#include "display_panel.h"
 #include "shared_window.h"
 #include "status_led.h"
 
@@ -31,6 +32,8 @@ int main(void)
         g_shared_window.cpu1_heartbeat++;
         snapshot_divider++;
         display_poll();
+        g_shared_window.cpu1_blits = display_panel_blit_count();
+        g_shared_window.cpu1_blit_rejects = display_panel_reject_count();
 
         if (snapshot_divider >= CORE1_SNAPSHOT_HEARTBEATS) {
             snapshot_divider = 0u;

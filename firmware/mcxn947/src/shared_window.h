@@ -31,6 +31,8 @@ typedef struct {
     // halves of that gate are one measurement.
     uint32_t cpu1_frames;
     uint32_t cpu1_display_flags;
+    uint32_t cpu1_blits;
+    uint32_t cpu1_blit_rejects;
 
     // The CPU0 -> CPU1 payload proper. Kept last so every CPU1 -> CPU0
     // observation word above it keeps its offset when the snapshot grows.
@@ -45,7 +47,7 @@ typedef struct {
 // Bit 1 -- a blit was rejected or the transport reported an error since boot.
 #define SHARED_DISPLAY_FLAG_FAULT 0x00000002u
 
-_Static_assert(sizeof(shared_window_t) == 56u, "step-7 shared window must be 56 bytes");
+_Static_assert(sizeof(shared_window_t) == 64u, "step-7 shared window must be 64 bytes");
 
 extern volatile shared_window_t g_shared_window;
 

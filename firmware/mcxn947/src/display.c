@@ -208,6 +208,39 @@ static void display_kick_prepared(void)
     (void)display_prepare_next();
 }
 
+// Bring-up aid, deliberately kept. Paints the whole panel one colour through
+// exactly the same SelectArea + WritePixels path a real run uses.
+//
+// It exists because "blits succeed and the screen is black" is not a
+// diagnosis: it is consistent with a dead bus AND with a renderer that emits
+// nothing visible, and those have completely different fixes. A solid fill
+// separates them in one look at the board -- colour means the transport works
+// and the bug is above it. Every other check (pins, mux alternates, shifter
+// and timer indices, baud divider, callback wiring) was read against NXP's own
+// LVGL support file for this exact panel and matched, which is precisely why
+// reading more code was not going to settle it.
+static bool display_fill_screen(uint16_t rgb565)
+{
+    for (uint32_t i = 0u; i < DISPLAY_ROW_BUFFER_PIXELS; ++i) {
+        s_display.row_buffers[0][i] = rgb565;
+    }
+
+    const uint16_t band = (uint16_t)(DISPLAY_ROW_BUFFER_PIXELS / DISPLAY_PANEL_WIDTH);
+    for (uint16_t y = 0u; y < DISPLAY_PANEL_HEIGHT; y = (uint16_t)(y + band)) {
+        uint16_t height = band;
+        if ((uint32_t)y + height > DISPLAY_PANEL_HEIGHT) {
+            height = (uint16_t)(DISPLAY_PANEL_HEIGHT - y);
+        }
+        if (!display_panel_blit(0u, y, DISPLAY_PANEL_WIDTH, height,
+                                s_display.row_buffers[0])) {
+            return false;
+        }
+        while (display_panel_blit_busy()) {
+        }
+    }
+    return true;
+}
+
 bool display_init(void)
 {
     text_grid_init(&s_display.grid, ' ', DISPLAY_ATTR_NORMAL);
@@ -216,6 +249,20 @@ bool display_init(void)
     s_display.first_frame = true;
     s_display.write_buffer = 0u;
     s_display.available = display_panel_init();
+
+    // Paint the panel solid before any text. Two jobs: it proves the transport
+    // reaches the glass (see display_fill_screen), and it clears the ST7796S's
+    // power-on GRAM, which is undefined -- NXP's own bring-up clears video RAM
+    // between ST7796S_Init and EnableDisplay for the same reason.
+    if (s_display.available) {
+        (void)display_fill_screen(DISPLAY_FILL_ON_INIT);
+        // Hold it. The first rendered frame marks every cell dirty and repaints
+        // the whole grid on a black background, so without this the fill is
+        // gone in well under a second and whoever is watching the board cannot
+        // say whether they saw it. CPU1 stalling here is free: it is
+        // non-load-bearing by construction and the link cannot observe it.
+        display_panel_delay_us(DISPLAY_FILL_HOLD_US);
+    }
     return s_display.available;
 }
 

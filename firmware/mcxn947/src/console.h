@@ -80,6 +80,8 @@ typedef struct {
     bool cpu1_held_in_reset;
     uint32_t cpu1_frames;
     uint32_t cpu1_display_flags;
+    uint32_t cpu1_blits;
+    uint32_t cpu1_blit_rejects;
 } console_stats_t;
 
 typedef struct {

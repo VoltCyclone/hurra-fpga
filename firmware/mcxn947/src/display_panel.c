@@ -2,6 +2,7 @@
 // FlexIO0, eDMA1, DBI and ST7796S state.
 
 #include "display_panel.h"
+#include "platform.h"
 
 bool display_panel_rect(uint16_t x, uint16_t y, uint16_t width,
                         uint16_t height, uint16_t *end_x, uint16_t *end_y,
@@ -77,6 +78,10 @@ static flexio_mculcd_edma_handle_t s_flexio_handle;
 static dbi_iface_t s_dbi_iface;
 static st7796s_handle_t s_panel;
 static volatile bool s_blit_busy;
+// Blits that actually reached ST7796S_WritePixels, and calls refused before
+// any pixel was sent. See display_panel_blit_count().
+static uint32_t s_blit_count;
+static uint32_t s_blit_reject;
 static volatile bool s_panel_failed;
 static bool s_panel_ready;
 
@@ -141,22 +146,65 @@ static void display_pins_init(void)
     CLOCK_EnableClock(kCLOCK_Gpio0);
     CLOCK_EnableClock(kCLOCK_Gpio4);
 
+    // PORT_SetPinConfig, NOT PORT_SetPinMux, and that distinction is the whole
+    // reason this panel was black.
+    //
+    // PORT_SetPinMux writes ONLY the PCR's MUX field:
+    //     base->PCR[pin] = (base->PCR[pin] & ~MUX_MASK) | MUX(mux);
+    // Everything else keeps its reset value, and on this part that leaves
+    // PCR[IBE] -- the input buffer enable at bit 12 -- clear. NXP's own
+    // pin_mux.c for this panel sets kPORT_InputBufferEnable on every one of
+    // these pins, data lines and GPIO alike.
+    //
+    // With IBE clear the FlexIO shifters still drain and every eDMA transfer
+    // still completes, so the firmware sees a perfectly healthy transport:
+    // FLEXIO_MCULCD_Init succeeds, ST7796S_Init succeeds, blits run at ~537/s
+    // with zero rejections, and the screen stays black. There is no handshake
+    // on an 8080 bus to report that nothing was received. A solid-red fill
+    // through the identical SelectArea + WritePixels path was what finally
+    // separated "the bus is dead" from "the renderer draws nothing".
+    //
+    // Values below are NXP's, field for field: no pull (pull-up on WR only),
+    // fast slew, no passive filter, push-pull, low drive, input buffer
+    // enabled, non-inverted, unlocked.
+    static const port_pin_config_t flexio_pin = {
+        kPORT_PullDisable,      kPORT_LowPullResistor,
+        kPORT_FastSlewRate,     kPORT_PassiveFilterDisable,
+        kPORT_OpenDrainDisable, kPORT_LowDriveStrength,
+        kPORT_MuxAlt6,          kPORT_InputBufferEnable,
+        kPORT_InputNormal,      kPORT_UnlockRegister,
+    };
+    // WR carries a pull-up in NXP's configuration; the strobe idles high.
+    static const port_pin_config_t flexio_wr_pin = {
+        kPORT_PullUp,           kPORT_LowPullResistor,
+        kPORT_FastSlewRate,     kPORT_PassiveFilterDisable,
+        kPORT_OpenDrainDisable, kPORT_LowDriveStrength,
+        kPORT_MuxAlt6,          kPORT_InputBufferEnable,
+        kPORT_InputNormal,      kPORT_UnlockRegister,
+    };
+    static const port_pin_config_t gpio_pin = {
+        kPORT_PullDisable,      kPORT_LowPullResistor,
+        kPORT_FastSlewRate,     kPORT_PassiveFilterDisable,
+        kPORT_OpenDrainDisable, kPORT_LowDriveStrength,
+        kPORT_MuxAlt0,          kPORT_InputBufferEnable,
+        kPORT_InputNormal,      kPORT_UnlockRegister,
+    };
+
     // CS, D/C, WR and RD share Port 0 with CPU0's green LED on P0_27. These
-    // PinInit/PCR operations are RMW and are safe only here: section 4(a)
-    // releases CPU1 after CPU0 has completed every pin/clock setup. Never
-    // remux or reinitialize a Port 0 display pin after this boot-only block.
-    PORT_SetPinMux(PORT0, 7u, kPORT_MuxAlt0);
-    PORT_SetPinMux(PORT0, 8u, kPORT_MuxAlt6);
-    PORT_SetPinMux(PORT0, 9u, kPORT_MuxAlt6);
-    PORT_SetPinMux(PORT0, 12u, kPORT_MuxAlt0);
-    PORT_SetPinMux(PORT2, 8u, kPORT_MuxAlt6);
-    PORT_SetPinMux(PORT2, 9u, kPORT_MuxAlt6);
-    PORT_SetPinMux(PORT2, 10u, kPORT_MuxAlt6);
-    PORT_SetPinMux(PORT2, 11u, kPORT_MuxAlt6);
-    for (uint32_t pin = 12u; pin <= 23u; ++pin) {
-        PORT_SetPinMux(PORT4, pin, kPORT_MuxAlt6);
+    // PCR writes are read-modify-write and are safe only here: section 4(a)
+    // releases CPU1 after CPU0 has completed every pin and clock setup. Never
+    // remux a Port 0 display pin after this boot-only block.
+    PORT_SetPinConfig(PORT0, 7u, &gpio_pin);        // D/C
+    PORT_SetPinConfig(PORT0, 8u, &flexio_pin);      // RD  = FLEXIO0_D0
+    PORT_SetPinConfig(PORT0, 9u, &flexio_wr_pin);   // WR  = FLEXIO0_D1
+    PORT_SetPinConfig(PORT0, 12u, &gpio_pin);       // CS
+    for (uint32_t pin = 8u; pin <= 11u; ++pin) {
+        PORT_SetPinConfig(PORT2, pin, &flexio_pin); // D16..D19
     }
-    PORT_SetPinMux(PORT4, 7u, kPORT_MuxAlt0);
+    for (uint32_t pin = 12u; pin <= 23u; ++pin) {
+        PORT_SetPinConfig(PORT4, pin, &flexio_pin); // D20..D31
+    }
+    PORT_SetPinConfig(PORT4, 7u, &gpio_pin);        // RST
 
     const gpio_pin_config_t output_high = {
         .pinDirection = kGPIO_DigitalOutput,
@@ -204,17 +252,38 @@ bool display_panel_init(void)
     s_panel_ready = false;
     s_panel_failed = false;
     s_blit_busy = false;
+    s_blit_count = 0u;
+    s_blit_reject = 0u;
 
     display_pins_init();
-    GPIO_PortClear(DISPLAY_RST_GPIO, 1u << DISPLAY_RST_PIN);
-    SDK_DelayAtLeastUs(1u, DISPLAY_FLEXIO_CLOCK_HZ);
-    GPIO_PortSet(DISPLAY_RST_GPIO, 1u << DISPLAY_RST_PIN);
-    SDK_DelayAtLeastUs(5000u, DISPLAY_FLEXIO_CLOCK_HZ);
 
+    // TRANSPORT FIRST, THEN RESET THE PANEL. This order is not arbitrary and
+    // it is not what an earlier version did.
+    //
+    // FLEXIO_MCULCD_Init() is what puts WR, RD and the sixteen data lines into
+    // a defined state. Releasing the ST7796S from reset before that happens
+    // lets it sample a floating bus as it comes up, and the result is a panel
+    // that stays black while every subsequent call still returns success --
+    // there is no handshake on this bus for a wedged controller to fail.
+    // NXP's own lvgl_support.c for this panel on this board does the same
+    // thing in the same order: FLEXIO_MCULCD_Init and the DBI handle, and only
+    // then the reset pulse.
     if (!display_transport_init()) {
         s_panel_failed = true;
         return false;
     }
+
+    // 1 ms low, then 5 ms to settle -- again NXP's figures for this panel. An
+    // earlier version held RST low for 1 us, three orders of magnitude short.
+    //
+    // The second argument is the clock the busy-wait is calibrated against, so
+    // it must be the CORE clock, not the FlexIO clock. They are both 150 MHz
+    // here, which is exactly why passing the wrong one would stay invisible
+    // until someone re-divided FlexIO.
+    GPIO_PortClear(DISPLAY_RST_GPIO, 1u << DISPLAY_RST_PIN);
+    SDK_DelayAtLeastUs(1000u, PLATFORM_CORE_HZ);
+    GPIO_PortSet(DISPLAY_RST_GPIO, 1u << DISPLAY_RST_PIN);
+    SDK_DelayAtLeastUs(5000u, PLATFORM_CORE_HZ);
 
     const st7796s_config_t panel_config = {
         .driverPreset = kST7796S_DriverPresetLCDPARS035,
@@ -245,6 +314,7 @@ bool display_panel_blit(uint16_t x, uint16_t y, uint16_t width,
     if (!s_panel_ready || s_panel_failed || s_blit_busy || rgb565 == NULL ||
         !display_panel_rect(x, y, width, height, &end_x, &end_y,
                             &pixel_count)) {
+        s_blit_reject++;
         return false;
     }
 
@@ -260,7 +330,27 @@ bool display_panel_blit(uint16_t x, uint16_t y, uint16_t width,
         s_panel_failed = true;
         return false;
     }
+    s_blit_count++;
     return true;
+}
+
+// Pixels actually handed to the panel, and calls refused before any were.
+// `frames` alone cannot answer "is anything reaching the glass": a frame with
+// no dirty runs completes successfully having sent nothing, so a black screen
+// with frames advancing is ambiguous until these two exist.
+void display_panel_delay_us(uint32_t microseconds)
+{
+    SDK_DelayAtLeastUs(microseconds, PLATFORM_CORE_HZ);
+}
+
+uint32_t display_panel_blit_count(void)
+{
+    return s_blit_count;
+}
+
+uint32_t display_panel_reject_count(void)
+{
+    return s_blit_reject;
 }
 
 bool display_panel_blit_busy(void)

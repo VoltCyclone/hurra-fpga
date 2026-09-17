@@ -161,6 +161,8 @@ static void cmd_stats(void)
     console_field("boot", s.cpu1_boot_count);
     console_field("heartbeat", s.cpu1_heartbeat);
     console_field("frames", s.cpu1_frames);
+    console_field("blits", s.cpu1_blits);
+    console_field("blitrej", s.cpu1_blit_rejects);
     console_put(" panel=");
     if ((s.cpu1_display_flags & 1u) == 0u) {
         console_put("ABSENT");
