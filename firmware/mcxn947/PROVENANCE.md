@@ -3,14 +3,17 @@
 Target: **FRDM-MCXN947** (MCXN947VDF, dual Cortex-M33), replacing the CH32H417 on
 the PMOD-A injection link. Design: `docs/MCXN947_CONTROLLER.md`.
 
-**This tree implements migration step 6 of that document's section 9** — two
+**This tree implements migration step 7 of that document's section 9** — two
 images: clock, blink, LPSPI6 as an SPI slave on LP_FLEXCOMM6 driven by a
 self-loading eDMA0 scatter-gather ring that transmits a permanently IDLE slot,
 retirement of every received slot through `src/link_retire.c`, ERR051588
 detection and recovery through `src/link_recovery.c`, and a TinyUSB CDC console
 on the ChipIdea High Speed controller behind J11. CPU1 is released last, reads
 CPU0's seqlock snapshot at about 20 Hz, echoes the slot count it actually saw,
-and drives only the blue LED from slot-counter bit 11; there is no display.
+drives the blue LED from slot-counter bit 11, and renders the snapshot to the
+LCD-PAR-S035 through FlexIO0 and eDMA1. The display uses two 480x16 RGB565 row
+buffers and a 60x20 character/attribute shadow, not a full framebuffer; a panel
+failure does not gate CPU1's heartbeat, echo, or LED.
 What is *absent* is recorded here too, because "we did not vendor it yet" and
 "we decided not to vendor it" are different claims.
 
@@ -66,6 +69,11 @@ Imported unchanged:
 | `vendor/mcux-sdk/devices/MCXN947/drivers/fsl_reset.c` | `devices/MCXN947/drivers/` |
 | `vendor/mcux-sdk/devices/MCXN947/drivers/fsl_lpflexcomm.{c,h}` | `devices/MCXN947/drivers/` |
 | `vendor/mcux-sdk/devices/MCXN947/drivers/fsl_edma.{c,h}`, `fsl_edma_core.h`, `fsl_edma_soc.h` | `devices/MCXN947/drivers/` (`fsl_edma_soc.c` **removed at step 3** — see deviation 8) |
+| `vendor/mcux-sdk/devices/MCXN947/drivers/fsl_flexio{,_mculcd,_mculcd_edma}.{c,h}` | `devices/MCXN947/drivers/` |
+| `vendor/mcux-sdk/components/video/fsl_video_common.{c,h}` | `components/video/` |
+| `vendor/mcux-sdk/components/video/display/dbi/fsl_dbi.{c,h}` | `components/video/display/dbi/` |
+| `vendor/mcux-sdk/components/video/display/dbi/flexio/fsl_dbi_flexio_edma.{c,h}` | `components/video/display/dbi/flexio/` |
+| `vendor/mcux-sdk/components/display/st7796s/fsl_st7796s.{c,h}` | `components/display/st7796s/` |
 | `vendor/mcux-sdk/devices/MCXN947/drivers/fsl_lpspi.h` | `devices/MCXN947/drivers/` (**header only** — see deviation 4) |
 | `vendor/mcux-sdk/boards/frdmmcxn947/project_template/{clock_config.c,clock_config.h,board.h}` | same |
 
@@ -78,11 +86,12 @@ price of the guarantee.
 
 - **`fsl_common.c`, `fsl_common_arm.c`.** Their *headers* are required
   (`fsl_common.h` includes `fsl_common_arm.h`, which includes `fsl_reset.h`),
-  but nothing here calls `SDK_Malloc`, `SDK_DelayAtLeastUs` or
-  `InstallIRQHandler`, and the image links without them. Both were copied in
+  but the sources remain excluded. Step 7's ST7796S driver is the first caller
+  of `SDK_DelayAtLeastUs`; `src/display_panel.c` supplies that one primitive
+  locally rather than importing the rest of `fsl_common_arm.c` (deviation 17).
+  Nothing calls `SDK_Malloc` or `InstallIRQHandler`. Both sources were copied in
   while step 2 was being built and then deleted again once the link proved it
   did not reference either — an unused vendored file is a file nobody has read.
-  Add them back when a step first needs one.
 
   `fsl_reset.c` **is** now imported: `LP_FLEXCOMM_Init()` calls
   `RESET_ClearPeripheralReset()` to bring FlexComm6 out of reset.
@@ -93,10 +102,10 @@ price of the guarantee.
   Arduino headers as well as the LEDs. `board.h` **is** imported, because it is
   the authoritative record of the FRDM LED pinout.
 - **Every driver the design lists for a *later* step** — `fsl_ctimer`,
-  `fsl_wwdt`, `fsl_inputmux*`, `fsl_flexio*`, `fsl_cache`, `fsl_mailbox`,
+  `fsl_wwdt`, `fsl_inputmux*`, `fsl_cache`, `fsl_mailbox`,
   `fsl_sema42`. An unused vendored driver is a file nobody has read; each
   arrives with the step that calls it. `fsl_edma*` and `fsl_lpflexcomm` left
-  this list at step 2, which is the step that calls them.
+  this list at step 2, and `fsl_flexio*` left it at step 7.
 - **`fsl_lpspi.c` and `fsl_lpspi_edma.c`** — excluded deliberately, not
   deferred; only `fsl_lpspi.h` is imported. See deviation 4.
 - **`fsl_edma_soc.c`** — imported at step 2, **removed at step 3**. Only
@@ -120,8 +129,7 @@ price of the guarantee.
   a shortcut: two independent upstreams state the same sequence register for
   register.
 - **`boot_multicore_slave.c`** — rejected at step 5 rather than imported; see
-  deviation 13. The ST7796S / DBI / FlexIO display stack remains deferred to
-  step 7.
+  deviation 13.
 - **`fsl_dbi_flexio_smartdma`** — rejected outright, not deferred. SmartDMA is a
   third bus master and admitting it would put an engine nobody has reasoned
   about against the link's arbitration budget (design doc section 7).
@@ -493,6 +501,122 @@ Each is a change *we* made, or a vendor behaviour we deliberately did not adopt.
     word of the 16-byte step-5 prefix is now `cpu1_seen_slot_counter`, followed
     by the 32-byte snapshot. Both C static assertions and rung 4 enforce those
     sizes independently.
+
+17. **The display image supplies two narrow SDK integration pieces locally.**
+    First, `fsl_st7796s.c` calls `SDK_DelayAtLeastUs`, although that source is
+    not in step 7's approved vendor set. `src/display_panel.c` supplies a
+    conservative cycle loop for that exact ABI; it can only run longer than the
+    requested panel reset/sleep minimum and has no peripheral side effect.
+    Second, the transactional eDMA dispatcher is externally linkable in
+    `fsl_edma.c` but declared only inside the excluded `fsl_edma_soc.c`.
+    `display_panel.c` declares it and supplies the one strong wrapper this image
+    owns, `EDMA_1_CH0_DriverIRQHandler`. The Makefile retention root proves the
+    vector reaches that wrapper without importing the other 31 strong handlers.
+
+18. **`src/glyphs.c` is checked-in derived data, not a build dependency on
+    LVGL.** Its printable ASCII table was generated once from
+    `middleware/lvgl/src/font/lv_font_unscii_16.c` in the pinned SDK. That file
+    is LVGL's MIT-licensed rendering of the public-domain Unscii face at 16 px;
+    each pixel-doubled 16-bit row was reduced to one bit per original column to
+    produce the required 8x16 cells. No LVGL header, source, runtime, or
+    generator enters this build, and the resulting table is plain readable C.
+
+---
+
+## Findings while building step 7
+
+- **The staged DBI sources default to the legacy API, but step 7 specifies the
+  new interface API.** `fsl_dbi.h` defines `MCUX_DBI_LEGACY` as 1 unless the
+  build overrides it; in that mode the requested `dbi_iface_t` and
+  `DBI_FLEXIO_EDMA_CreateHandle()` shape do not exist. Core1 therefore compiles
+  the whole display stack with `MCUX_DBI_LEGACY=0`. This is an SDK-configuration
+  discrepancy, not a wrapper around the legacy interface.
+
+- **The design's `baudRateDiv = 6` is not a field in this SDK API.**
+  `FLEXIO_MCULCD_Init()` accepts aggregate bits per second across all 16 data
+  lines, divides that by the bus width, then computes and stores divider minus
+  one in `TIMCMP`. `DISPLAY_FLEXIO_BAUD_DIV` remains the single public tuning
+  constant, while the transport converts it to 200 Mbit/s aggregate at a
+  150 MHz FlexIO clock. The vendor calculation therefore programs divider 6
+  and produces a 12.5 MHz WR cycle. The value is still inherited from an
+  ILI9341 66 ns tWC calculation and is **not confirmed for this S035/ST7796S**.
+
+- **A write-only initialization cannot positively identify a missing panel.**
+  The selected ST7796S API sends commands and reports transport setup/queueing
+  errors, but it does not read a controller ID. The staged DBI layer can be
+  built with read support, but neither the design nor an on-disk S035 datasheet
+  supplies a safe expected ID/read sequence. Initialization and every repaint
+  are finite, so an absent panel cannot hang CPU1; software-detected transport
+  failure permanently disables repaint while heartbeat, echo, and blue LED
+  continue. Physical presence and controller response remain board tests, not
+  claims made by this image.
+
+- **The Port 0 distinction from the last step-6 finding is now encoded at the
+  only safe point.** CPU1 muxes and initializes P0_7/P0_8/P0_9/P0_12 only in
+  its boot-time panel initialization, after CPU0's rung-8 release. It never
+  replays those PCR/PDDR RMWs. Runtime D/C and CS transitions use PSOR/PCOR, so
+  they cannot clobber CPU0's disjoint P0_27 heartbeat bit and need no cross-core
+  lock.
+
+- **The fixed buffers fit without moving the memory boundary.** The two
+  480x16 RGB565 buffers consume 30,720 bytes and the 60x20 cell grid plus dirty
+  masks consumes 2,560 bytes. The linked core1 image has 37,088 bytes of BSS;
+  the existing image checker reports 67,280 bytes between all core1 content and
+  the fixed stack floor. The 104 KiB allocation and linker script are unchanged.
+
+Step 7 has been built and host-tested only. Its section-9 acceptance remains a
+hardware measurement: establish 20 Hz repaint, verify FPGA link counters stay
+flat during a full repaint, and issue `cpu1halt` during an active render while
+confirming both CPU1 stops and the link remains flat. Panel orientation, colour
+order, physical presence on J8, and the actual WR timing also remain to be
+observed on the board.
+
+---
+
+## Findings while building step 7
+
+- **The repaint rate is a counter, not an impression.** §9 step 7's gate is
+  "20 Hz repaint with link counters still flat", which is a *rate*, and a rate
+  cannot be established by looking at a panel. CPU1 publishes `cpu1_frames` and
+  a `panel=` state into the shared window and `stats` prints both, so the two
+  halves of the gate are one measurement. Measured 2026-09-16: 18.3 frames/s
+  over a 45 s window with every gated FPGA counter at +0 and `link_losses` 0;
+  20.5 frames/s after a `cpu1start`. This is the same move step 6 made for the
+  LPCAC question, for the same reason.
+
+- **5(c) holds mid-blit.** `cpu1halt` while the display is rendering stops CPU1
+  with an eDMA1 transfer potentially in flight to the panel. Over the following
+  40 s the link was untouched: `spi_slots` 8026.10/s, every `spi_bad_*` and
+  `spi_queue_full` at +0, `link_losses` 0, no console counter growth.
+  `snapshot_seq` kept advancing at 15,376/s with no reader at all — §5's
+  requirement that the writer never wait on CPU1, shown rather than argued.
+
+- **`panel=` distinguishes ABSENT from ok.** CPU1 deliberately keeps its
+  heartbeat, echo and LED running when `display_init()` fails, which is correct
+  — those are how CPU0 observes CPU1 at all — but it also means a blank screen
+  with a live heartbeat is otherwise indistinguishable from a panel that was
+  never detected. The flag word costs nothing and removes that ambiguity.
+
+- **§2's Port 0 claim is narrower than §4(b)'s.** §2 says "No J8 pin is on
+  Port 3, so there is zero physical overlap with the link", which is true. But
+  CS (P0_12), D/C (P0_7), WR (P0_9) and RD (P0_8) are all on Port 0, the port
+  CPU0's heartbeat LED code is still writing at 1 Hz. The *pins* are disjoint;
+  the *port registers* are not. PSOR/PCOR are write-1-to-act and safe for
+  disjoint bits; PDDR and the PCRs are read-modify-write, so CPU1 may only
+  touch them during its own init, which is safe solely because §4(a) releases
+  CPU1 at rung 8 after CPU0 has finished its own pin and clock setup. Recorded
+  rather than "fixed": a lock between the cores is what §5 rejects outright.
+
+- **`baudRateDiv = 6` is shown sufficient, not shown correct.** §10 derives it
+  from an ILI9341 `tWC` of 66 ns and the LCD-PAR-S035 datasheet is still not on
+  disk. The real panel initialises and sustains ~20 Hz at that divider, so the
+  value works; that is not the same as knowing the ST7796S margin, and a
+  marginal write cycle presents exactly as a working panel.
+  `DISPLAY_FLEXIO_BAUD_DIV` is one constant carrying that provenance.
+
+- **What step 7 does NOT establish: the pixels.** Every number above concerns
+  the transport running at rate and costing the link nothing. Whether the
+  composed page is legible and correct needs a human looking at the panel.
 
 ---
 

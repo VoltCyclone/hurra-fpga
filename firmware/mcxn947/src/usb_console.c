@@ -143,12 +143,16 @@ static void usb_console_stats(void *ctx, console_stats_t *out)
     if (g_shared_window.magic == SHARED_WINDOW_MAGIC) {
         const uint32_t heartbeat = g_shared_window.cpu1_heartbeat;
         out->cpu1_boot_count = g_shared_window.cpu1_boot_count;
+        out->cpu1_frames = g_shared_window.cpu1_frames;
+        out->cpu1_display_flags = g_shared_window.cpu1_display_flags;
         out->cpu1_heartbeat = heartbeat;
         out->cpu1_seen_slot_counter = g_shared_window.cpu1_seen_slot_counter;
         out->cpu1_alive = heartbeat != previous_cpu1_heartbeat;
         previous_cpu1_heartbeat = heartbeat;
     } else {
         out->cpu1_boot_count = 0u;
+        out->cpu1_frames = 0u;
+        out->cpu1_display_flags = 0u;
         out->cpu1_heartbeat = 0u;
         out->cpu1_seen_slot_counter = 0u;
         out->cpu1_alive = false;

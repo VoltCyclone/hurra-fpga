@@ -160,6 +160,16 @@ static void cmd_stats(void)
     console_put(s.cpu1_alive ? "alive " : "DOWN ");
     console_field("boot", s.cpu1_boot_count);
     console_field("heartbeat", s.cpu1_heartbeat);
+    console_field("frames", s.cpu1_frames);
+    console_put(" panel=");
+    if ((s.cpu1_display_flags & 1u) == 0u) {
+        console_put("ABSENT");
+    } else if ((s.cpu1_display_flags & 2u) != 0u) {
+        console_put("ok/FAULT");
+    } else {
+        console_put("ok");
+    }
+    console_put(" ");
     console_field("seen_slots", s.cpu1_seen_slot_counter);
     console_put("\r\n");
 }

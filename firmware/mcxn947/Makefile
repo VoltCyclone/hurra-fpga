@@ -1,4 +1,4 @@
-# FRDM-MCXN947 controller firmware -- migration step 6: snapshot IPC.
+# FRDM-MCXN947 controller firmware -- migration step 7: CPU1 display.
 #
 # CPU0 brings the part to overdrive + 150 MHz, arms a 1 kHz
 # SysTick, blinks the green LED, brings up LPSPI6 as an SPI slave on
@@ -8,7 +8,8 @@
 # ladder in src/link_recovery.c, and presents a TinyUSB CDC console on the
 # ChipIdea High Speed controller behind J11. CPU1 is a separate image released
 # last; it reads the one-way snapshot, echoes the slot count it actually saw,
-# and drives the blue LED from slot-counter bit 11. There is no display yet.
+# drives the blue LED from slot-counter bit 11, and repaints the S035 panel at
+# about 20 Hz through FlexIO0 + eDMA1.
 #
 # `make all` is not the gate. --gc-sections will silently discard a translation
 # unit that nothing references, and the vector table declares every handler
@@ -76,11 +77,16 @@ INCLUDES := -Isrc -isystem include \
 	-isystem $(VENDOR_SDK)/devices/MCXN947/periph \
 	-isystem $(VENDOR_SDK)/devices/MCXN947/drivers \
 	-isystem $(VENDOR_SDK)/boards/frdmmcxn947/project_template \
+	-isystem $(VENDOR_SDK)/components/video \
+	-isystem $(VENDOR_SDK)/components/video/display/dbi \
+	-isystem $(VENDOR_SDK)/components/video/display/dbi/flexio \
+	-isystem $(VENDOR_SDK)/components/display/st7796s \
 	-isystem $(VENDOR_TUSB)/src
 
 COMMON_CFLAGS := $(CORE0_ARCH) $(CORE0_DEFINES) $(INCLUDES) $(EXTRA_CFLAGS) -Os \
 	-ffunction-sections -fdata-sections -fno-common
-CORE1_CFLAGS := $(CORE1_ARCH) $(CORE1_DEFINES) $(INCLUDES) $(EXTRA_CFLAGS) -Os \
+CORE1_CFLAGS := $(CORE1_ARCH) $(CORE1_DEFINES) -DMCUX_DBI_LEGACY=0 \
+	$(INCLUDES) $(EXTRA_CFLAGS) -Os \
 	-ffunction-sections -fdata-sections -fno-common
 APP_WARNINGS      := -std=c11 -Wall -Wextra -Werror -Wconversion -Wshadow
 # Vendor sources are byte-exact imports and are not held to the app's warning
@@ -115,7 +121,7 @@ CORE0_RAM_START   := 0x20000000
 CORE0_RAM_END     := 0x2004C000
 RAM_SHARED_START  := 0x2004C000
 RAM_SHARED_END    := 0x2004E000
-SHARED_WINDOW_SIZE := 0x30
+SHARED_WINDOW_SIZE := 0x38
 CORE1_RAM_START   := 0x2004E000
 CORE1_RAM_END     := 0x20068000
 STACK_SIZE        := 0x0800
@@ -219,9 +225,12 @@ CORE0_RETAIN_LDFLAGS := \
 # SystemInit is rooted as well as main: the ownership check makes the decision
 # not to link NXP's chip-wide core1 SystemInit a property of the ELF, not a
 # review promise. See PROVENANCE.md deviation 12.
+# EDMA_1_CH0 follows the same two-level startup rule as CPU0's DMA vector: the
+# vector-table name is only a weak trampoline, so the Driver name is the root.
 CORE1_RETAIN := \
 	main=build/core1/main_core1.o \
-	SystemInit=build/core1/system_core1.o
+	SystemInit=build/core1/system_core1.o \
+	EDMA_1_CH0_DriverIRQHandler=build/core1/display_panel.o
 
 CORE1_RETAIN_LDFLAGS := \
 	$(foreach r,$(CORE1_RETAIN),-Wl,--undefined=$(call retain_symbol,$(r)))
@@ -286,16 +295,30 @@ CORE0_OBJECTS := \
 CORE1_OBJECTS := \
 	build/core1/startup.o \
 	build/core1/system_core1.o \
+	build/core1/fsl_clock.o \
+	build/core1/fsl_reset.o \
 	build/core1/fsl_gpio.o \
+	build/core1/fsl_edma.o \
+	build/core1/fsl_flexio.o \
+	build/core1/fsl_flexio_mculcd.o \
+	build/core1/fsl_flexio_mculcd_edma.o \
+	build/core1/fsl_dbi.o \
+	build/core1/fsl_dbi_flexio_edma.o \
+	build/core1/fsl_st7796s.o \
 	build/core1/link_snapshot.o \
 	build/core1/shared_window.o \
 	build/core1/status_led.o \
+	build/core1/text_grid.o \
+	build/core1/glyphs.o \
+	build/core1/display_panel.o \
+	build/core1/display.o \
 	build/core1/main_core1.o
 
 .PHONY: all check check-copies clean flash flash-core0-only flash-merged \
 	verify-core1-blank probes test test-platform \
 	test-heartbeat test-link test-link-retire test-link-recovery test-spi-frame \
 	test-console test-core1-release test-shared-window test-link-snapshot test-status-led \
+	test-text-grid test-glyphs test-display-panel test-display \
 	test-merge-images
 
 all: build/hurra-mcxn947.bin
@@ -459,6 +482,33 @@ build/core1/system_core1.o: src/system_core1.c | build/core1
 build/core1/fsl_gpio.o: $(VENDOR_SDK)/devices/MCXN947/drivers/fsl_gpio.c | build/core1
 	$(CC) $(CORE1_CFLAGS) $(VENDOR_WARNINGS) -c $< -o $@
 
+build/core1/fsl_clock.o: $(VENDOR_SDK)/devices/MCXN947/drivers/fsl_clock.c | build/core1
+	$(CC) $(CORE1_CFLAGS) $(VENDOR_WARNINGS) -c $< -o $@
+
+build/core1/fsl_reset.o: $(VENDOR_SDK)/devices/MCXN947/drivers/fsl_reset.c | build/core1
+	$(CC) $(CORE1_CFLAGS) $(VENDOR_WARNINGS) -c $< -o $@
+
+build/core1/fsl_edma.o: $(VENDOR_SDK)/devices/MCXN947/drivers/fsl_edma.c | build/core1
+	$(CC) $(CORE1_CFLAGS) $(VENDOR_WARNINGS) -c $< -o $@
+
+build/core1/fsl_flexio.o: $(VENDOR_SDK)/devices/MCXN947/drivers/fsl_flexio.c | build/core1
+	$(CC) $(CORE1_CFLAGS) $(VENDOR_WARNINGS) -c $< -o $@
+
+build/core1/fsl_flexio_mculcd.o: $(VENDOR_SDK)/devices/MCXN947/drivers/fsl_flexio_mculcd.c | build/core1
+	$(CC) $(CORE1_CFLAGS) $(VENDOR_WARNINGS) -c $< -o $@
+
+build/core1/fsl_flexio_mculcd_edma.o: $(VENDOR_SDK)/devices/MCXN947/drivers/fsl_flexio_mculcd_edma.c | build/core1
+	$(CC) $(CORE1_CFLAGS) $(VENDOR_WARNINGS) -c $< -o $@
+
+build/core1/fsl_dbi.o: $(VENDOR_SDK)/components/video/display/dbi/fsl_dbi.c | build/core1
+	$(CC) $(CORE1_CFLAGS) $(VENDOR_WARNINGS) -c $< -o $@
+
+build/core1/fsl_dbi_flexio_edma.o: $(VENDOR_SDK)/components/video/display/dbi/flexio/fsl_dbi_flexio_edma.c | build/core1
+	$(CC) $(CORE1_CFLAGS) $(VENDOR_WARNINGS) -c $< -o $@
+
+build/core1/fsl_st7796s.o: $(VENDOR_SDK)/components/display/st7796s/fsl_st7796s.c | build/core1
+	$(CC) $(CORE1_CFLAGS) $(VENDOR_WARNINGS) -c $< -o $@
+
 build/core1/link_snapshot.o: src/link_snapshot.c src/link_snapshot.h | build/core1
 	$(CC) $(CORE1_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
@@ -469,8 +519,22 @@ build/core1/shared_window.o: src/shared_window.c src/shared_window.h \
 build/core1/status_led.o: src/status_led.c src/status_led.h | build/core1
 	$(CC) $(CORE1_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
+build/core1/text_grid.o: src/text_grid.c src/text_grid.h | build/core1
+	$(CC) $(CORE1_CFLAGS) $(APP_WARNINGS) -c $< -o $@
+
+build/core1/glyphs.o: src/glyphs.c src/glyphs.h | build/core1
+	$(CC) $(CORE1_CFLAGS) $(APP_WARNINGS) -c $< -o $@
+
+build/core1/display_panel.o: src/display_panel.c src/display_panel.h | build/core1
+	$(CC) $(CORE1_CFLAGS) $(APP_WARNINGS) -c $< -o $@
+
+build/core1/display.o: src/display.c src/display.h src/display_panel.h \
+		src/glyphs.h src/text_grid.h src/link_snapshot.h \
+		include/injection_wire.h | build/core1
+	$(CC) $(CORE1_CFLAGS) $(APP_WARNINGS) -c $< -o $@
+
 build/core1/main_core1.o: src/main_core1.c src/shared_window.h \
-		src/link_snapshot.h src/status_led.h | build/core1
+		src/link_snapshot.h src/status_led.h src/display.h | build/core1
 	$(CC) $(CORE1_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
 build/core0 build/core1 build/host:
@@ -485,7 +549,8 @@ CHECK_RETAIN_ARGS := \
 	$(foreach r,$(CORE0_RETAIN),--retain core0.elf:$(r)) \
 	$(foreach r,$(CORE1_RETAIN),--retain core1.elf:$(r))
 
-CORE0_FORBIDDEN := (?i)flexio (?i)edma1 EDMA_1_ ST7796S DBI (?i)status_led
+CORE0_FORBIDDEN := (?i)flexio (?i)edma1 EDMA_1_ ST7796S DBI \
+	(?i)display (?i)text_grid (?i)glyphs (?i)status_led
 CORE1_FORBIDDEN := (?i)lpspi6 LP_FLEXCOMM6 (?i)edma0 EDMA_0_ CTIMER2 SPC GDET ITRC
 CHECK_FORBIDDEN_ARGS := \
 	$(foreach p,$(CORE0_FORBIDDEN),--forbid 'core0.elf:$(p)') \
@@ -543,7 +608,8 @@ check: all check-copies
 
 test: test-platform test-heartbeat test-spi-frame test-link test-link-retire \
 	test-link-recovery test-console test-core1-release test-shared-window \
-	test-link-snapshot test-status-led test-merge-images
+	test-link-snapshot test-status-led test-text-grid test-glyphs \
+	test-display-panel test-display test-merge-images
 
 test-merge-images:
 	python3 test/merge_mcxn947_images_test.py
@@ -622,6 +688,35 @@ test-status-led: build/host/status_led_test
 
 build/host/status_led_test: test/status_led_test.c src/status_led.c src/status_led.h | build/host
 	$(HOST_CC) $(APP_WARNINGS) -Isrc test/status_led_test.c src/status_led.c -o $@
+
+test-text-grid: build/host/text_grid_test
+	./build/host/text_grid_test
+
+build/host/text_grid_test: test/text_grid_test.c src/text_grid.c src/text_grid.h | build/host
+	$(HOST_CC) $(APP_WARNINGS) -Isrc test/text_grid_test.c src/text_grid.c -o $@
+
+test-glyphs: build/host/glyphs_test
+	./build/host/glyphs_test
+
+build/host/glyphs_test: test/glyphs_test.c src/glyphs.c src/glyphs.h | build/host
+	$(HOST_CC) $(APP_WARNINGS) -Isrc test/glyphs_test.c src/glyphs.c -o $@
+
+test-display-panel: build/host/display_panel_test
+	./build/host/display_panel_test
+
+build/host/display_panel_test: test/display_panel_test.c src/display_panel.c \
+		src/display_panel.h | build/host
+	$(HOST_CC) $(APP_WARNINGS) -Isrc test/display_panel_test.c \
+		src/display_panel.c -o $@
+
+test-display: build/host/display_test
+	./build/host/display_test
+
+build/host/display_test: test/display_test.c src/display.c src/display.h \
+		src/text_grid.c src/text_grid.h src/glyphs.c src/glyphs.h \
+		src/link_snapshot.h include/injection_wire.h | build/host
+	$(HOST_CC) $(APP_WARNINGS) -Isrc -isystem include test/display_test.c \
+		src/display.c src/text_grid.c src/glyphs.c -o $@
 
 build/host/link_recovery_test: test/link_recovery_test.c src/link_recovery.c \
 		src/link_recovery.h | build/host

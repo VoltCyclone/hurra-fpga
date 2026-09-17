@@ -147,8 +147,19 @@ interface. FlexIO0 8080 16-bit is 8x faster and collides with nothing.
 Data on `FLEXIO0_D16..D31` (P2_8–P2_11, P4_12–P4_23); WR = P0_9 (`FLEXIO0_D1`),
 RD = P0_8 (`FLEXIO0_D0`); CS = P0_12, D/C = P0_7, RST = P4_7 as GPIO.
 **No J8 pin is on Port 3**, so there is zero physical overlap with the link.
+That is true, and it is **not** the same claim as §4(b)'s "disjoint pins": CS
+(P0_12), D/C (P0_7), WR (P0_9) and RD (P0_8) are all on **Port 0**, the port
+whose GPIO registers CPU0 is still writing at 1 Hz for its green heartbeat LED.
+The pins are disjoint; the port registers are not. PSOR/PCOR are write-1-to-act
+and safe for disjoint bits with no coordination, but PDDR and the PCRs are
+read-modify-write, so CPU1 may only do Port 0 setup during its own init — which
+is safe solely because §4(a) releases CPU1 at rung 8, after CPU0 has finished
+all of its own pin and clock setup. A lock between the cores is not the fix;
+§5 rejects exactly that.
 
-**R34 / R28 (USB1_OTG_PWR / OC on P4_16 / P4_17) stay DNP.** That is what keeps
+**R34 / R28 (USB1_OTG_PWR / OC on P4_16 / P4_17) stay DNP.** (Restated at step
+7 in `src/display_panel.h` next to the bus-width constant, as this section
+asks.) That is what keeps
 P4_16/P4_17 free as `FLEXIO0_D24/D25` and the bus 16 bits wide. This is
 reversible with a soldering iron, so it is a standing constraint and belongs in
 the display module's header next to the bus-width configuration — whoever
@@ -737,7 +748,30 @@ counters over JTAG.
    and §3 reserves red for a hard link fault, so bit 11 of `slot_counter` at
    ~1.95 Hz goes on the only one left.
 7. **Display.** *Gate: 20 Hz repaint with link counters still flat under a full
-   repaint, and 5(c) still passing mid-render.*
+   repaint, and 5(c) still passing mid-render.* **DONE 2026-09-16; both halves
+   measured.**
+
+   | | slots/s | gated FPGA counters | CPU1 |
+   |---|---|---|---|
+   | repaint running, 45 s | 8000.82 | all +0, `link_losses` 0 | 18.3 frames/s, echo lag 0.8 ms |
+   | 5(c) mid-render, 40 s | 8026.10 | all +0, `link_losses` 0 | halted mid-blit, frames frozen |
+
+   `cpu1halt` during a blit stops CPU1 with an eDMA1 transfer potentially in
+   flight to the panel, and the link does not notice. `snapshot_seq` kept
+   advancing at 15,376/s throughout with no reader at all, which is §5's
+   requirement that the writer never wait on CPU1 shown rather than argued.
+   `cpu1start` then restored rendering at 20.5 frames/s with `boot=2`.
+
+   **The repaint RATE is the gate, so it is a counter, not an impression.**
+   CPU1 publishes `cpu1_frames` into the shared window and `stats` prints it,
+   for the same reason step 6 added the `slot_counter` echo: a rate cannot be
+   read off a panel by looking at it, and "it looks right" is not a
+   measurement. `panel=` reports ABSENT / ok / ok-with-FAULT so a blank screen
+   with a live heartbeat can be told from a panel that was never detected.
+
+   **Not verified here: the pixels.** Everything above says the transport runs
+   at rate and costs the link nothing. Whether the composed page is legible and
+   correct needs someone looking at the panel.
 8. **Map uploader** — `entries_crc32`, CRC-32/ISO-HDLC (poly 0xEDB88320
    reflected, init/xorout 0xFFFFFFFF) over the concatenated 26-byte MAP_ENTRY
    payloads in transmission order; empty map is 0x00000000. *Gate: `COMMIT_ACCEPTED`
@@ -846,8 +880,12 @@ display bugs.
   stands, so step 2's two-DMA-engine coherency story needs an MPU region or an
   explicit placement decision — not this.
 - **ILI9341 `tWC` = 66 ns** — the figure behind `baudRateDiv = 6`; the panel
-  datasheet is not on disk. (S035/ST7796S may differ; confirm for the actual
-  panel.)
+  datasheet is still not on disk. Narrowed at step 7, not closed: the real
+  LCD-PAR-S035 initialises and sustains ~20 Hz at `baudRateDiv = 6`, so the
+  value is **sufficient** for this panel. That is not the same as knowing the
+  ST7796S margin, and a working panel is exactly how a marginal write cycle
+  presents. `DISPLAY_FLEXIO_BAUD_DIV` in `src/display_panel.h` is one constant
+  with this provenance in its comment; raise it if artefacts ever appear.
 - **SJ20 pin 2-3** — one schematic glance before soldering to J3 pin 3.
 - ~~**TinyUSB `rhport` numbering**~~ — **RESOLVED at step 4: it is 1**, and
   re-reading was worth doing for a reason other than the number. Three

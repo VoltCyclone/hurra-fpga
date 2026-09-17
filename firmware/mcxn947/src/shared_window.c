@@ -16,6 +16,8 @@ void shared_window_reset(void)
     g_shared_window.cpu1_boot_count = 0u;
     g_shared_window.cpu1_heartbeat = 0u;
     g_shared_window.cpu1_seen_slot_counter = 0u;
+    g_shared_window.cpu1_frames = 0u;
+    g_shared_window.cpu1_display_flags = 0u;
     g_shared_window.snapshot = (link_snapshot_t){0};
 
     // Magic is the publication store: readers never observe a valid window
