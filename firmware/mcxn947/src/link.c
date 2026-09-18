@@ -25,6 +25,8 @@ uint8_t link_next_bank(uint8_t bank)
 
 #if defined(MCXN947)
 
+#include <string.h>
+
 #include "fsl_clock.h"
 #include "fsl_device_registers.h"
 #include "fsl_edma.h"
@@ -40,6 +42,13 @@ uint8_t link_next_bank(uint8_t bank)
 // still links against nothing but spi_frame.c, as test/link_test.c does.
 #include "link_recovery.h"
 #include "link_retire.h"
+
+// The injection command builders and the session policy above them: the MCU's
+// TX side of the wire contract. Both are MMIO-free and host-tested in their own
+// right; included inside the guard so a host build of this file still links
+// against nothing but spi_frame.c (test/link_test.c).
+#include "inj_command.h"
+#include "inj_session.h"
 
 // PLATFORM_CORE_HZ, for the FlexComm6 divider static assert below, and
 // platform_ticks() for the report cadence. Portable header; nothing in it is
@@ -178,6 +187,7 @@ static uint8_t s_rx_cursor;
 static volatile uint32_t s_isr_entries;
 static volatile uint32_t s_retire_stalls;
 static volatile uint32_t s_daddr_out_of_range;
+static volatile uint32_t s_saddr_out_of_range;  // TX refill: source addr outside the bank array.
 
 // ERR051588 accounting. A nonzero s_recoveries in normal operation is a bug,
 // not routine -- design doc section 4 says so and this is the counter it means.
@@ -195,6 +205,11 @@ static void link_dma_rings_install(void);
 // so the only way the console can report the link's ready state is for the
 // one function that drives it to remember what it drove.
 static bool s_ready;
+
+// The injection session: MCU-side policy that learns the target report, uploads
+// a boot-mouse field map and then emits RELATIVE motion. Fed from retired RX
+// telemetry and drained into the TX ring by link_drain_rx(); see inj_session.h.
+static inj_session_t s_inj;
 
 void link_mcu_ready_set(bool ready)
 {
@@ -596,6 +611,46 @@ static void link_watch(void)
 
 // --- RX retirement ---------------------------------------------------------
 
+// Feed retired FPGA->MCU telemetry into the injection session. link_retire_slot
+// enqueues every deliverable (SPI_FRAME_OK, non-IDLE) frame; the session only
+// acts on REPORT_FRAGMENT (learn the target report's addressing and descriptor
+// generation) and MAP_STATUS (the map-commit handshake).
+static void link_inject_consume(void)
+{
+    inj_frame_t frame;
+    while (link_retire_receive(&frame)) {
+        if (frame.type == INJ_TYPE_REPORT_FRAGMENT) {
+            inj_report_fragment_payload_t fragment;
+            memcpy(&fragment, frame.payload, sizeof(fragment));
+            inj_session_observe_report(&s_inj, &fragment);
+        } else if (frame.type == INJ_TYPE_MAP_STATUS) {
+            inj_map_status_payload_t status;
+            memcpy(&status, frame.payload, sizeof(status));
+            inj_session_observe_map_status(&s_inj, &status);
+        }
+    }
+}
+
+// Stage the session's next command into the TX bank the DMA does not own, one
+// slot ahead of transmission. Mirrors link_drain_rx's ownership rule against the
+// live source address; a torn write costs at most one command to a CRC reject,
+// which the session re-attempts. With nothing to send the bank is refilled with
+// IDLE, so the self-loading ring never re-transmits a stale command.
+static void link_inject_refill_tx(void)
+{
+    uint8_t active;
+    if (!link_retire_active_bank(LINK_DMA->CH[LINK_DMA_CHANNEL_TX].TCD_SADDR,
+                                 (uint32_t)s_tx_bank[0], INJ_FRAME_SIZE,
+                                 (uint8_t)LINK_SLOT_BANKS, &active)) {
+        s_saddr_out_of_range++;
+        return;
+    }
+    uint8_t target = link_next_bank(active);
+    if (!inj_session_fill_tx(&s_inj, s_tx_bank[target])) {
+        link_build_idle_slot(s_tx_bank[target]);
+    }
+}
+
 // Retire every bank between the cursor and the one the DMA is currently
 // writing. Bounded by LINK_SLOT_BANKS iterations by construction: the loop
 // stops at `active`, and `active` is always a valid bank index.
@@ -607,6 +662,12 @@ static void link_watch(void)
 static void link_drain_rx(void)
 {
     uint8_t active;
+
+    // Reflect the transport into the session first. set_link is idempotent: it
+    // only arms map upload on the down->up edge and tears all learned state
+    // down when the link drops (an ERR051588 recovery holds mcu_ready low for
+    // its whole duration, which is exactly when the map must be abandoned).
+    inj_session_set_link(&s_inj, s_ready);
 
     if (!link_retire_active_bank(LINK_DMA->CH[LINK_DMA_CHANNEL_RX].TCD_DADDR,
                                  (uint32_t)s_rx_bank[0], INJ_FRAME_SIZE,
@@ -630,6 +691,14 @@ static void link_drain_rx(void)
     while (s_rx_cursor != active) {
         link_retire_slot(s_rx_bank[s_rx_cursor]);
 
+        // Only touch the injection path while the link is up and steady. During
+        // an ERR051588 recovery mcu_ready is low and the ladder is rebuilding
+        // the TX banks itself, so retirement and the snapshot below still run
+        // but no command is consumed or emitted.
+        if (s_ready) {
+            link_inject_consume();
+        }
+
         // shared_window_reset() runs after link_init() has enabled this ISR.
         // Its magic-first invalidation prevents the reset from racing this
         // writer; once magic is published, every retired slot gets exactly one
@@ -638,16 +707,27 @@ static void link_drain_rx(void)
             const link_retire_counters_t *counters = link_retire_counters();
             link_snapshot_t snapshot = {0};
             snapshot.slot_counter = counters->slots;
-            // At step 6 the MCU genuinely knows only that it has driven its
-            // link-ready line. Native report count, USB phase, descriptor/map
-            // generations, fault flags and last RX sequence have no source
-            // yet and remain zero rather than carrying invented values.
-            snapshot.link_flags = s_ready
-                                      ? (uint16_t)INJ_LINK_STATUS_FLAG_RELAY_READY
-                                      : 0u;
+            // Descriptor and map generations now have a real source: what the
+            // session last learned from REPORT_FRAGMENT / MAP_STATUS. Each reads
+            // zero until the session learns it -- honest rather than invented.
+            snapshot.descriptor_generation = s_inj.descriptor_generation;
+            snapshot.map_generation = s_inj.active_map_generation;
+            snapshot.link_flags = (uint16_t)(
+                (s_ready ? INJ_LINK_STATUS_FLAG_RELAY_READY : 0u) |
+                (s_inj.active_map_generation != 0u ? INJ_LINK_STATUS_FLAG_MAP_ACTIVE : 0u) |
+                (inj_session_phase(&s_inj) == INJ_PHASE_INJECTING
+                     ? INJ_LINK_STATUS_FLAG_INJECTION_ENABLED
+                     : 0u));
             link_snapshot_publish(&g_shared_window.snapshot, &snapshot);
         }
         s_rx_cursor = link_next_bank(s_rx_cursor);
+    }
+
+    // One command per drain, staged a slot ahead of the wire. Kept out of the
+    // per-slot loop so a catch-up drain of several banks still emits a single
+    // fresh frame rather than racing several writes into one bank.
+    if (s_ready) {
+        link_inject_refill_tx();
     }
 }
 
@@ -1332,6 +1412,9 @@ void link_init(void)
 
     // Retirement state before anything can complete into it.
     link_retire_reset();
+
+    // The injection session, before the RX ISR that feeds and drains it is armed.
+    inj_session_init(&s_inj);
 
     for (uint8_t bank = 0u; bank < LINK_SLOT_BANKS; ++bank) {
         link_build_idle_slot(s_tx_bank[bank]);

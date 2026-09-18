@@ -292,6 +292,8 @@ CORE0_OBJECTS := \
 	build/core0/link_recovery.o \
 	build/core0/link_snapshot.o \
 	build/core0/link.o \
+	build/core0/inj_command.o \
+	build/core0/inj_session.o \
 	build/core0/console.o \
 	build/core0/usb_descriptors.o \
 	build/core0/usb_console.o \
@@ -378,8 +380,19 @@ build/core0/heartbeat.o: src/heartbeat.c src/heartbeat.h src/platform.h | build/
 
 build/core0/link.o: src/link.c src/link.h src/link_retire.h src/link_recovery.h \
 		src/spi_frame.h src/platform.h src/dbg_uart.h src/shared_window.h \
-		src/link_snapshot.h \
+		src/link_snapshot.h src/inj_command.h src/inj_session.h \
 		include/injection_wire.h | build/core0
+	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
+
+# The injection TX side: command builders and the session policy above them.
+# Both are MMIO-free (host-tested below); link.c pulls them in inside its
+# MCXN947 guard, so only the target link needs these objects.
+build/core0/inj_command.o: src/inj_command.c src/inj_command.h src/spi_frame.h \
+		include/injection_wire.h | build/core0
+	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
+
+build/core0/inj_session.o: src/inj_session.c src/inj_session.h src/inj_command.h \
+		src/spi_frame.h include/injection_wire.h | build/core0
 	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
 # The portable transport half of step 3. Neither of these compiles a single
@@ -618,7 +631,8 @@ check: all check-copies
 test: test-platform test-heartbeat test-spi-frame test-link test-link-retire \
 	test-link-recovery test-console test-core1-release test-shared-window \
 	test-link-snapshot test-status-led test-text-grid test-glyphs \
-	test-display-panel test-display test-merge-images
+	test-display-panel test-display test-inj-command test-inj-session \
+	test-merge-images
 
 test-merge-images:
 	python3 test/merge_mcxn947_images_test.py
@@ -641,6 +655,23 @@ test-spi-frame: build/host/spi_frame_test
 build/host/spi_frame_test: test/spi_frame_test.c src/spi_frame.c src/spi_frame.h \
 		include/injection_wire.h | build/host
 	$(HOST_CC) $(APP_WARNINGS) -Isrc -isystem include test/spi_frame_test.c src/spi_frame.c -o $@
+
+test-inj-command: build/host/inj_command_test
+	./build/host/inj_command_test
+
+build/host/inj_command_test: test/inj_command_test.c src/inj_command.c src/spi_frame.c \
+		src/inj_command.h src/spi_frame.h include/injection_wire.h | build/host
+	$(HOST_CC) $(APP_WARNINGS) -Isrc -isystem include test/inj_command_test.c \
+		src/inj_command.c src/spi_frame.c -o $@
+
+test-inj-session: build/host/inj_session_test
+	./build/host/inj_session_test
+
+build/host/inj_session_test: test/inj_session_test.c src/inj_session.c src/inj_command.c \
+		src/spi_frame.c src/inj_session.h src/inj_command.h src/spi_frame.h \
+		include/injection_wire.h | build/host
+	$(HOST_CC) $(APP_WARNINGS) -Isrc -isystem include test/inj_session_test.c \
+		src/inj_session.c src/inj_command.c src/spi_frame.c -o $@
 
 test-link: build/host/link_test
 	./build/host/link_test
