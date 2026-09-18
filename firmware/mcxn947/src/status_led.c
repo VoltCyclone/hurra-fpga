@@ -2,9 +2,38 @@
 
 #include "status_led.h"
 
+_Static_assert((STATUS_LED_CYCLE_SLOTS & (STATUS_LED_CYCLE_SLOTS - 1u)) == 0u,
+               "cycle must be a power of two so the phase mask is exact");
+_Static_assert(STATUS_LED_BEAT1_END < STATUS_LED_GAP_END
+                   && STATUS_LED_GAP_END < STATUS_LED_BEAT2_END
+                   && STATUS_LED_BEAT2_END < STATUS_LED_CYCLE_SLOTS,
+               "segments must be ordered and fit inside one cycle");
+_Static_assert(STATUS_LED_ON_SLOTS_PER_CYCLE
+                   == STATUS_LED_BEAT1_END
+                          + (STATUS_LED_BEAT2_END - STATUS_LED_GAP_END),
+               "lit-slot count must match the two beats");
+
+// Two-beat cardiac pulse, phase-locked to retired slots. See status_led.h for
+// why this is a rhythm rather than a fade: the caller rewrites this pin about
+// 20 times a second, which is a strobe rate, not a PWM rate.
+//
+// Being a pure function of slot_counter is the liveness property. Advancing
+// slots animate it; a stalled slot_counter pins it to one level, so a halted
+// link reads as a dark (usually) or steady LED rather than as a blink that
+// keeps going after the data behind it has stopped.
 bool status_led_for_slot_counter(uint32_t slot_counter)
 {
-    return ((slot_counter >> STATUS_LED_SLOT_BIT) & 1u) != 0u;
+    // Exact across the 2^32 wrap: the cycle is a power of two that divides
+    // 2^32, so the rhythm runs continuously through the rollover.
+    const uint32_t phase = slot_counter & (STATUS_LED_CYCLE_SLOTS - 1u);
+
+    if (phase < STATUS_LED_BEAT1_END) {
+        return true;  // First beat.
+    }
+    if (phase < STATUS_LED_GAP_END) {
+        return false;  // Gap between the two beats.
+    }
+    return phase < STATUS_LED_BEAT2_END;  // Second beat, then the long rest.
 }
 
 #if defined(MCXN947)

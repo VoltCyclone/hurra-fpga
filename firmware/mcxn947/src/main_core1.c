@@ -50,7 +50,18 @@ int main(void)
                     if (display_start_frame(&last_snapshot,
                                             g_shared_window.cpu1_heartbeat)) {
                         g_shared_window.cpu1_frames++;
-                    } else {
+                    } else if (!display_panel_ok()) {
+                        // Only a transport failure is a fault, which is what
+                        // SHARED_DISPLAY_FLAG_FAULT is documented to mean.
+                        //
+                        // display_start_frame() also returns false when the
+                        // previous frame is still in flight, and that is normal
+                        // pacing, not an error: the repaint tick is faster than
+                        // a full repaint whenever the page is busy. Treating it
+                        // as a fault latched the flag permanently on the first
+                        // overlap and made `panel=ok/FAULT` mean nothing. The
+                        // achieved rate is already visible in cpu1_frames, so a
+                        // skipped tick needs no flag of its own.
                         g_shared_window.cpu1_display_flags |=
                             SHARED_DISPLAY_FLAG_FAULT;
                     }

@@ -10,7 +10,8 @@ retirement of every received slot through `src/link_retire.c`, ERR051588
 detection and recovery through `src/link_recovery.c`, and a TinyUSB CDC console
 on the ChipIdea High Speed controller behind J11. CPU1 is released last, reads
 CPU0's seqlock snapshot at about 20 Hz, echoes the slot count it actually saw,
-drives the blue LED from slot-counter bit 11, and renders the snapshot to the
+drives the blue LED as a slot-counter-derived heartbeat, and renders the
+snapshot to the
 LCD-PAR-S035 through FlexIO0 and eDMA1. The display uses two 480x16 RGB565 row
 buffers and a 60x20 character/attribute shadow, not a full framebuffer; a panel
 failure does not gate CPU1's heartbeat, echo, or LED.
@@ -659,8 +660,8 @@ track on the console while the blue LED cycles. No result is claimed here.
   word CPU1 writes with the value it actually read — turns the coherency
   question into two numbers on the console that either track or do not. It is
   the same category as the CPU1 heartbeat that §3 already endorses: data CPU0
-  observes and never waits on. The LED is still there and still blinks at
-  ~1.95 Hz; it is simply no longer the only evidence.
+  observes and never waits on. The LED is still there and still
+  animates from the slot counter; it is simply no longer the only evidence.
 
 - **§5's snapshot struct does not add up to the size it claims.** The named
   fields total 28 bytes, so the `_pad[3]` shown gives 28 and not the 32 the
@@ -1246,9 +1247,15 @@ these were resolved by reading files this commit imports.
   **Consequence while it was broken:** CS (P0_12), D/C (P0_7) and RST (P4_7) are
   GPIO, so CPU1 drove none of them. The FlexIO data lines and WR strobe were
   correct throughout, feeding a panel that was never selected and never reset.
-  **The free diagnostic is the blue LED**: CPU1 drives P1_2 via GPIO1, so a dark
-  blue LED while `stats` shows CPU1 alive means CPU1's GPIO is dead. Check that
-  before anything else.
+  **The cheap diagnostic is the blue LED**, with one caveat that post-dates this
+  finding. CPU1 drives P1_2 via GPIO1, so a blue LED that never animates while
+  `stats` shows CPU1 alive means CPU1's GPIO is dead — check it before anything
+  else. **But "dark" is no longer the test.** The LED was a 50% square wave when
+  this was written; it is now a two-beat pulse that is deliberately dark 78% of
+  the time, so a dark instant proves nothing. **Watch a full 2.048 s cycle and
+  look for the double-beat.** A stalled `slot_counter` freezes the waveform at
+  whatever level it held, and the low duty makes that far more likely to be dark
+  than a misleading steady-on.
 
 - **`MCUX_DBI_LEGACY` must stay at its default of 1.** Step 7 built core1 with
   `-DMCUX_DBI_LEGACY=0`, which routes `ST7796S_WriteCommand()` through

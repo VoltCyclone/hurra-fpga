@@ -24,6 +24,58 @@ static void display_put_hex32(text_grid_t *grid, uint8_t row, uint8_t col,
     (void)text_grid_put(grid, row, col, text, attr);
 }
 
+// Right-aligned unsigned decimal in `width` columns, space padded. Decimal
+// because these are quantities a person reads, not register images.
+static void display_put_dec(text_grid_t *grid, uint8_t row, uint8_t col,
+                            uint32_t value, uint8_t width, uint8_t attr)
+{
+    char text[11];
+    uint8_t digits = 0u;
+    do {
+        text[digits] = (char)('0' + (value % 10u));
+        value /= 10u;
+        digits++;
+    } while (value != 0u && digits < (uint8_t)sizeof(text));
+
+    char out[12];
+    uint8_t pad = (width > digits) ? (uint8_t)(width - digits) : 0u;
+    uint8_t n = 0u;
+    while (n < pad && n < (uint8_t)(sizeof(out) - 1u)) {
+        out[n] = ' ';
+        n++;
+    }
+    while (digits > 0u && n < (uint8_t)(sizeof(out) - 1u)) {
+        digits--;
+        out[n] = text[digits];
+        n++;
+    }
+    out[n] = '\0';
+    (void)text_grid_put(grid, row, col, out, attr);
+}
+
+// Reports per second, derived from the slot counter rather than a clock.
+//
+// CPU1 has no time base -- no SysTick, no timer, and its loop is not paced. But
+// the FPGA link delivers exactly one slot every 125 us, so `slot_counter` IS a
+// clock at DISPLAY_SLOT_HZ. A ratio against it converts to real time:
+//
+//     reports/s = delta_reports * DISPLAY_SLOT_HZ / delta_slots
+//
+// Note this is the only rate that can honestly be shown. "Slots per second"
+// derived the same way is tautologically DISPLAY_SLOT_HZ and would be a fake
+// number, so link liveness is reported as advancing-or-stalled instead.
+//
+// Returns 0 when no slots have elapsed, which is also the stalled case.
+uint32_t display_report_rate(uint32_t delta_reports, uint32_t delta_slots)
+{
+    if (delta_slots == 0u) {
+        return 0u;
+    }
+    const uint64_t scaled =
+        (uint64_t)delta_reports * (uint64_t)DISPLAY_SLOT_HZ / (uint64_t)delta_slots;
+    return (scaled > 0xffffffffu) ? 0xffffffffu : (uint32_t)scaled;
+}
+
 static void display_page_row(text_grid_t *grid, uint8_t row,
                              const char *label)
 {
@@ -55,43 +107,142 @@ void display_attr_rgb565(uint8_t attr, uint16_t *foreground,
     }
 }
 
+// Two columns, split at DISPLAY_SPLIT_COL.
+//
+// Left is for a person: decimal quantities, decoded states, and colour that
+// answers "is it working" at a glance. Right is the raw register image in hex,
+// which is what you want when the answer is "no". Neither view is derived from
+// the other -- the left side can be read without trusting the decode, and the
+// right side is the wire contract verbatim.
 void display_compose_page(text_grid_t *grid, const link_snapshot_t *snapshot,
-                          uint32_t cpu1_heartbeat)
+                          uint32_t cpu1_heartbeat, uint32_t reports_per_sec,
+                          bool link_alive)
 {
     text_grid_fill_row(grid, 0u, ' ', DISPLAY_ATTR_HEADER);
     (void)text_grid_put(grid, 0u, 2u, "HURRA  MCXN947 LINK",
                         DISPLAY_ATTR_HEADER);
 
-    display_page_row(grid, 2u, "SLOT COUNTER");
-    text_grid_fill_row(grid, DISPLAY_SLOT_VALUE_ROW, ' ', DISPLAY_ATTR_SLOT);
-    display_put_hex32(grid, DISPLAY_SLOT_VALUE_ROW, 2u,
-                      snapshot->slot_counter, 8u, DISPLAY_ATTR_SLOT);
-
-    display_page_row(grid, 5u, "LINK READY");
     const bool ready =
         (snapshot->link_flags & INJ_LINK_STATUS_FLAG_RELAY_READY) != 0u;
-    (void)text_grid_put(grid, 5u, 16u, ready ? "YES" : "NO ",
+    const bool healthy = ready && link_alive && snapshot->fault_flags == 0u;
+    (void)text_grid_put(grid, 0u, 45u, healthy ? "LINK OK  " : "LINK FAULT",
+                        DISPLAY_ATTR_HEADER);
+
+    (void)text_grid_put(grid, 2u, 1u, "HEALTH", DISPLAY_ATTR_NORMAL);
+    (void)text_grid_put(grid, 2u, DISPLAY_REG_LABEL_COL, "REGISTERS",
+                        DISPLAY_ATTR_NORMAL);
+
+    // ---- left: health -------------------------------------------------
+    display_page_row(grid, 3u, "Link");
+    (void)text_grid_put(grid, 3u, DISPLAY_HEALTH_VALUE_COL,
+                        ready ? "READY" : "DOWN ",
                         ready ? DISPLAY_ATTR_GOOD : DISPLAY_ATTR_FAULT);
 
-    display_page_row(grid, 6u, "LINK FLAGS");
-    display_put_hex32(grid, 6u, 16u, snapshot->link_flags, 4u,
+    display_page_row(grid, 4u, "Faults");
+    if (snapshot->fault_flags == 0u) {
+        (void)text_grid_put(grid, 4u, DISPLAY_HEALTH_VALUE_COL, "NONE  ",
+                            DISPLAY_ATTR_GOOD);
+    } else {
+        display_put_hex32(grid, 4u, DISPLAY_HEALTH_VALUE_COL,
+                          snapshot->fault_flags, 4u, DISPLAY_ATTR_FAULT);
+    }
+
+    display_page_row(grid, 5u, "Reports");
+    display_put_dec(grid, 5u, DISPLAY_HEALTH_VALUE_COL,
+                    snapshot->native_report_count, 10u, DISPLAY_ATTR_NORMAL);
+
+    display_page_row(grid, 6u, "Rate");
+    display_put_dec(grid, 6u, DISPLAY_HEALTH_VALUE_COL, reports_per_sec, 6u,
+                    DISPLAY_ATTR_SLOT);
+    (void)text_grid_put(grid, 6u, (uint8_t)(DISPLAY_HEALTH_VALUE_COL + 7u),
+                        "/s", DISPLAY_ATTR_SLOT);
+
+    // Frame phase is the 125 us alignment the whole injection design turns on.
+    display_page_row(grid, 7u, "Frame");
+    display_put_dec(grid, 7u, DISPLAY_HEALTH_VALUE_COL, snapshot->usb_frame, 5u,
+                    DISPLAY_ATTR_NORMAL);
+    (void)text_grid_put(grid, 7u, (uint8_t)(DISPLAY_HEALTH_VALUE_COL + 5u), ".",
+                        DISPLAY_ATTR_NORMAL);
+    display_put_dec(grid, 7u, (uint8_t)(DISPLAY_HEALTH_VALUE_COL + 6u),
+                    snapshot->usb_subframe, 1u, DISPLAY_ATTR_NORMAL);
+
+    display_page_row(grid, 8u, "Desc gen");
+    display_put_dec(grid, 8u, DISPLAY_HEALTH_VALUE_COL,
+                    snapshot->descriptor_generation, 5u, DISPLAY_ATTR_NORMAL);
+
+    display_page_row(grid, 9u, "Map gen");
+    display_put_dec(grid, 9u, DISPLAY_HEALTH_VALUE_COL,
+                    snapshot->map_generation, 5u, DISPLAY_ATTR_NORMAL);
+
+    // Advancing slots, not a rate: see display_report_rate().
+    display_page_row(grid, 10u, "Activity");
+    (void)text_grid_put(grid, 10u, DISPLAY_HEALTH_VALUE_COL,
+                        link_alive ? "ALIVE  " : "STALLED",
+                        link_alive ? DISPLAY_ATTR_GOOD : DISPLAY_ATTR_FAULT);
+
+    // Column rule, so the two halves read as separate panes.
+    for (uint8_t row = 2u; row <= 13u; row++) {
+        (void)text_grid_set_cell(grid, row, DISPLAY_SPLIT_COL, '|',
+                                 DISPLAY_ATTR_NORMAL);
+    }
+
+    // ---- right: raw registers -----------------------------------------
+    (void)text_grid_put(grid, 3u, DISPLAY_REG_LABEL_COL, "slot",
+                        DISPLAY_ATTR_NORMAL);
+    display_put_hex32(grid, 3u, DISPLAY_REG_VALUE_COL, snapshot->slot_counter,
+                      8u, DISPLAY_ATTR_SLOT);
+
+    (void)text_grid_put(grid, 4u, DISPLAY_REG_LABEL_COL, "seq",
+                        DISPLAY_ATTR_NORMAL);
+    display_put_hex32(grid, 4u, DISPLAY_REG_VALUE_COL, snapshot->seq, 8u,
                       DISPLAY_ATTR_NORMAL);
 
-    display_page_row(grid, 7u, "FAULT FLAGS");
-    display_put_hex32(grid, 7u, 16u, snapshot->fault_flags, 4u,
+    (void)text_grid_put(grid, 5u, DISPLAY_REG_LABEL_COL, "native",
+                        DISPLAY_ATTR_NORMAL);
+    display_put_hex32(grid, 5u, DISPLAY_REG_VALUE_COL,
+                      snapshot->native_report_count, 8u, DISPLAY_ATTR_NORMAL);
+
+    (void)text_grid_put(grid, 6u, DISPLAY_REG_LABEL_COL, "flags",
+                        DISPLAY_ATTR_NORMAL);
+    display_put_hex32(grid, 6u, DISPLAY_REG_VALUE_COL, snapshot->link_flags, 4u,
+                      DISPLAY_ATTR_NORMAL);
+
+    (void)text_grid_put(grid, 7u, DISPLAY_REG_LABEL_COL, "fault",
+                        DISPLAY_ATTR_NORMAL);
+    display_put_hex32(grid, 7u, DISPLAY_REG_VALUE_COL, snapshot->fault_flags,
+                      4u,
                       snapshot->fault_flags == 0u ? DISPLAY_ATTR_GOOD
                                                   : DISPLAY_ATTR_FAULT);
 
-    display_page_row(grid, 9u, "LAST RX SEQ");
-    display_put_hex32(grid, 9u, 16u, snapshot->last_rx_sequence, 2u,
+    (void)text_grid_put(grid, 8u, DISPLAY_REG_LABEL_COL, "rxseq",
+                        DISPLAY_ATTR_NORMAL);
+    display_put_hex32(grid, 8u, DISPLAY_REG_VALUE_COL,
+                      snapshot->last_rx_sequence, 2u, DISPLAY_ATTR_NORMAL);
+
+    (void)text_grid_put(grid, 9u, DISPLAY_REG_LABEL_COL, "frame",
+                        DISPLAY_ATTR_NORMAL);
+    display_put_hex32(grid, 9u, DISPLAY_REG_VALUE_COL, snapshot->usb_frame, 4u,
                       DISPLAY_ATTR_NORMAL);
 
-    display_page_row(grid, 11u, "CPU1 HEARTBEAT");
-    display_put_hex32(grid, 11u, 16u, cpu1_heartbeat, 8u,
+    (void)text_grid_put(grid, 10u, DISPLAY_REG_LABEL_COL, "subfrm",
+                        DISPLAY_ATTR_NORMAL);
+    display_put_hex32(grid, 10u, DISPLAY_REG_VALUE_COL, snapshot->usb_subframe,
+                      4u, DISPLAY_ATTR_NORMAL);
+
+    (void)text_grid_put(grid, 11u, DISPLAY_REG_LABEL_COL, "dgen",
+                        DISPLAY_ATTR_NORMAL);
+    display_put_hex32(grid, 11u, DISPLAY_REG_VALUE_COL,
+                      snapshot->descriptor_generation, 4u,
                       DISPLAY_ATTR_NORMAL);
 
-    display_page_row(grid, 12u, "SNAPSHOT SEQ");
-    display_put_hex32(grid, 12u, 16u, snapshot->seq, 8u,
+    (void)text_grid_put(grid, 12u, DISPLAY_REG_LABEL_COL, "mgen",
+                        DISPLAY_ATTR_NORMAL);
+    display_put_hex32(grid, 12u, DISPLAY_REG_VALUE_COL,
+                      snapshot->map_generation, 4u, DISPLAY_ATTR_NORMAL);
+
+    (void)text_grid_put(grid, 13u, DISPLAY_REG_LABEL_COL, "hbeat",
+                        DISPLAY_ATTR_NORMAL);
+    display_put_hex32(grid, 13u, DISPLAY_REG_VALUE_COL, cpu1_heartbeat, 8u,
                       DISPLAY_ATTR_NORMAL);
 }
 
@@ -155,6 +306,11 @@ typedef struct {
     bool active;
     bool first_frame;
     bool available;
+
+    // Baseline for the derived report rate and liveness. CPU1 has no clock, so
+    // the slot counter is the time base -- see display_report_rate().
+    uint32_t prev_slots;
+    uint32_t prev_reports;
 } display_state_t;
 
 static display_state_t s_display;
@@ -248,6 +404,8 @@ bool display_init(void)
     s_display.active = false;
     s_display.first_frame = true;
     s_display.write_buffer = 0u;
+    s_display.prev_slots = 0u;
+    s_display.prev_reports = 0u;
     s_display.available = display_panel_init();
 
     // Paint the panel solid before any text. Two jobs: it proves the transport
@@ -256,12 +414,6 @@ bool display_init(void)
     // between ST7796S_Init and EnableDisplay for the same reason.
     if (s_display.available) {
         (void)display_fill_screen(DISPLAY_FILL_ON_INIT);
-        // Hold it. The first rendered frame marks every cell dirty and repaints
-        // the whole grid on a black background, so without this the fill is
-        // gone in well under a second and whoever is watching the board cannot
-        // say whether they saw it. CPU1 stalling here is free: it is
-        // non-load-bearing by construction and the link cannot observe it.
-        display_panel_delay_us(DISPLAY_FILL_HOLD_US);
     }
     return s_display.available;
 }
@@ -273,7 +425,20 @@ bool display_start_frame(const link_snapshot_t *snapshot,
         return false;
     }
 
-    display_compose_page(&s_display.grid, snapshot, cpu1_heartbeat);
+    // Rate and liveness both come from how far the slot counter moved since the
+    // last frame; CPU1 has no other clock. First frame has no baseline, so it
+    // reports 0/s and STALLED for one repaint rather than inventing a number.
+    const uint32_t delta_slots = snapshot->slot_counter - s_display.prev_slots;
+    const uint32_t delta_reports =
+        snapshot->native_report_count - s_display.prev_reports;
+    const uint32_t rate = s_display.first_frame
+                              ? 0u
+                              : display_report_rate(delta_reports, delta_slots);
+    const bool alive = !s_display.first_frame && delta_slots != 0u;
+    s_display.prev_slots = snapshot->slot_counter;
+    s_display.prev_reports = snapshot->native_report_count;
+
+    display_compose_page(&s_display.grid, snapshot, cpu1_heartbeat, rate, alive);
     if (s_display.first_frame) {
         text_grid_mark_all_dirty(&s_display.grid);
         s_display.first_frame = false;
