@@ -277,6 +277,40 @@ static void test_reset_clears_everything(void)
     assert(link_retire_counters()->stale == 0u);
 }
 
+// link_retire_slot() short-circuits an exact keepalive with a full-slot
+// compare. This pins the reason it must stay a FULL compare.
+//
+// Corrupt a keepalive's body while leaving SOF, type and length intact: only
+// the CRC can catch it, and it must land in bad_crc. Weaken the short-circuit
+// to "the type byte says INJ_TYPE_IDLE, so skip the CRC" and this slot is
+// counted as a healthy keepalive instead -- blinding bad_crc, the counter whose
+// flatness on the bench is the running proof the link is clean, and which the
+// ERR051588 recovery ladder reads to decide a slot was lost on the wire.
+static void test_a_corrupted_keepalive_is_not_counted_as_idle(void)
+{
+    uint8_t slot[INJ_FRAME_SIZE];
+    const link_retire_counters_t *c;
+
+    link_retire_reset();
+    build_idle(slot);
+    slot[SPI_FRAME_OFF_PAYLOAD + 3u] ^= 0x01u;
+    link_retire_slot(slot);
+
+    c = link_retire_counters();
+    assert(c->slots == 1u);
+    assert(c->bad_crc == 1u);
+    assert(c->idle == 0u);
+    assert(c->deliverable == 0u);
+
+    // ...and the pristine keepalive still takes the fast path, so the compare
+    // is doing its job rather than simply never matching.
+    link_retire_reset();
+    build_idle(slot);
+    link_retire_slot(slot);
+    c = link_retire_counters();
+    assert(c->idle == 1u && c->bad_crc == 0u);
+}
+
 static void test_framing_health(void)
 {
     uint8_t idle[INJ_FRAME_SIZE];
@@ -364,6 +398,7 @@ int main(void)
 {
     test_active_bank();
     test_idle_is_a_slot_but_never_a_frame();
+    test_a_corrupted_keepalive_is_not_counted_as_idle();
     test_every_malformed_bucket();
     test_sequence_dispositions();
     test_ring_drops_rather_than_overwrites();

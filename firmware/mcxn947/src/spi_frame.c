@@ -2,20 +2,42 @@
 
 #include <stddef.h>
 
+/* The shift counts below ARE the polynomial: 12, 5 and 0 spell x^16 + x^12 +
+ * x^5 + 1 with the x^16 implicit. INJ_CRC16_POLY is generated from
+ * protocol/report_injection_wire.json, so pin it here -- changing the poly in
+ * the JSON must fail this build loudly rather than leave these shifts quietly
+ * computing a different CRC than every other implementation of the contract. */
+_Static_assert(INJ_CRC16_POLY == 0x1021u,
+               "spi_frame_crc16's table-free reduction hardcodes poly 0x1021");
+
+/* CRC-16/CCITT-FALSE, a byte at a time and without a lookup table.
+ *
+ * This is the standard table-free reduction of the bitwise loop it replaces:
+ * the eight shift/xor steps for one byte collapse into three shifted xors of a
+ * single intermediate. Verified identical to the bitwise form over 20,000
+ * random 30-byte buffers, and against the CRC-16/CCITT-FALSE check value
+ * 0x29B1 for "123456789".
+ *
+ * Why it is worth the density: this runs in the eDMA retirement ISR 8,000 times
+ * a second over 30 bytes. PROVENANCE.md measures that ISR at ~10 us of each
+ * 125 us slot, "nearly all of it the bitwise CRC-16" -- ~68 instructions per
+ * byte, against ~10 here.
+ *
+ * Why not a 256-entry table: GCC 15 already rewrites the bitwise loop into one
+ * for the CH32/RISC-V build, but the ARM toolchain is GCC 14.2, which has no
+ * CRC idiom recognition, so the MCXN947 image shipped the loop verbatim. A
+ * table is marginally faster per byte but costs 512 bytes of rodata and makes
+ * the speed depend on which compiler happens to read this file. This form does
+ * not. */
 uint16_t spi_frame_crc16(const uint8_t *data, uint32_t length)
 {
     uint16_t crc = INJ_CRC16_INIT;
 
     for (uint32_t index = 0u; index < length; ++index) {
-        crc ^= (uint16_t)((uint16_t)data[index] << 8);
-        for (uint8_t bit = 0u; bit < 8u; ++bit) {
-            if ((crc & 0x8000u) != 0u) {
-                const uint16_t shifted = (uint16_t)(crc << 1);
-                crc = (uint16_t)(shifted ^ (uint16_t)INJ_CRC16_POLY);
-            } else {
-                crc = (uint16_t)(crc << 1);
-            }
-        }
+        uint8_t reduced = (uint8_t)((crc >> 8) ^ data[index]);
+        reduced ^= (uint8_t)(reduced >> 4);
+        crc = (uint16_t)((uint16_t)(crc << 8) ^ ((uint16_t)reduced << 12) ^
+                         ((uint16_t)reduced << 5) ^ (uint16_t)reduced);
     }
 
     return crc;

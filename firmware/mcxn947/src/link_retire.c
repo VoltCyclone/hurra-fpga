@@ -16,6 +16,16 @@ static bool s_have_window;       // False until the first deliverable frame.
 static link_retire_counters_t s_counters;
 static uint8_t s_last_slot[INJ_FRAME_SIZE];
 
+// The FPGA's keepalive, byte for byte. Built by the same packer every other
+// frame goes through rather than written out as a literal, so it cannot drift
+// from the wire contract: change the SOF, the frame size or the polynomial in
+// protocol/report_injection_wire.json and this follows automatically.
+//
+// Before link_retire_reset() runs this is all zero, whose byte 0 is not
+// INJ_FRAME_SOF, so no slot can match it and every slot takes the full path.
+// Missing the reset costs speed, never correctness.
+static uint8_t s_canonical_idle[INJ_FRAME_SIZE];
+
 static bool ring_full(void)
 {
     return (uint8_t)((s_head + 1u) & LINK_RETIRE_RING_MASK) == s_tail;
@@ -59,6 +69,7 @@ void link_retire_reset(void)
     s_have_window = false;
     memset(&s_counters, 0, sizeof(s_counters));
     memset(s_last_slot, 0, sizeof(s_last_slot));
+    (void)spi_frame_pack(s_canonical_idle, INJ_TYPE_IDLE, 0u, NULL, 0u);
 }
 
 void link_retire_slot(const uint8_t slot[INJ_FRAME_SIZE])
@@ -72,6 +83,28 @@ void link_retire_slot(const uint8_t slot[INJ_FRAME_SIZE])
 
     s_counters.slots++;
     memcpy(s_last_slot, slot, INJ_FRAME_SIZE);
+
+    // About seven slots in eight are keepalives (PROVENANCE.md: "About 1 in 8
+    // slots is a real INJ_TYPE_REPORT_FRAGMENT ... at ~1 kHz"), and unpacking
+    // one still CRCs all 30 bytes. Eight word compares replace that.
+    //
+    // This is EXACTLY equivalent, not an approximation: a slot byte-identical
+    // to the canonical keepalive necessarily carries the right SOF, a known
+    // type, the right length and a matching CRC, so spi_frame_unpack() could
+    // only have returned SPI_FRAME_IDLE and counted it here. Anything differing
+    // in any byte falls through to the full path untouched -- including a
+    // corrupted keepalive, which still lands in bad_crc where the recovery
+    // ladder expects it.
+    //
+    // Do NOT weaken this to "the type byte says IDLE, so skip the CRC". The CRC
+    // is what makes the type byte trustworthy; a frame whose type was corrupted
+    // to INJ_TYPE_IDLE would then be counted as a healthy keepalive and bad_crc
+    // would go blind. A full compare is strictly stronger than a CRC check, a
+    // type test is strictly weaker.
+    if (memcmp(slot, s_canonical_idle, INJ_FRAME_SIZE) == 0) {
+        s_counters.idle++;
+        return;
+    }
 
     switch (spi_frame_unpack(slot, &type, &sequence, &payload, &length)) {
     case SPI_FRAME_ERR_SOF:

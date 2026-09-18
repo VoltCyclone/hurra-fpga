@@ -586,9 +586,12 @@ def test_target_crc_codegen_matches_the_reference_table(tmp_path: Path) -> None:
     )
     raw = rodata.read_bytes()
     if not raw:
-        # A future compiler that stops table-izing is correct too: the bitwise
-        # loop is already pinned against Python by the CRC differential above.
-        pytest.skip("target build emitted the bitwise CRC loop, no table to check")
+        # No table is the expected result as of the table-free reduction in
+        # spi_frame.c: it gives the compiler no bitwise loop to recognise. A
+        # compiler that stops table-izing is fine for the same reason -- what
+        # the target actually computes is pinned against Python by the CRC
+        # differential above, which compiles this very source.
+        pytest.skip("target build emitted no CRC table, nothing to check")
 
     assert len(raw) == 512, f"unexpected .rodata size {len(raw)}; expected a 256-entry uint16 table"
     table = [int.from_bytes(raw[index * 2 : index * 2 + 2], "little") for index in range(256)]
