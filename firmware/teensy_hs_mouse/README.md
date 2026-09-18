@@ -2,11 +2,10 @@
 
 A test instrument for the hurra-cynthion relay: a bare-metal USB device on a
 SparkFun MicroMod Teensy (iMXRT1062) that presents a minimal boot mouse at
-High Speed and emits reports at a fixed, known rate.
+High Speed, emitting reports at a fixed 8 kHz rate while the cursor traces a
+slow, predictable circle.
 
 ## What it is for
-
-Two things a real mouse cannot do:
 
 - **Prove the link speed by measurement.** It offers `bInterval = 1`, which at
   High Speed means one 125 us microframe -- 8000 reports/sec. Full Speed
@@ -14,9 +13,16 @@ Two things a real mouse cannot do:
   the relay's `native_reports` counter advances at ~8000/sec, the TARGET link
   negotiated High Speed. That is a measurement, not an inference from a status
   bit.
-- **Make drops unambiguous.** It emits at a steady rate with a sequence counter
-  in the report payload, so a shortfall in the relay's counters is a real drop
-  rather than a hand holding still.
+- **Show injection at a glance.** The cursor traces a slow circle -- a couple
+  hundred counts across, one revolution every few seconds -- so motion injected
+  by the control MCU is obvious in real time, drifting or distorting the circle
+  instead of being lost in fast, erratic movement. Radius and period are set by
+  `CIRCLE_RADIUS` and `CIRCLE_PERIOD_S` in `src/main.c`.
+
+An earlier build instead carried a free-running sequence counter in the report's
+Y axis for drop/reorder detection, but that drove the cursor at the microframe
+rate; the slow-circle build here replaces it. Report-rate measurement above is
+unaffected.
 
 ## Why not Teensyduino
 

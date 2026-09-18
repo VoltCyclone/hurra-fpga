@@ -35,11 +35,18 @@
 // the TARGET link is running High Speed; that is a measurement, not an
 // inference from a status bit.
 //
-// The report payload carries a sequence byte so a dropped or reordered report
-// is detectable downstream rather than merely suspected.
+// WHAT IT SENDS
+//
+// This build traces a slow circle for a legible injection demo: X and Y carry
+// small per-report deltas and buttons/wheel stay zero. An earlier build put a
+// free-running sequence counter in Y for drop/reorder detection, but using it
+// as a raw delta moved the cursor at the microframe rate (~500k counts/s), so
+// it was removed. Report-rate counting downstream still measures the negotiated
+// link speed regardless of payload.
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <math.h>
 #include <string.h>
 #include "imxrt.h"
 #include "desc_capture.h"
@@ -69,6 +76,27 @@ extern void usb_host_shim_set_last_report(const uint8_t *data, uint16_t len);
 #define MOUSE_EP        1
 #define MOUSE_MAXPKT    8
 #define REPORT_LEN      4
+
+// --- Slow-circle motion (this build) ---------------------------------------
+// The cursor traces a circle of CIRCLE_RADIUS counts, one revolution every
+// CIRCLE_PERIOD_S seconds, so an injected drift is plainly visible fighting it.
+// Deltas are computed from a float position and accumulated (see the loop), so
+// at this radius/period they are 0 or +/-1 -- smooth and gentle, not the
+// microframe-rate blur the earlier sequence-in-Y build produced.
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+#ifndef CIRCLE_RADIUS
+#define CIRCLE_RADIUS 100
+#endif
+#ifndef CIRCLE_PERIOD_S
+#define CIRCLE_PERIOD_S 6.0f
+#endif
+// Angle advanced per generated report: a full turn spread over
+// (reports-per-second * period) reports, where reports-per-second is
+// 1e6 / REPORT_PERIOD_US.
+#define CIRCLE_DTHETA \
+	(2.0f * (float)M_PI / (CIRCLE_PERIOD_S * (1000000.0f / (float)REPORT_PERIOD_US)))
 
 // ---------------------------------------------------------------------------
 // Static descriptors
@@ -216,9 +244,15 @@ int main(void)
 	}
 
 	uint32_t next_report = micros();
-	uint8_t sequence = 0;
-	int8_t direction = 1;
 	uint8_t send_phase = 0;
+
+	// Slow-circle state. theta steps a fixed amount per generated report;
+	// emitted_x/y hold the integer position already sent, so each report emits
+	// only the rounded delta and sub-count motion accumulates instead of being
+	// truncated to zero (which at this radius it otherwise would be).
+	float theta = 0.0f;
+	int32_t emitted_x = (int32_t)CIRCLE_RADIUS;  // theta 0 -> (R cos0, R sin0) = (R, 0)
+	int32_t emitted_y = 0;
 
 	while (1) {
 		usb_device_poll();
@@ -239,21 +273,28 @@ int main(void)
 			continue;
 		}
 
-		// X alternates +1/-1 so the pointer dithers in place instead of
-		// walking off the screen, while every report still carries distinct
-		// payload bytes. Y carries a free-running sequence number so a
-		// dropped or reordered report is detectable downstream, not merely
-		// suspected -- the whole reason for a synthetic device.
-		uint8_t report[REPORT_LEN];
-		report[0] = 0;                    // buttons: none
-		report[1] = (uint8_t)direction;   // X
-		report[2] = sequence;             // Y, used as a sequence counter
-		report[3] = 0;                    // wheel
+		// Trace the circle: target = (R cos theta, R sin theta). Emit the
+		// integer delta from the position already sent and clamp it to the
+		// signed byte the boot report carries. emitted_x/y is the accumulator,
+		// so fractional per-report motion is never lost.
+		theta += CIRCLE_DTHETA;
+		if (theta >= 2.0f * (float)M_PI) {
+			theta -= 2.0f * (float)M_PI;
+		}
+		int32_t target_x = (int32_t)lroundf((float)CIRCLE_RADIUS * cosf(theta));
+		int32_t target_y = (int32_t)lroundf((float)CIRCLE_RADIUS * sinf(theta));
+		int32_t dx = target_x - emitted_x;
+		int32_t dy = target_y - emitted_y;
+		emitted_x = target_x;
+		emitted_y = target_y;
+		if (dx > 127) { dx = 127; } else if (dx < -127) { dx = -127; }
+		if (dy > 127) { dy = 127; } else if (dy < -127) { dy = -127; }
 
-		// The sequence advances per *generation*, not per transmission, so it
-		// still counts what this loop produced even when most are skipped.
-		direction = (int8_t)-direction;
-		sequence++;
+		uint8_t report[REPORT_LEN];
+		report[0] = 0;                     // buttons: none
+		report[1] = (uint8_t)(int8_t)dx;   // X delta
+		report[2] = (uint8_t)(int8_t)dy;   // Y delta
+		report[3] = 0;                     // wheel
 
 		if (++send_phase >= DIAG_SEND_EVERY) {
 			send_phase = 0;

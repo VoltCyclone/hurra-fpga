@@ -56,3 +56,7 @@ docs/handoffs/
 *.swp
 *~
 .DS_Store
+
+# AI/engineering notes and design docs: kept locally, not published
+CLAUDE.md
+docs/
