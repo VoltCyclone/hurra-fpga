@@ -157,4 +157,31 @@ void link_mcu_ready_set(bool ready);
 // Never blocks on the link. Safe to call as fast as the foreground loop turns.
 void link_poll(void);
 
+// --- Driving injection from the foreground loop -----------------------------
+//
+// The injection session lives here because link_drain_rx() -- the 8 kHz
+// retirement interrupt -- is what stages its TX frames. These two wrappers are
+// how foreground code (kmcmd, via usb_console.c) reaches it without touching
+// ISR-shared state directly: the request fields and their pending flag are only
+// consistent when written together, so the write happens with the retirement
+// interrupt masked. Binding kmcmd straight to inj_session_request_relative()
+// would look identical and be torn by the next slot.
+//
+// Queue one one-shot RELATIVE. False means "not now" -- a request is already in
+// flight, or the session is not in a state the FPGA would honour a command in.
+// The caller keeps its budget and retries. See inj_session.h for why an
+// oversized field vanishes rather than clipping, and kmcmd.h for the step cap.
+bool link_inject_request_relative(int16_t x, int16_t y, int16_t wheel, int16_t pan);
+
+// Queue the injected button mask, or which of the real device's buttons are
+// suppressed. All three requests share the session's single slot, so a pending
+// motion step refuses a button request and vice versa -- the queue is one deep.
+bool link_inject_request_buttons(uint64_t mask, uint16_t hold_reports);
+bool link_inject_request_physical_mask(uint64_t button_mask);
+
+// True while the FPGA would honour an injection command: the MCU-side mirror of
+// gateware.py's command_fresh (link up, session active, map committed and the
+// active generation matching). Leaving this state voids any queued budget.
+bool link_inject_ready(void);
+
 #endif  // HURRA_MCXN947_LINK_H

@@ -54,3 +54,24 @@ spi_frame_result_t inj_build_relative(uint8_t slot[INJ_FRAME_SIZE], uint8_t fram
     return spi_frame_pack(slot, INJ_TYPE_RELATIVE, frame_sequence, (const uint8_t *)payload,
                           INJ_FRAME_PAYLOAD_SIZE);
 }
+
+// BUTTON_STATE and PHYSICAL_MASK have near-identical layouts and adjacent type
+// codes, and both carry a u64 button field. Pointing either builder at the
+// other's type would still pack, still CRC and still round-trip cleanly, and
+// the FPGA would act on the wrong field with nothing to notice it by -- there
+// is no COMMAND_ACK. That is what inj_command_test asserts about these two, and
+// it is the only reason they are worth separate tests at all.
+
+spi_frame_result_t inj_build_button_state(uint8_t slot[INJ_FRAME_SIZE], uint8_t frame_sequence,
+                                          const inj_button_state_payload_t *payload)
+{
+    return spi_frame_pack(slot, INJ_TYPE_BUTTON_STATE, frame_sequence, (const uint8_t *)payload,
+                          INJ_FRAME_PAYLOAD_SIZE);
+}
+
+spi_frame_result_t inj_build_physical_mask(uint8_t slot[INJ_FRAME_SIZE], uint8_t frame_sequence,
+                                           const inj_physical_mask_payload_t *payload)
+{
+    return spi_frame_pack(slot, INJ_TYPE_PHYSICAL_MASK, frame_sequence, (const uint8_t *)payload,
+                          INJ_FRAME_PAYLOAD_SIZE);
+}

@@ -134,7 +134,12 @@ CORE0_RAM_START   := 0x20000000
 CORE0_RAM_END     := 0x2004C000
 RAM_SHARED_START  := 0x2004C000
 RAM_SHARED_END    := 0x2004E000
-SHARED_WINDOW_SIZE := 0x40
+# 0x854 = 2132 = the 64-byte step-7 window, one 2060-byte HID report descriptor
+# block for CPU1 to decode, and the 8-byte link fault block
+# (src/shared_window.h asserts all three). Still inside the 0x2000 region: the
+# reservation exists whether or not anything uses it, so this costs neither
+# core any RAM.
+SHARED_WINDOW_SIZE := 0x854
 CORE1_RAM_START   := 0x2004E000
 CORE1_RAM_END     := 0x20068000
 STACK_SIZE        := 0x0800
@@ -290,11 +295,14 @@ CORE0_OBJECTS := \
 	build/core0/dbg_uart.o \
 	build/core0/link_retire.o \
 	build/core0/link_recovery.o \
+	build/core0/link_fault_classify.o \
 	build/core0/link_snapshot.o \
 	build/core0/link.o \
 	build/core0/inj_command.o \
 	build/core0/inj_session.o \
 	build/core0/console.o \
+	build/core0/kmcmd.o \
+	build/core0/hid_descriptor_reassembly.o \
 	build/core0/usb_descriptors.o \
 	build/core0/usb_console.o \
 	build/core0/tusb.o \
@@ -324,6 +332,8 @@ CORE1_OBJECTS := \
 	build/core1/status_led.o \
 	build/core1/text_grid.o \
 	build/core1/glyphs.o \
+	build/core1/hid_report_decoder.o \
+	build/core1/link_fault_classify.o \
 	build/core1/display_panel.o \
 	build/core1/display.o \
 	build/core1/main_core1.o
@@ -331,8 +341,9 @@ CORE1_OBJECTS := \
 .PHONY: all check check-copies clean flash flash-core0-only flash-merged \
 	verify-core1-blank probes test test-platform \
 	test-heartbeat test-link test-link-retire test-link-recovery test-spi-frame \
-	test-console test-core1-release test-shared-window test-link-snapshot test-status-led \
+	test-console test-kmcmd test-core1-release test-shared-window test-link-snapshot test-status-led \
 	test-text-grid test-glyphs test-display-panel test-display \
+	test-hid-descriptor-reassembly test-hid-report-decoder \
 	test-merge-images
 
 all: build/hurra-mcxn947.bin
@@ -379,6 +390,7 @@ build/core0/heartbeat.o: src/heartbeat.c src/heartbeat.h src/platform.h | build/
 	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
 build/core0/link.o: src/link.c src/link.h src/link_retire.h src/link_recovery.h \
+		src/link_fault_classify.h \
 		src/spi_frame.h src/platform.h src/dbg_uart.h src/shared_window.h \
 		src/link_snapshot.h src/inj_command.h src/inj_session.h \
 		include/injection_wire.h | build/core0
@@ -406,13 +418,32 @@ build/core0/link_retire.o: src/link_retire.c src/link_retire.h src/spi_frame.h \
 build/core0/link_recovery.o: src/link_recovery.c src/link_recovery.h | build/core0
 	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
+build/core0/link_fault_classify.o: src/link_fault_classify.c \
+		src/link_fault_classify.h include/injection_wire.h | build/core0
+	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
+
 # --- the step-4 console ----------------------------------------------------
 #
 # console.c is the portable half and is host-tested below. It never sees a
 # TinyUSB header, which is what keeps that true -- note the absence of
 # $(VENDOR_TUSB) from its host recipe, and the Makefile rule at the top of this
 # file: if a host test ever needs -Ivendor, the module is mis-split.
-build/core0/console.o: src/console.c src/console.h | build/core0
+build/core0/console.o: src/console.c src/console.h src/kmcmd.h | build/core0
+	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
+
+# The KMBox/MAKCU command parser. Portable for the same reasons and by the same
+# means as console.c, and one step further: it sees neither a TinyUSB header nor
+# the generated injection_wire.h. It reaches the injection session through the
+# ops struct in kmcmd.h and nothing else, so a regeneration of the wire contract
+# can never become a change to a third-party protocol's grammar.
+build/core0/kmcmd.o: src/kmcmd.c src/kmcmd.h | build/core0
+	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
+
+# Descriptor reassembly runs on CPU0, where the fragments are retired. Its
+# completed output is copied into the shared window for CPU1 to decode, so the
+# two halves of that feature deliberately live on different cores.
+build/core0/hid_descriptor_reassembly.o: src/hid_descriptor_reassembly.c \
+		src/hid_descriptor_reassembly.h include/injection_wire.h | build/core0
 	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
 # The glue and the descriptor table. Both include tusb.h, so both are built
@@ -550,8 +581,23 @@ build/core1/glyphs.o: src/glyphs.c src/glyphs.h | build/core1
 build/core1/display_panel.o: src/display_panel.c src/display_panel.h | build/core1
 	$(CC) $(CORE1_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
+# The decoder runs on CPU1, the core with no FPU and no DSP. It is integer-only
+# by construction, so the weaker core costs it nothing but flash.
+build/core1/hid_report_decoder.o: src/hid_report_decoder.c src/hid_report_decoder.h \
+		| build/core1
+	$(CC) $(CORE1_CFLAGS) $(APP_WARNINGS) -c $< -o $@
+
+# CPU1 needs only the NAME tables out of this module -- display.c renders the
+# verdict and pin spellings. The classification itself runs on CPU0. Both cores
+# compile the same file rather than duplicating the strings, so a pin that is
+# renamed cannot read one way on the panel and another on the UART.
+build/core1/link_fault_classify.o: src/link_fault_classify.c \
+		src/link_fault_classify.h include/injection_wire.h | build/core1
+	$(CC) $(CORE1_CFLAGS) $(APP_WARNINGS) -c $< -o $@
+
 build/core1/display.o: src/display.c src/display.h src/display_panel.h \
 		src/glyphs.h src/text_grid.h src/link_snapshot.h \
+		src/hid_report_decoder.h src/shared_window.h \
 		include/injection_wire.h | build/core1
 	$(CC) $(CORE1_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
@@ -629,9 +675,11 @@ check: all check-copies
 # grows MMIO outside its guard, the host build of it stops compiling here.
 
 test: test-platform test-heartbeat test-spi-frame test-link test-link-retire \
-	test-link-recovery test-console test-core1-release test-shared-window \
+	test-link-recovery test-link-fault-classify \
+	test-console test-kmcmd test-core1-release test-shared-window \
 	test-link-snapshot test-status-led test-text-grid test-glyphs \
 	test-display-panel test-display test-inj-command test-inj-session \
+	test-hid-descriptor-reassembly test-hid-report-decoder \
 	test-merge-images
 
 test-merge-images:
@@ -688,6 +736,18 @@ build/host/link_retire_test: test/link_retire_test.c src/link_retire.c src/spi_f
 	$(HOST_CC) $(APP_WARNINGS) -Isrc -isystem include test/link_retire_test.c \
 		src/link_retire.c src/spi_frame.c -o $@
 
+# No MMIO and no vendor includes on this recipe, for the same reason as the
+# console below: the classifier reads counters and names wires, and anything
+# that made it need a register header would mean it had stopped being portable.
+test-link-fault-classify: build/host/link_fault_classify_test
+	./build/host/link_fault_classify_test
+
+build/host/link_fault_classify_test: test/link_fault_classify_test.c \
+		src/link_fault_classify.c src/link_fault_classify.h \
+		include/injection_wire.h | build/host
+	$(HOST_CC) $(APP_WARNINGS) -Isrc -isystem include \
+		test/link_fault_classify_test.c src/link_fault_classify.c -o $@
+
 test-link-recovery: build/host/link_recovery_test
 	./build/host/link_recovery_test
 
@@ -698,8 +758,20 @@ test-link-recovery: build/host/link_recovery_test
 test-console: build/host/console_test
 	./build/host/console_test
 
-build/host/console_test: test/console_test.c src/console.c src/console.h | build/host
-	$(HOST_CC) $(APP_WARNINGS) -Isrc test/console_test.c src/console.c -o $@
+build/host/console_test: test/console_test.c src/console.c src/console.h \
+		src/kmcmd.c src/kmcmd.h | build/host
+	$(HOST_CC) $(APP_WARNINGS) -Isrc test/console_test.c src/console.c src/kmcmd.c -o $@
+
+# Same omission as test-console above, and for a second reason as well: not
+# -isystem include either. kmcmd.c speaks the third-party KMBox/MAKCU grammar
+# and must not reach for injection_wire.h -- it hands neutral intents to an ops
+# struct and knows nothing about slots, CRCs or generations. Adding the wire
+# header here would let that coupling in quietly.
+test-kmcmd: build/host/kmcmd_test
+	./build/host/kmcmd_test
+
+build/host/kmcmd_test: test/kmcmd_test.c src/kmcmd.c src/kmcmd.h | build/host
+	$(HOST_CC) $(APP_WARNINGS) -Isrc test/kmcmd_test.c src/kmcmd.c -o $@
 
 test-core1-release: build/host/core1_release_test
 	./build/host/core1_release_test
@@ -754,9 +826,37 @@ test-display: build/host/display_test
 
 build/host/display_test: test/display_test.c src/display.c src/display.h \
 		src/text_grid.c src/text_grid.h src/glyphs.c src/glyphs.h \
+		src/hid_report_decoder.c src/hid_report_decoder.h \
+		src/link_fault_classify.c src/link_fault_classify.h \
 		src/link_snapshot.h include/injection_wire.h | build/host
 	$(HOST_CC) $(APP_WARNINGS) -Isrc -isystem include test/display_test.c \
-		src/display.c src/text_grid.c src/glyphs.c -o $@
+		src/display.c src/text_grid.c src/glyphs.c src/hid_report_decoder.c \
+		src/link_fault_classify.c -o $@
+
+test-hid-descriptor-reassembly: build/host/hid_descriptor_reassembly_test
+	./build/host/hid_descriptor_reassembly_test
+
+build/host/hid_descriptor_reassembly_test: \
+		test/hid_descriptor_reassembly_test.c \
+		src/hid_descriptor_reassembly.c src/hid_descriptor_reassembly.h \
+		include/injection_wire.h | build/host
+	$(HOST_CC) $(APP_WARNINGS) -Isrc -isystem include \
+		test/hid_descriptor_reassembly_test.c \
+		src/hid_descriptor_reassembly.c -o $@
+
+# Note what is NOT on this recipe: -isystem include. The decoder speaks raw HID
+# report-descriptor bytes and nothing else, so a dependency on the generated
+# wire contract would break this build rather than pass unnoticed into the
+# image -- the same argument test-console makes about TinyUSB. Reassembly above
+# does get the include, because it legitimately needs
+# INJ_MAX_DESCRIPTOR_BYTES_PER_INTERFACE for its capacity.
+test-hid-report-decoder: build/host/hid_report_decoder_test
+	./build/host/hid_report_decoder_test
+
+build/host/hid_report_decoder_test: test/hid_report_decoder_test.c \
+		src/hid_report_decoder.c src/hid_report_decoder.h | build/host
+	$(HOST_CC) $(APP_WARNINGS) -Isrc \
+		test/hid_report_decoder_test.c src/hid_report_decoder.c -o $@
 
 build/host/link_recovery_test: test/link_recovery_test.c src/link_recovery.c \
 		src/link_recovery.h | build/host

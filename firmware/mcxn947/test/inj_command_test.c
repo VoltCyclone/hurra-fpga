@@ -131,11 +131,60 @@ static void test_map_frames_round_trip(void)
     assert(memcmp(payload, &commit, sizeof(commit)) == 0);
 }
 
+// BUTTON_STATE carries the injected button mask; PHYSICAL_MASK carries which of
+// the real device's buttons are suppressed on the way to the PC. They are
+// different frame types with deliberately similar layouts, so the thing worth
+// asserting is that each lands its u64 at the offset ITS type declares -- a
+// builder pointed at the wrong type would still pack, still CRC, and still
+// round-trip, and the FPGA would silently act on the wrong field.
+static void test_button_and_mask_frames_round_trip(void)
+{
+    uint8_t slot[INJ_FRAME_SIZE];
+    uint8_t type = 0u;
+    uint8_t length = 0u;
+    const uint8_t *payload = NULL;
+
+    inj_button_state_payload_t buttons;
+    memset(&buttons, 0, sizeof(buttons));
+    buttons.lease_generation = 7u;
+    buttons.map_generation = 7u;
+    buttons.command_sequence = 11u;
+    buttons.interface_number = 1u;
+    buttons.endpoint_number = 2u;
+    buttons.report_id = 0u;
+    buttons.buttons = 0x0000000000000005u;  // left + middle
+    buttons.hold_reports = 400u;
+
+    assert(inj_build_button_state(slot, 4u, &buttons) == SPI_FRAME_OK);
+    assert(spi_frame_unpack(slot, &type, NULL, &payload, &length) == SPI_FRAME_OK);
+    assert(type == INJ_TYPE_BUTTON_STATE);
+    assert(length == INJ_FRAME_PAYLOAD_SIZE);
+    assert(memcmp(payload, &buttons, sizeof(buttons)) == 0);
+    assert(payload[INJ_BUTTON_STATE_BUTTONS_OFFSET] == 0x05u);
+    assert(payload[INJ_BUTTON_STATE_HOLD_REPORTS_OFFSET] == (400u & 0xffu));
+
+    inj_physical_mask_payload_t mask;
+    memset(&mask, 0, sizeof(mask));
+    mask.lease_generation = 7u;
+    mask.map_generation = 7u;
+    mask.command_sequence = 12u;
+    mask.interface_number = 1u;
+    mask.endpoint_number = 2u;
+    mask.button_mask = 0x0000000000000001u;  // suppress the real left button
+
+    assert(inj_build_physical_mask(slot, 5u, &mask) == SPI_FRAME_OK);
+    assert(spi_frame_unpack(slot, &type, NULL, &payload, &length) == SPI_FRAME_OK);
+    assert(type == INJ_TYPE_PHYSICAL_MASK);
+    assert(memcmp(payload, &mask, sizeof(mask)) == 0);
+    assert(payload[INJ_PHYSICAL_MASK_BUTTON_MASK_OFFSET] == 0x01u);
+}
+
 int main(void)
 {
     test_crc32_matches_zlib();
     test_relative_round_trips_with_fields_at_offsets();
     test_map_frames_round_trip();
+    test_button_and_mask_frames_round_trip();
 
     printf("inj_command_test: ok\n");
     return 0;
