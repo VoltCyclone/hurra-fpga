@@ -16,6 +16,7 @@
 #include <string.h>
 
 #include "console.h"
+#include "kmcmd.h"
 
 #define CAPTURE_MAX 16384
 
@@ -444,6 +445,130 @@ static void test_flood_shortfall_is_not_a_drop(void)
     assert(console_dropped_bytes() == before);
 }
 
+// --- KMBox / MAKCU command input --------------------------------------------
+//
+// The console is the transport for the third-party km.* grammar; kmcmd_test.c
+// covers the grammar itself. What is asserted here is only the wiring: that a
+// km line reaches the parser, that it does so LAST so no existing command is
+// shadowed, and that the mode switch works from the console.
+
+static uint32_t g_km_relatives;
+static int32_t g_km_dx;
+
+static bool km_relative(void *ctx, int16_t dx, int16_t dy, int16_t wheel, int16_t pan)
+{
+    (void)ctx;
+    (void)dy;
+    (void)wheel;
+    (void)pan;
+    g_km_relatives++;
+    g_km_dx += dx;
+    return true;
+}
+
+static bool km_ready(void *ctx)
+{
+    (void)ctx;
+    return true;
+}
+
+static void setup_with_km(void)
+{
+    setup(0xFFFFFFFFu);
+    g_km_relatives = 0u;
+    g_km_dx = 0;
+    const kmcmd_ops_t km_ops = {
+        .relative = km_relative,
+        .buttons = NULL,
+        .physical_mask = NULL,
+        .ready = km_ready,
+        .ctx = NULL,
+    };
+    kmcmd_init(&km_ops);
+}
+
+// Default is off, so a console that nobody has switched over behaves exactly
+// as it did before this existed. Enabling it is an explicit act.
+static void test_km_input_is_off_until_enabled(void)
+{
+    setup_with_km();
+    feed("km.move(10,0)\r");
+    assert(captured("unknown command"));
+    assert(!kmcmd_pending());
+
+    feed("kmmode makcu\r");
+    assert(kmcmd_mode() == KMCMD_MODE_MAKCU);
+    feed("km.move(10,0)\r");
+    assert(kmcmd_pending());
+    while (kmcmd_pending()) {
+        (void)kmcmd_step();
+    }
+    assert(g_km_dx == 10);
+}
+
+static void test_kmmode_accepts_each_mode_and_reports_it(void)
+{
+    setup_with_km();
+    feed("kmmode kmbox\r");
+    assert(kmcmd_mode() == KMCMD_MODE_KMBOX);
+    feed("kmmode off\r");
+    assert(kmcmd_mode() == KMCMD_MODE_OFF);
+    feed("kmmode makcu\r");
+    assert(kmcmd_mode() == KMCMD_MODE_MAKCU);
+
+    // A bare `kmmode` reports the current setting rather than changing it.
+    feed("kmmode\r");
+    assert(kmcmd_mode() == KMCMD_MODE_MAKCU);
+    assert(captured("makcu"));
+
+    // And an unrecognised one must not silently leave the mode as it was while
+    // looking like it worked.
+    feed("kmmode banana\r");
+    assert(kmcmd_mode() == KMCMD_MODE_MAKCU);
+    assert(captured("kmmode off|makcu|kmbox"));
+}
+
+// The parser is consulted only after every built-in command has had its turn,
+// so enabling km input can never shadow `stats` -- which is the one command the
+// step-4 gate is read through.
+static void test_km_input_does_not_shadow_builtins(void)
+{
+    setup_with_km();
+    feed("kmmode makcu\r");
+    feed("stats\r");
+    assert(g_stats_calls == 1u);
+    feed("version\r");
+    assert(captured("mcxn947"));
+    feed("help\r");
+    assert(captured("kmmode"));
+}
+
+// The parser's reply has to reach the wire, or a MAKCU host waiting for the
+// `>>>` prompt hangs.
+static void test_km_reply_is_emitted(void)
+{
+    setup_with_km();
+    feed("kmmode makcu\r");
+    feed("km.move(1,2)\r");
+    assert(captured(">>>"));
+
+    // And a refusal is visible for a command this device cannot express.
+    feed("km.moveto(1,2)\r");
+    assert(captured("!noabsolute"));
+}
+
+static void test_stats_reports_km_counters(void)
+{
+    setup_with_km();
+    feed("kmmode makcu\r");
+    feed("km.move(1,2)\r");
+    feed("km.moveto(1,2)\r");
+    memset(&g_stats, 0, sizeof(g_stats));
+    feed("stats\r");
+    assert(captured("km_ok=1"));
+    assert(captured("km_no=1"));
+}
+
 static void test_no_provider_is_survivable(void)
 {
     // A console bound with no stats provider must answer rather than fault.
@@ -481,6 +606,11 @@ int main(void)
     test_flood_yields_when_the_writer_is_full();
     test_short_writes_are_counted();
     test_flood_shortfall_is_not_a_drop();
+    test_km_input_is_off_until_enabled();
+    test_kmmode_accepts_each_mode_and_reports_it();
+    test_km_input_does_not_shadow_builtins();
+    test_km_reply_is_emitted();
+    test_stats_reports_km_counters();
     test_no_provider_is_survivable();
 
     printf("console_test: all cases passed\n");

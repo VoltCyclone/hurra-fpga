@@ -221,11 +221,241 @@ static void test_link_drop_resets_and_non_boot_is_ignored(void)
     assert(inj_session_phase(&s) == INJ_PHASE_WAIT_REPORT);
 }
 
+// Drive a fresh session all the way to INJECTING with a committed boot map.
+static void reach_injecting(inj_session_t *s)
+{
+    inj_session_init(s);
+    inj_session_set_link(s, true);
+    inj_report_fragment_payload_t frag = boot_fragment();
+    inj_session_observe_report(s, &frag);
+    run_upload(s);
+    inj_map_status_payload_t ok = commit_status(1u, INJ_MAP_STATUS_STATUS_COMMIT_ACCEPTED);
+    inj_session_observe_map_status(s, &ok);
+    assert(inj_session_phase(s) == INJ_PHASE_INJECTING);
+}
+
+// An externally requested one-shot must go out on the NEXT slot, not wait out
+// the drift's pace period. kmcmd drains a move as a budget of bounded steps, so
+// a queued step that sat behind 199 idle slots would make a large move take
+// seconds for no reason.
+static void test_requested_relative_preempts_the_paced_drift(void)
+{
+    inj_session_t s;
+    reach_injecting(&s);
+
+    assert(inj_session_request_relative(&s, 64, -3, 0, 0));
+
+    uint8_t type = 0u;
+    uint8_t payload[INJ_FRAME_PAYLOAD_SIZE];
+    (void)next_frame(&s, &type, payload);
+    assert(type == INJ_TYPE_RELATIVE);
+
+    inj_relative_payload_t rel;
+    memcpy(&rel, payload, sizeof(rel));
+    assert(rel.x == 64 && rel.y == -3);
+    assert(rel.flags == (INJ_RELATIVE_FLAG_X | INJ_RELATIVE_FLAG_Y));
+
+    // Consumed: the slot is free again and the drift resumes its pacing.
+    assert(!inj_session_pending_request(&s));
+    assert_idle(&s);
+}
+
+// Wheel and pan carry their own enable bits, and a field that is not being
+// injected must not have its flag set -- the flags are what the engine reads to
+// decide which fields to touch at all.
+static void test_requested_wheel_sets_only_the_wheel_flag(void)
+{
+    inj_session_t s;
+    reach_injecting(&s);
+
+    assert(inj_session_request_relative(&s, 0, 0, -1, 0));
+
+    uint8_t type = 0u;
+    uint8_t payload[INJ_FRAME_PAYLOAD_SIZE];
+    (void)next_frame(&s, &type, payload);
+    inj_relative_payload_t rel;
+    memcpy(&rel, payload, sizeof(rel));
+    assert(rel.flags == INJ_RELATIVE_FLAG_WHEEL);
+    assert(rel.wheel == -1 && rel.x == 0 && rel.y == 0);
+}
+
+// The FPGA's command queue is one deep. Refusing a second request rather than
+// overwriting the first is what makes that depth visible to the caller, so a
+// dropped step can be retried instead of silently vanishing.
+static void test_second_request_is_refused_while_one_is_pending(void)
+{
+    inj_session_t s;
+    reach_injecting(&s);
+
+    assert(inj_session_request_relative(&s, 10, 0, 0, 0));
+    assert(!inj_session_request_relative(&s, 20, 0, 0, 0));
+
+    uint8_t type = 0u;
+    uint8_t payload[INJ_FRAME_PAYLOAD_SIZE];
+    (void)next_frame(&s, &type, payload);
+    inj_relative_payload_t rel;
+    memcpy(&rel, payload, sizeof(rel));
+    assert(rel.x == 10);  // the first, not the second
+
+    assert(inj_session_request_relative(&s, 20, 0, 0, 0));
+}
+
+// Before INJECTING the FPGA's command_fresh is false, so a queued command would
+// be discarded at the far end. Refuse locally instead of emitting something that
+// cannot be honoured.
+static void test_request_is_refused_before_injecting(void)
+{
+    inj_session_t s;
+    inj_session_init(&s);
+    assert(!inj_session_request_relative(&s, 1, 1, 0, 0));
+
+    inj_session_set_link(&s, true);
+    assert(inj_session_phase(&s) == INJ_PHASE_WAIT_REPORT);
+    assert(!inj_session_request_relative(&s, 1, 1, 0, 0));
+}
+
+// The FPGA tears down its session and RX sequence window with the link, so a
+// queued count is void. Replaying it into a fresh session would be a stale move
+// landing at an unpredictable time.
+static void test_link_drop_discards_a_pending_request(void)
+{
+    inj_session_t s;
+    reach_injecting(&s);
+
+    assert(inj_session_request_relative(&s, 32, 32, 0, 0));
+    assert(inj_session_pending_request(&s));
+
+    inj_session_set_link(&s, false);
+    assert(!inj_session_pending_request(&s));
+    assert_idle(&s);
+}
+
+// A zero drift emits nothing. The paced RELATIVE exists to move the cursor; at
+// (0,0) it is an additive no-op, and spending a slot and a command sequence on
+// it would burn the FPGA's one-deep queue against an externally driven move.
+static void test_zero_drift_emits_no_paced_relative(void)
+{
+    inj_session_t s;
+    reach_injecting(&s);
+
+    inj_session_set_drift(&s, 0, 0);
+    for (uint32_t i = 0u; i < (INJ_SESSION_DEFAULT_PACE * 3u); i++) {
+        assert_idle(&s);
+    }
+
+    // A request still goes out: only the drift is silenced, not the session.
+    assert(inj_session_request_relative(&s, 5, 0, 0, 0));
+    uint8_t type = 0u;
+    uint8_t payload[INJ_FRAME_PAYLOAD_SIZE];
+    (void)next_frame(&s, &type, payload);
+    assert(type == INJ_TYPE_RELATIVE);
+}
+
+// A click's press half is an injected button mask with a hold; its release half
+// is the same mask cleared. hold_reports is the one RELATIVE-adjacent field the
+// gateware actually wires (engine.button_hold_reports at gateware.py:371 is the
+// only hold_reports wiring in the whole design), so BUTTON_STATE is the only
+// command on this link that can time anything for itself.
+static void test_requested_buttons_emit_button_state(void)
+{
+    inj_session_t s;
+    reach_injecting(&s);
+
+    assert(inj_session_request_buttons(&s, 0x5u, 400u));
+
+    uint8_t type = 0u;
+    uint8_t payload[INJ_FRAME_PAYLOAD_SIZE];
+    (void)next_frame(&s, &type, payload);
+    assert(type == INJ_TYPE_BUTTON_STATE);
+
+    inj_button_state_payload_t st;
+    memcpy(&st, payload, sizeof(st));
+    assert(st.buttons == 0x5u);
+    assert(st.hold_reports == 400u);
+    assert(st.map_generation == s.active_map_generation);
+    assert(!inj_session_pending_request(&s));
+}
+
+// PHYSICAL_MASK suppresses the REAL device's buttons. It is buttons-only --
+// there is no motion mask in the contract -- so this is the whole of what an
+// axis lock would have needed and the reason axis locks are refused upstream.
+static void test_requested_physical_mask_emits_physical_mask(void)
+{
+    inj_session_t s;
+    reach_injecting(&s);
+
+    assert(inj_session_request_physical_mask(&s, 0x3u));
+
+    uint8_t type = 0u;
+    uint8_t payload[INJ_FRAME_PAYLOAD_SIZE];
+    (void)next_frame(&s, &type, payload);
+    assert(type == INJ_TYPE_PHYSICAL_MASK);
+
+    inj_physical_mask_payload_t mask;
+    memcpy(&mask, payload, sizeof(mask));
+    assert(mask.button_mask == 0x3u);
+    assert(mask.map_generation == s.active_map_generation);
+}
+
+// There is ONE request slot, shared by all three kinds, because the FPGA's
+// command queue is one deep. A pending motion step must therefore block a
+// button request rather than the two coexisting -- otherwise a click and a move
+// queued in the same pass would silently discard one of them.
+static void test_one_request_slot_is_shared_across_kinds(void)
+{
+    inj_session_t s;
+    reach_injecting(&s);
+
+    assert(inj_session_request_relative(&s, 8, 0, 0, 0));
+    assert(!inj_session_request_buttons(&s, 0x1u, 0u));
+    assert(!inj_session_request_physical_mask(&s, 0x1u));
+
+    uint8_t type = 0u;
+    uint8_t payload[INJ_FRAME_PAYLOAD_SIZE];
+    (void)next_frame(&s, &type, payload);
+    assert(type == INJ_TYPE_RELATIVE);  // the motion step, not either mask
+
+    assert(inj_session_request_buttons(&s, 0x1u, 0u));
+}
+
+// Releasing every button is a real command, not an empty one: the mask must go
+// to zero on the wire or the button stays held. This is the one place the
+// "all fields zero is a no-op, drop it" rule from the RELATIVE path must NOT
+// apply, so it is pinned separately.
+static void test_zero_button_mask_is_still_emitted(void)
+{
+    inj_session_t s;
+    reach_injecting(&s);
+
+    assert(inj_session_request_buttons(&s, 0x1u, 0u));
+    uint8_t type = 0u;
+    uint8_t payload[INJ_FRAME_PAYLOAD_SIZE];
+    (void)next_frame(&s, &type, payload);
+    assert(type == INJ_TYPE_BUTTON_STATE);
+
+    assert(inj_session_request_buttons(&s, 0x0u, 0u));
+    (void)next_frame(&s, &type, payload);
+    assert(type == INJ_TYPE_BUTTON_STATE);
+    inj_button_state_payload_t st;
+    memcpy(&st, payload, sizeof(st));
+    assert(st.buttons == 0u);
+}
+
 int main(void)
 {
     test_full_lifecycle();
     test_rejection_retries_with_new_generation();
     test_link_drop_resets_and_non_boot_is_ignored();
+    test_requested_relative_preempts_the_paced_drift();
+    test_requested_wheel_sets_only_the_wheel_flag();
+    test_second_request_is_refused_while_one_is_pending();
+    test_request_is_refused_before_injecting();
+    test_link_drop_discards_a_pending_request();
+    test_zero_drift_emits_no_paced_relative();
+    test_requested_buttons_emit_button_state();
+    test_requested_physical_mask_emits_physical_mask();
+    test_one_request_slot_is_shared_across_kinds();
+    test_zero_button_mask_is_still_emitted();
 
     printf("inj_session_test: ok\n");
     return 0;

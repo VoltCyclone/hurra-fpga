@@ -3,6 +3,7 @@
 #include <stddef.h>
 
 #include "console.h"
+#include "kmcmd.h"
 
 static console_ops_t s_ops;
 
@@ -87,6 +88,40 @@ static void console_prompt(void)
     console_put("hurra> ");
 }
 
+static bool console_equal(const char *a, const char *b)
+{
+    uint32_t i = 0u;
+    while (a[i] != '\0' && b[i] != '\0') {
+        if (a[i] != b[i]) {
+            return false;
+        }
+        i++;
+    }
+    return a[i] == b[i];
+}
+
+// `name` matched, and the rest of the line is either empty or begins with a
+// space. Returns the first argument character (possibly the terminator) or NULL
+// when `name` is not the command on this line. Only `kmmode` takes an argument;
+// every other command is an exact match.
+static const char *console_argument(const char *line, const char *name)
+{
+    uint32_t i = 0u;
+    while (name[i] != '\0') {
+        if (line[i] != name[i]) {
+            return NULL;
+        }
+        i++;
+    }
+    if (line[i] != '\0' && line[i] != ' ') {
+        return NULL;
+    }
+    while (line[i] == ' ') {
+        i++;
+    }
+    return &line[i];
+}
+
 static void cmd_help(void)
 {
     console_put("commands:\r\n"
@@ -95,7 +130,47 @@ static void cmd_help(void)
                 "  version  firmware identity\r\n"
                 "  flood    saturate this pipe until a key is pressed\r\n"
                 "  cpu1halt hold CPU1 in reset (the link must not notice)\r\n"
-                "  cpu1start release CPU1 again\r\n");
+                "  cpu1start release CPU1 again\r\n"
+                "  kmmode   KMBox/MAKCU command input: off|makcu|kmbox\r\n");
+}
+
+static const char *km_mode_name(kmcmd_mode_t mode)
+{
+    switch (mode) {
+        case KMCMD_MODE_MAKCU:
+            return "makcu";
+        case KMCMD_MODE_KMBOX:
+            return "kmbox";
+        default:
+            return "off";
+    }
+}
+
+// `kmmode` with no argument reports; with one it sets. An unrecognised argument
+// prints the usage and changes nothing -- leaving the mode alone while looking
+// like a success is how a host ends up talking a protocol the device is not
+// listening for.
+static void cmd_kmmode(const char *argument)
+{
+    if (argument[0] == '\0') {
+        console_put("kmmode ");
+        console_put(km_mode_name(kmcmd_mode()));
+        console_put("\r\n");
+        return;
+    }
+    if (console_equal(argument, "off")) {
+        kmcmd_set_mode(KMCMD_MODE_OFF);
+    } else if (console_equal(argument, "makcu")) {
+        kmcmd_set_mode(KMCMD_MODE_MAKCU);
+    } else if (console_equal(argument, "kmbox")) {
+        kmcmd_set_mode(KMCMD_MODE_KMBOX);
+    } else {
+        console_put("usage: kmmode off|makcu|kmbox\r\n");
+        return;
+    }
+    console_put("kmmode ");
+    console_put(km_mode_name(kmcmd_mode()));
+    console_put("\r\n");
 }
 
 static void cmd_version(void)
@@ -173,6 +248,21 @@ static void cmd_stats(void)
     }
     console_put(" ");
     console_field("seen_slots", s.cpu1_seen_slot_counter);
+    // Appended, not inserted: the eleven counters above are compared field for
+    // field against the FPGA's own registers, and these three are neither
+    // visible to nor meaningful for it. km_no counts commands this device
+    // cannot express (see kmcmd.h) and km_drop counts sink refusals, which are
+    // the one-deep command queue being busy rather than an error.
+    console_put("\r\n  km ");
+    console_put(km_mode_name(kmcmd_mode()));
+    console_put(" ");
+    console_field("km_ok", kmcmd_accepted());
+    console_field("km_no", kmcmd_refused());
+    console_field("km_drop", kmcmd_dropped());
+    // Undrained counts still owed to the wire. A move is a budget, so accepted
+    // commands and emitted ones are different numbers; without this the two
+    // cannot be told apart from outside.
+    console_field("km_budget", kmcmd_pending_counts());
     console_put("\r\n");
 }
 
@@ -199,21 +289,13 @@ static void cmd_cpu1(bool start)
     console_put(start ? "cpu1 release requested\r\n" : "cpu1 held in reset\r\n");
 }
 
-static bool console_equal(const char *a, const char *b)
-{
-    uint32_t i = 0u;
-    while (a[i] != '\0' && b[i] != '\0') {
-        if (a[i] != b[i]) {
-            return false;
-        }
-        i++;
-    }
-    return a[i] == b[i];
-}
-
 static void console_dispatch(void)
 {
     s_line[s_length] = '\0';
+
+    // `kmmode` is the only command that takes an argument, so its match is
+    // resolved once here rather than inside the chain below.
+    const char *const km_argument = console_argument(s_line, "kmmode");
 
     if (s_overflowed) {
         // Say so rather than acting on a truncated line: acting would run
@@ -233,8 +315,23 @@ static void console_dispatch(void)
         cmd_cpu1(false);
     } else if (console_equal(s_line, "cpu1start")) {
         cmd_cpu1(true);
+    } else if (km_argument != NULL) {
+        cmd_kmmode(km_argument);
     } else {
-        console_put("unknown command; try help\r\n");
+        // The third-party grammar is consulted LAST, so no built-in command
+        // can be shadowed by a km.* name now or later -- `stats` in particular
+        // is what the step-4 gate is read through. kmcmd answers with
+        // KMCMD_NOT_MINE for anything that is not a km command, including
+        // every line while the mode is off, which is the default.
+        char reply[KMCMD_REPLY_MAX];
+        if (kmcmd_line(s_line, reply, sizeof(reply)) == KMCMD_HANDLED) {
+            if (reply[0] != '\0') {
+                console_put(reply);
+                console_put("\r\n");
+            }
+        } else {
+            console_put("unknown command; try help\r\n");
+        }
     }
 
     s_length = 0u;
