@@ -39,6 +39,15 @@ spi_frame_result_t inj_build_map_entry(uint8_t slot[INJ_FRAME_SIZE], uint8_t fra
                                        const inj_map_entry_payload_t *payload);
 spi_frame_result_t inj_build_map_commit(uint8_t slot[INJ_FRAME_SIZE], uint8_t frame_sequence,
                                         const inj_map_commit_payload_t *payload);
+// Injected button state, and which of the REAL device's buttons are suppressed
+// on the way to the PC. Note PHYSICAL_MASK is buttons-only: there is no motion
+// mask anywhere in the contract, which is why absolute positioning and axis
+// locks are not expressible on this link (see kmcmd.h).
+spi_frame_result_t inj_build_button_state(uint8_t slot[INJ_FRAME_SIZE], uint8_t frame_sequence,
+                                          const inj_button_state_payload_t *payload);
+spi_frame_result_t inj_build_physical_mask(uint8_t slot[INJ_FRAME_SIZE], uint8_t frame_sequence,
+                                           const inj_physical_mask_payload_t *payload);
+
 spi_frame_result_t inj_build_relative(uint8_t slot[INJ_FRAME_SIZE], uint8_t frame_sequence,
                                       const inj_relative_payload_t *payload);
 

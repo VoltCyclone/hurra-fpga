@@ -49,6 +49,13 @@
 // it. Still far below the FPGA's one-deep command queue retire rate.
 #define INJ_SESSION_DEFAULT_PACE 200u
 
+// Which kind of command occupies the single request slot. All three share it
+// because the FPGA's command queue is one deep.
+#define INJ_SESSION_REQ_NONE 0u
+#define INJ_SESSION_REQ_RELATIVE 1u
+#define INJ_SESSION_REQ_BUTTONS 2u
+#define INJ_SESSION_REQ_PHYSICAL_MASK 3u
+
 typedef enum {
     INJ_PHASE_WAIT_LINK = 0,  // Transport down; nothing to send.
     INJ_PHASE_WAIT_REPORT,    // Up; learning addressing from a REPORT_FRAGMENT.
@@ -82,11 +89,39 @@ typedef struct {
     uint16_t command_sequence;
     uint8_t entry_cursor;
 
-    // Injection pattern and pacing.
+    // Injection pattern and pacing. inject_x/y of (0,0) silences the paced
+    // RELATIVE entirely rather than emitting an additive no-op -- see
+    // inj_session_set_drift.
     uint16_t pace_period;
     uint16_t pace_counter;
     int16_t inject_x;
     int16_t inject_y;
+
+    // One-deep external command request: written by whoever drives injection
+    // from outside (the foreground loop, via kmcmd) and consumed by
+    // inj_session_fill_tx(), which runs in the 8 kHz RX ISR. It is ONE slot
+    // because the FPGA's command queue is one deep, so a second pending
+    // request would have nowhere to go; see inj_session_request_relative.
+    //
+    // This field is touched from two contexts. The writer must mask the
+    // retirement interrupt around the whole request, because a request is only
+    // consistent once every req_* field and the kind tag are written together.
+    //
+    // req_pending is a KIND, not a bitmask: all three request kinds share the
+    // one slot, so at most one can ever be in flight and a bitmask would imply
+    // otherwise.
+    int16_t req_x;
+    int16_t req_y;
+    int16_t req_wheel;
+    int16_t req_pan;
+    uint64_t req_buttons;
+    uint64_t req_button_mask;
+    uint16_t req_hold_reports;
+    uint8_t req_pending;  // INJ_SESSION_REQ_*
+
+    // Diagnostics (monotonic; cleared only by init).
+    uint32_t requests_sent;
+    uint32_t requests_refused;
 
     // Diagnostics (monotonic; cleared only by init).
     uint32_t maps_committed;
@@ -110,6 +145,51 @@ void inj_session_observe_map_status(inj_session_t *s, const inj_map_status_paylo
 // when the session has one to send this slot; returns false when the caller
 // should stage an IDLE keepalive instead.
 bool inj_session_fill_tx(inj_session_t *s, uint8_t slot[INJ_FRAME_SIZE]);
+
+// Queue one one-shot RELATIVE, to be emitted on the next TX slot ahead of the
+// paced drift. Each argument is added to whatever the physical device reports
+// on the same report, and the injected field's logical range is +/-127 -- an
+// out-of-range sum is REJECTED by the engine and the report passes through
+// unmodified, so an oversized value does not clip, it vanishes. Callers must
+// therefore split a large displacement into bounded steps; kmcmd.h explains the
+// step cap it uses and why.
+//
+// Returns false, and queues nothing, when a request is already pending or the
+// session is not INJECTING. Both are refusals rather than overwrites: the FPGA
+// honours a command only while command_fresh holds (link up, session active,
+// map committed, generation matching), and its queue is one deep. A caller that
+// is draining a budget should keep the count and retry on its next step.
+//
+// Not reentrant, and the callers are in different contexts -- see req_pending.
+bool inj_session_request_relative(inj_session_t *s, int16_t x, int16_t y,
+                                  int16_t wheel, int16_t pan);
+
+// Queue the injected button mask (BUTTON_STATE). `hold_reports` is 0 for a
+// plain state change and non-zero for a click's press half -- it is the only
+// self-timing field on this link, because engine.button_hold_reports is the
+// ONLY hold_reports the gateware wires (RELATIVE's is defined in the contract
+// and connected to nothing, so one RELATIVE affects exactly one report).
+//
+// A mask of 0 is a real command, not an empty one: it is how a held button is
+// released. Unlike the RELATIVE path, this is never dropped as a no-op.
+bool inj_session_request_buttons(inj_session_t *s, uint64_t mask, uint16_t hold_reports);
+
+// Queue which of the REAL device's buttons are suppressed on the way to the PC
+// (PHYSICAL_MASK). Buttons only -- the contract has no motion mask, which is
+// why axis locks cannot be expressed on this link at all.
+bool inj_session_request_physical_mask(inj_session_t *s, uint64_t button_mask);
+
+// True while a queued request has not yet been emitted. All three request kinds
+// share the one slot, so this is what a caller checks before queuing any of
+// them.
+bool inj_session_pending_request(const inj_session_t *s);
+
+// Replace the steady drift. (0,0) silences the paced RELATIVE completely
+// instead of emitting a command whose every field adds zero: that would spend a
+// slot and a command sequence number, and burn the FPGA's one-deep queue
+// against an externally driven move that actually wants it. Requests are
+// unaffected -- this silences the demo pattern, not the session.
+void inj_session_set_drift(inj_session_t *s, int16_t x, int16_t y);
 
 static inline inj_phase_t inj_session_phase(const inj_session_t *s)
 {

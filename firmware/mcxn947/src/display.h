@@ -42,9 +42,56 @@ void display_attr_rgb565(uint8_t attr, uint16_t *foreground,
 // Reports per second from a slot delta. Pure, so it is host-tested directly.
 uint32_t display_report_rate(uint32_t delta_reports, uint32_t delta_slots);
 
+// Rows 14..19 are the decoded HID report descriptor. They were free -- the
+// health and register panes end at row 13 -- so this pane costs the existing
+// page nothing and needs no mode switch on a core with no input.
+#define DISPLAY_DESC_HEADER_ROW 14u
+#define DISPLAY_DESC_FIRST_ROW 15u
+#define DISPLAY_DESC_LAST_ROW 19u
+// Two columns of decoded lines per row. The decoder emits lines of at most 30
+// characters, and the grid is 60 wide, so a second column doubles what fits for
+// the price of one more base offset.
+#define DISPLAY_DESC_COL_A 0u
+#define DISPLAY_DESC_COL_B 30u
+#define DISPLAY_DESC_LINES \
+    (((DISPLAY_DESC_LAST_ROW - DISPLAY_DESC_FIRST_ROW) + 1u) * 2u)
+
+// What CPU1 knows about the captured descriptor. A plain by-value struct rather
+// than a pointer into the shared window: display.c stays portable and
+// host-testable, and never learns that shared memory exists. `bytes` is NULL
+// when nothing has been published, which is the state at boot and after a
+// re-enumeration.
+typedef struct {
+    const uint8_t *bytes;
+    uint16_t length;
+    uint16_t generation;
+    uint8_t interface_number;
+} display_descriptor_t;
+
+// What CPU1 knows about the link fault classifier's verdict. By value, for the
+// same reason as display_descriptor_t above. `sequence == 0` means nothing has
+// been classified yet, which is NOT the same as a verdict of OK and must not
+// render as a clean link.
+//
+// `verdict` holds a link_fault_verdict_t and each `suspect` a link_pin_t; they
+// are bytes here because this struct mirrors the cross-core block, where an
+// enum's width would be a compiler's choice rather than a contract.
+typedef struct {
+    uint32_t sequence;
+    uint8_t verdict;
+    uint8_t suspect_count;
+    uint8_t suspect[2];
+} display_fault_t;
+
+// `fault` may be NULL, which renders the descriptor pane as before.
+//
+// When a fault IS present the pane is given over to it. The two never compete
+// for the rows: a descriptor can only arrive over a working link, so whenever
+// there is a fault worth reporting that pane is necessarily empty anyway.
 void display_compose_page(text_grid_t *grid, const link_snapshot_t *snapshot,
                           uint32_t cpu1_heartbeat, uint32_t reports_per_sec,
-                          bool link_alive);
+                          bool link_alive, const display_descriptor_t *descriptor,
+                          const display_fault_t *fault);
 bool display_rasterize_run(const text_grid_t *grid,
                            const text_grid_run_t *run, uint16_t *pixels,
                            size_t pixel_capacity);

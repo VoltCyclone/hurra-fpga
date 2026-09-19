@@ -12,6 +12,7 @@
 
 #include "console.h"
 #include "dbg_uart.h"
+#include "kmcmd.h"
 #include "link.h"
 #include "link_retire.h"
 #include "platform.h"
@@ -321,9 +322,63 @@ static const console_ops_t s_console_ops = {
     .ctx = NULL,
 };
 
+// --- The KMBox/MAKCU sink --------------------------------------------------
+//
+// kmcmd parses a foreign protocol and hands over neutral intents; these bind
+// those intents to the injection session. The session lives in link.c because
+// the 8 kHz retirement interrupt is what stages its TX frames, so every call
+// here goes through link.h's masked wrappers rather than touching it directly.
+//
+// kmcmd's masks are uint32_t (its button numbering tops out at five) and the
+// wire's are uint64_t; the widening happens here, at the boundary, so neither
+// side has to know the other's width.
+static bool km_relative(void *ctx, int16_t dx, int16_t dy, int16_t wheel, int16_t pan)
+{
+    (void)ctx;
+    return link_inject_request_relative(dx, dy, wheel, pan);
+}
+
+static bool km_buttons(void *ctx, uint32_t mask, uint32_t hold_reports)
+{
+    (void)ctx;
+    // hold_reports is a u16 on the wire. kmcmd derives it from a click's
+    // requested hold in milliseconds x the declared report rate, so a long
+    // enough hold can exceed it; clamp rather than wrap, because a wrapped hold
+    // would release the button almost immediately and look like a dropped click.
+    const uint32_t hold = (hold_reports > 0xffffu) ? 0xffffu : hold_reports;
+    return link_inject_request_buttons((uint64_t)mask, (uint16_t)hold);
+}
+
+static bool km_physical_mask(void *ctx, uint32_t mask)
+{
+    (void)ctx;
+    return link_inject_request_physical_mask((uint64_t)mask);
+}
+
+static bool km_ready(void *ctx)
+{
+    (void)ctx;
+    return link_inject_ready();
+}
+
+static const kmcmd_ops_t s_kmcmd_ops = {
+    .relative = km_relative,
+    .buttons = km_buttons,
+    .physical_mask = km_physical_mask,
+    .ready = km_ready,
+    .ctx = NULL,
+};
+
 void usb_console_init(void)
 {
     console_init(&s_console_ops);
+    kmcmd_init(&s_kmcmd_ops);
+    // The injection plane is designed around the High Speed 8 kHz microframe
+    // rate, and this is the only place that figure is declared to kmcmd -- it
+    // has no clock, so it cannot measure it. It is used solely to turn a
+    // click's requested hold in milliseconds into BUTTON_STATE.hold_reports.
+    // A Full Speed link would be 1.
+    kmcmd_set_reports_per_ms(8u);
 
     usb_console_hardware_init();
 
@@ -371,6 +426,24 @@ void usb_console_poll(void)
     }
 
     console_flood_step();
+
+    // Tell kmcmd when the session stops being able to honour commands, so it
+    // discards a queued budget instead of replaying stale counts into a fresh
+    // session. This tracks link_inject_ready() rather than mcu_ready alone
+    // because a re-enumeration or a rejected map also voids the budget, and
+    // both leave INJECTING without the link ever dropping.
+    static bool s_km_was_ready;
+    const bool km_ready_now = link_inject_ready();
+    if (km_ready_now != s_km_was_ready) {
+        kmcmd_set_link(km_ready_now);
+        s_km_was_ready = km_ready_now;
+    }
+
+    // One sink call per pass, by kmcmd's own contract. A move is drained as a
+    // budget of bounded steps, and an unbounded drain here would hold the
+    // foreground away from link_poll() -- and therefore away from the ERR051588
+    // recovery path -- for the length of a large move.
+    (void)kmcmd_step();
 
     const uint32_t now = platform_ticks();
     if (now - s_report_ms >= USB_CONSOLE_REPORT_MS) {
