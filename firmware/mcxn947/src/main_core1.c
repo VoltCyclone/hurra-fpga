@@ -5,7 +5,9 @@
 
 #include "display.h"
 #include "display_panel.h"
+#include "fault.h"
 #include "shared_window.h"
+#include "stack_limit.h"
 #include "status_led.h"
 
 #define CORE1_HEARTBEAT_SPIN 50000u
@@ -19,6 +21,8 @@ int main(void)
     uint32_t snapshot_divider = 0u;
     link_snapshot_t last_snapshot = {0};
 
+    stack_limit_init();
+    fault_handlers_init();
     g_shared_window.cpu1_boot_count++;
     status_led_hw_init();
     status_led_hw_set(false);

@@ -252,6 +252,15 @@ static void test_stats_reports_every_counter(void)
         .snapshot_slot_counter = 121u,
         .snapshot_read_failures = 122u,
         .cpu1_seen_slot_counter = 123u,
+        .debug_tx_drop = 124u,
+        .reset_srs = 0x00018000u,
+        .cpu1_fault_flags = 0xB2100000u,
+        .cpu1_fault_cfsr = 0x02108000u,
+        .cpu1_fault_hfsr = 0x40000000u,
+        .cpu1_fault_mmfar = 0x20001234u,
+        .cpu1_fault_bfar = 0x40005678u,
+        .cpu1_fault_pc = 0x000c1234u,
+        .cpu1_fault_lr = 0x000c5678u,
         .cpu1_alive = true,
         .cpu1_released = true,
         .link_ready = true,
@@ -285,6 +294,13 @@ static void test_stats_reports_every_counter(void)
     assert(captured("snapshot_slots=121"));
     assert(captured("snapshot_fail=122"));
     assert(captured("seen_slots=123"));
+    assert(captured("dbgtxdrop=124"));
+    assert(captured("reset LOCKUP|CPU1"));
+    assert(captured("srs=98304"));
+    assert(captured("cpu1 FAULT UsageFault"));
+    assert(captured("STKOF|DIVBYZERO"));
+    assert(captured("pc=791092"));
+    assert(captured("bfar=1073763960"));
     assert(captured("link ready"));
 }
 

@@ -3,7 +3,12 @@
 #include <stddef.h>
 
 #include "console.h"
+#include "fault.h"
 #include "kmcmd.h"
+#include "reset_cause.h"
+
+_Static_assert(FAULT_CAUSE_TEXT_MAX >= RESET_CAUSE_TEXT_MAX,
+               "stats detail buffer must fit reset-cause text");
 
 static console_ops_t s_ops;
 
@@ -221,11 +226,18 @@ static void cmd_stats(void)
     console_put("\r\n  ");
     console_field("flood", s_flood_bytes);
     console_field("txdrop", s_dropped);
+    console_field("dbgtxdrop", s.debug_tx_drop);
     console_field("up_ms", s.uptime_ms);
     console_put("\r\n  snapshot ");
     console_field("snapshot_seq", s.snapshot_seq);
     console_field("snapshot_slots", s.snapshot_slot_counter);
     console_field("snapshot_fail", s.snapshot_read_failures);
+    char detail[FAULT_CAUSE_TEXT_MAX];
+    (void)reset_cause_format(s.reset_srs, detail, sizeof(detail));
+    console_put("\r\n  reset ");
+    console_put(detail);
+    console_put(" ");
+    console_field("srs", s.reset_srs);
     console_put("\r\n  cpu1 ");
     if (s.cpu1_held_in_reset) {
         console_put("HELD-IN-RESET ");
@@ -248,6 +260,27 @@ static void cmd_stats(void)
     }
     console_put(" ");
     console_field("seen_slots", s.cpu1_seen_slot_counter);
+    if ((s.cpu1_fault_flags & CONSOLE_CPU1_FAULT_VALID) != 0u) {
+        const fault_kind_t kind = (fault_kind_t)(
+            (s.cpu1_fault_flags & CONSOLE_CPU1_FAULT_KIND_MASK) >>
+            CONSOLE_CPU1_FAULT_KIND_SHIFT);
+        (void)fault_format_causes(s.cpu1_fault_cfsr, detail, sizeof(detail));
+        console_put("\r\n  cpu1 FAULT ");
+        console_put(fault_kind_name(kind));
+        console_put(" ");
+        console_put(detail);
+        console_put(" ");
+        console_field("pc", s.cpu1_fault_pc);
+        console_field("lr", s.cpu1_fault_lr);
+        console_field("cfsr", s.cpu1_fault_cfsr);
+        console_field("hfsr", s.cpu1_fault_hfsr);
+        if ((s.cpu1_fault_cfsr & FAULT_CFSR_MMARVALID) != 0u) {
+            console_field("mmfar", s.cpu1_fault_mmfar);
+        }
+        if ((s.cpu1_fault_cfsr & FAULT_CFSR_BFARVALID) != 0u) {
+            console_field("bfar", s.cpu1_fault_bfar);
+        }
+    }
     // Appended, not inserted: the eleven counters above are compared field for
     // field against the FPGA's own registers, and these three are neither
     // visible to nor meaningful for it. km_no counts commands this device

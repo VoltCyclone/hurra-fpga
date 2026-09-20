@@ -134,12 +134,12 @@ CORE0_RAM_START   := 0x20000000
 CORE0_RAM_END     := 0x2004C000
 RAM_SHARED_START  := 0x2004C000
 RAM_SHARED_END    := 0x2004E000
-# 0x854 = 2132 = the 64-byte step-7 window, one 2060-byte HID report descriptor
-# block for CPU1 to decode, and the 8-byte link fault block
+# 0x870 = 2160 = the 64-byte step-7 window, one 2060-byte HID report descriptor
+# block for CPU1 to decode, and the 36-byte shared fault block
 # (src/shared_window.h asserts all three). Still inside the 0x2000 region: the
 # reservation exists whether or not anything uses it, so this costs neither
 # core any RAM.
-SHARED_WINDOW_SIZE := 0x854
+SHARED_WINDOW_SIZE := 0x870
 CORE1_RAM_START   := 0x2004E000
 CORE1_RAM_END     := 0x20068000
 STACK_SIZE        := 0x0800
@@ -233,7 +233,11 @@ CORE0_RETAIN := \
 	main=build/core0/main_core0.o \
 	SysTick_Handler=build/core0/heartbeat.o \
 	EDMA_0_CH1_DriverIRQHandler=build/core0/link.o \
-	USB1_HS_DriverIRQHandler=build/core0/usb_console.o
+	USB1_HS_DriverIRQHandler=build/core0/usb_console.o \
+	HardFault_Handler=build/core0/fault.o \
+	MemManage_Handler=build/core0/fault.o \
+	BusFault_Handler=build/core0/fault.o \
+	UsageFault_Handler=build/core0/fault.o
 
 retain_symbol = $(word 1,$(subst =, ,$(1)))
 
@@ -248,7 +252,11 @@ CORE0_RETAIN_LDFLAGS := \
 CORE1_RETAIN := \
 	main=build/core1/main_core1.o \
 	SystemInit=build/core1/system_core1.o \
-	EDMA_1_CH0_DriverIRQHandler=build/core1/display_panel.o
+	EDMA_1_CH0_DriverIRQHandler=build/core1/display_panel.o \
+	HardFault_Handler=build/core1/fault.o \
+	MemManage_Handler=build/core1/fault.o \
+	BusFault_Handler=build/core1/fault.o \
+	UsageFault_Handler=build/core1/fault.o
 
 CORE1_RETAIN_LDFLAGS := \
 	$(foreach r,$(CORE1_RETAIN),-Wl,--undefined=$(call retain_symbol,$(r)))
@@ -290,9 +298,12 @@ CORE0_OBJECTS := \
 	build/core0/fsl_lpflexcomm.o \
 	build/core0/fsl_edma.o \
 	build/core0/platform.o \
+	build/core0/stack_limit.o \
+	build/core0/fault.o \
 	build/core0/heartbeat.o \
 	build/core0/spi_frame.o \
 	build/core0/dbg_uart.o \
+	build/core0/reset_cause.o \
 	build/core0/link_retire.o \
 	build/core0/link_recovery.o \
 	build/core0/link_fault_classify.o \
@@ -327,6 +338,8 @@ CORE1_OBJECTS := \
 	build/core1/fsl_flexio_mculcd_edma.o \
 	build/core1/fsl_dbi_flexio_edma.o \
 	build/core1/fsl_st7796s.o \
+	build/core1/stack_limit.o \
+	build/core1/fault.o \
 	build/core1/link_snapshot.o \
 	build/core1/shared_window.o \
 	build/core1/status_led.o \
@@ -341,6 +354,7 @@ CORE1_OBJECTS := \
 .PHONY: all check check-copies clean flash flash-core0-only flash-merged \
 	verify-core1-blank probes test test-platform \
 	test-heartbeat test-link test-link-retire test-link-recovery test-spi-frame \
+	test-reset-cause test-stack-limit test-fault test-dbg-uart \
 	test-console test-kmcmd test-core1-release test-shared-window test-link-snapshot test-status-led \
 	test-text-grid test-glyphs test-display-panel test-display \
 	test-hid-descriptor-reassembly test-hid-report-decoder \
@@ -370,7 +384,8 @@ build/core1.elf: $(CORE1_OBJECTS) $(CORE1_LINKER_SCRIPT) | build/core1
 # --- application objects ----------------------------------------------------
 
 build/core0/main_core0.o: src/main_core0.c src/core1_release.h src/heartbeat.h \
-		src/link.h src/platform.h src/shared_window.h src/usb_console.h | build/core0
+		src/fault.h src/link.h src/platform.h src/reset_cause.h src/shared_window.h \
+		src/stack_limit.h src/usb_console.h | build/core0
 	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
 build/core0/core1_release.o: src/core1_release.c src/core1_release.h | build/core0
@@ -386,13 +401,20 @@ build/core0/link_snapshot.o: src/link_snapshot.c src/link_snapshot.h | build/cor
 build/core0/platform.o: src/platform.c src/platform.h | build/core0
 	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
+build/core0/stack_limit.o: src/stack_limit.c src/stack_limit.h | build/core0
+	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
+
+build/core0/fault.o: src/fault.c src/fault.h src/dbg_uart.h src/link.h \
+		src/shared_window.h | build/core0
+	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
+
 build/core0/heartbeat.o: src/heartbeat.c src/heartbeat.h src/platform.h | build/core0
 	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
 build/core0/link.o: src/link.c src/link.h src/link_retire.h src/link_recovery.h \
 		src/link_fault_classify.h \
 		src/spi_frame.h src/platform.h src/dbg_uart.h src/shared_window.h \
-		src/link_snapshot.h src/inj_command.h src/inj_session.h \
+		src/link_snapshot.h src/inj_command.h src/inj_session.h src/reset_cause.h \
 		include/injection_wire.h | build/core0
 	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
@@ -428,7 +450,8 @@ build/core0/link_fault_classify.o: src/link_fault_classify.c \
 # TinyUSB header, which is what keeps that true -- note the absence of
 # $(VENDOR_TUSB) from its host recipe, and the Makefile rule at the top of this
 # file: if a host test ever needs -Ivendor, the module is mis-split.
-build/core0/console.o: src/console.c src/console.h src/kmcmd.h | build/core0
+build/core0/console.o: src/console.c src/console.h src/fault.h src/kmcmd.h \
+		src/reset_cause.h | build/core0
 	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
 # The KMBox/MAKCU command parser. Portable for the same reasons and by the same
@@ -459,7 +482,8 @@ build/core0/usb_descriptors.o: src/usb_descriptors.c src/tusb_config.h | build/c
 
 build/core0/usb_console.o: src/usb_console.c src/usb_console.h src/console.h \
 		src/dbg_uart.h src/link.h src/link_retire.h src/platform.h \
-		src/shared_window.h src/link_snapshot.h src/tusb_config.h | build/core0
+		src/reset_cause.h src/shared_window.h src/link_snapshot.h \
+		src/tusb_config.h | build/core0
 	$(CC) $(COMMON_CFLAGS) $(GLUE_WARNINGS) -c $< -o $@
 
 # --- vendored TinyUSB ------------------------------------------------------
@@ -504,6 +528,10 @@ build/core0/dcd_ci_hs.o: $(VENDOR_TUSB)/src/portable/chipidea/ci_hs/dcd_ci_hs.c 
 build/core0/dbg_uart.o: src/dbg_uart.c src/dbg_uart.h | build/core0
 	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
+build/core0/reset_cause.o: src/reset_cause.c src/reset_cause.h \
+		src/dbg_uart.h | build/core0
+	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
+
 # Byte-exact copy of firmware/ch32h417/src/spi_frame.c; `make check-copies`
 # holds the two identical. Built with the app warning set, not the vendor one:
 # it is our code, just shared.
@@ -528,6 +556,12 @@ build/core0/fsl_%.o: $(VENDOR_SDK)/devices/MCXN947/drivers/fsl_%.c | build/core0
 
 build/core1/startup.o: $(CORE1_STARTUP) | build/core1
 	$(CC) $(CORE1_CFLAGS) -c $< -o $@
+
+build/core1/stack_limit.o: src/stack_limit.c src/stack_limit.h | build/core1
+	$(CC) $(CORE1_CFLAGS) $(APP_WARNINGS) -c $< -o $@
+
+build/core1/fault.o: src/fault.c src/fault.h src/shared_window.h | build/core1
+	$(CC) $(CORE1_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
 # This is our core-private-only SystemInit, not the vendored reference. Linking
 # the SDK implementation would replay chip-wide power/security policy after
@@ -601,8 +635,9 @@ build/core1/display.o: src/display.c src/display.h src/display_panel.h \
 		include/injection_wire.h | build/core1
 	$(CC) $(CORE1_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
-build/core1/main_core1.o: src/main_core1.c src/shared_window.h \
-		src/link_snapshot.h src/status_led.h src/display.h | build/core1
+build/core1/main_core1.o: src/main_core1.c src/fault.h src/shared_window.h \
+		src/stack_limit.h src/link_snapshot.h src/status_led.h src/display.h \
+		| build/core1
 	$(CC) $(CORE1_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
 build/core0 build/core1 build/host:
@@ -675,7 +710,8 @@ check: all check-copies
 # grows MMIO outside its guard, the host build of it stops compiling here.
 
 test: test-platform test-heartbeat test-spi-frame test-link test-link-retire \
-	test-link-recovery test-link-fault-classify \
+	test-link-recovery test-link-fault-classify test-reset-cause test-stack-limit \
+	test-fault test-dbg-uart \
 	test-console test-kmcmd test-core1-release test-shared-window \
 	test-link-snapshot test-status-led test-text-grid test-glyphs \
 	test-display-panel test-display test-inj-command test-inj-session \
@@ -748,6 +784,36 @@ build/host/link_fault_classify_test: test/link_fault_classify_test.c \
 	$(HOST_CC) $(APP_WARNINGS) -Isrc -isystem include \
 		test/link_fault_classify_test.c src/link_fault_classify.c -o $@
 
+test-reset-cause: build/host/reset_cause_test
+	./build/host/reset_cause_test
+
+build/host/reset_cause_test: test/reset_cause_test.c src/reset_cause.c \
+		src/reset_cause.h | build/host
+	$(HOST_CC) $(APP_WARNINGS) -Isrc test/reset_cause_test.c \
+		src/reset_cause.c -o $@
+
+test-stack-limit: build/host/stack_limit_test
+	./build/host/stack_limit_test
+
+build/host/stack_limit_test: test/stack_limit_test.c src/stack_limit.c \
+		src/stack_limit.h | build/host
+	$(HOST_CC) $(APP_WARNINGS) -Isrc test/stack_limit_test.c \
+		src/stack_limit.c -o $@
+
+test-fault: build/host/fault_test
+	./build/host/fault_test
+
+build/host/fault_test: test/fault_test.c src/fault.c src/fault.h | build/host
+	$(HOST_CC) $(APP_WARNINGS) -Isrc test/fault_test.c src/fault.c -o $@
+
+test-dbg-uart: build/host/dbg_uart_test
+	./build/host/dbg_uart_test
+
+build/host/dbg_uart_test: test/dbg_uart_test.c src/dbg_uart.c \
+		src/dbg_uart.h | build/host
+	$(HOST_CC) $(APP_WARNINGS) -DDBG_UART_TESTING -Isrc \
+		test/dbg_uart_test.c src/dbg_uart.c -o $@
+
 test-link-recovery: build/host/link_recovery_test
 	./build/host/link_recovery_test
 
@@ -759,8 +825,10 @@ test-console: build/host/console_test
 	./build/host/console_test
 
 build/host/console_test: test/console_test.c src/console.c src/console.h \
-		src/kmcmd.c src/kmcmd.h | build/host
-	$(HOST_CC) $(APP_WARNINGS) -Isrc test/console_test.c src/console.c src/kmcmd.c -o $@
+		src/fault.c src/fault.h src/kmcmd.c src/kmcmd.h \
+		src/reset_cause.c src/reset_cause.h | build/host
+	$(HOST_CC) $(APP_WARNINGS) -Isrc test/console_test.c src/console.c \
+		src/fault.c src/kmcmd.c src/reset_cause.c -o $@
 
 # Same omission as test-console above, and for a second reason as well: not
 # -isystem include either. kmcmd.c speaks the third-party KMBox/MAKCU grammar

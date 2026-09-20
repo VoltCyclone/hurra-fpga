@@ -5,12 +5,24 @@
 #include "link.h"
 #include "dbg_uart.h"
 
+static uint8_t s_idle_slot[INJ_FRAME_SIZE] __attribute__((aligned(4)));
+
 void link_build_idle_slot(uint8_t slot[INJ_FRAME_SIZE])
 {
     // spi_frame_pack() checks type and length before writing a byte, and IDLE
     // with length 0 never dereferences the payload pointer, so NULL is correct
     // rather than merely tolerated. The return can only be SPI_FRAME_OK.
     (void)spi_frame_pack(slot, INJ_TYPE_IDLE, 0u, NULL, 0u);
+}
+
+void link_idle_slot_cache_init(void)
+{
+    link_build_idle_slot(s_idle_slot);
+}
+
+void link_copy_cached_idle_slot(uint8_t slot[INJ_FRAME_SIZE])
+{
+    __builtin_memcpy(slot, s_idle_slot, INJ_FRAME_SIZE);
 }
 
 bool link_slot_is_inert_idle(const uint8_t slot[INJ_FRAME_SIZE])
@@ -36,6 +48,7 @@ uint8_t link_next_bank(uint8_t bank)
 #include "fsl_port.h"
 
 #include "shared_window.h"
+#include "reset_cause.h"
 
 // shared_window.h spells its descriptor capacity as a literal so that neither
 // it nor its host test has to know the wire contract exists. This file includes
@@ -740,7 +753,7 @@ static void link_inject_refill_tx(void)
     }
     uint8_t target = link_next_bank(active);
     if (!inj_session_fill_tx(&s_inj, s_tx_bank[target])) {
-        link_build_idle_slot(s_tx_bank[target]);
+        __builtin_memcpy(s_tx_bank[target], s_idle_slot, INJ_FRAME_SIZE);
     }
 }
 
@@ -798,19 +811,23 @@ static void link_drain_rx(void)
         // snapshot publication at the MCU's own ~8 kHz retirement cadence.
         if (g_shared_window.magic == SHARED_WINDOW_MAGIC) {
             const link_retire_counters_t *counters = link_retire_counters();
-            link_snapshot_t snapshot = {0};
-            snapshot.slot_counter = counters->slots;
             // Descriptor and map generations now have a real source: what the
             // session last learned from REPORT_FRAGMENT / MAP_STATUS. Each reads
             // zero until the session learns it -- honest rather than invented.
-            snapshot.descriptor_generation = s_inj.descriptor_generation;
-            snapshot.map_generation = s_inj.active_map_generation;
-            snapshot.link_flags = (uint16_t)(
+            const uint16_t link_flags = (uint16_t)(
                 (s_ready ? INJ_LINK_STATUS_FLAG_RELAY_READY : 0u) |
                 (s_inj.active_map_generation != 0u ? INJ_LINK_STATUS_FLAG_MAP_ACTIVE : 0u) |
                 (inj_session_phase(&s_inj) == INJ_PHASE_INJECTING
                      ? INJ_LINK_STATUS_FLAG_INJECTION_ENABLED
                      : 0u));
+            link_snapshot_t snapshot;
+            link_snapshot_assign(&snapshot,
+                                 counters->slots,
+                                 0u, 0u, 0u,
+                                 link_flags,
+                                 s_inj.descriptor_generation,
+                                 s_inj.active_map_generation,
+                                 0u, 0u);
             link_snapshot_publish(&g_shared_window.snapshot, &snapshot);
         }
         s_rx_cursor = link_next_bank(s_rx_cursor);
@@ -1060,6 +1077,10 @@ static void link_recovery_apply(void *ctx, link_recovery_op_t op)
         // the steady-state invariant is that the buffer the DMA will next read
         // is never empty and never half written, and the moment the descriptor
         // is installed is the moment that becomes true again.
+        //
+        // Pack afresh here rather than trusting the steady-state cache. This is
+        // the path taken after something has gone wrong; it must be able to
+        // recover from corruption of that static RAM image as well.
         for (uint8_t bank = 0u; bank < LINK_SLOT_BANKS; ++bank) {
             link_build_idle_slot(s_tx_bank[bank]);
         }
@@ -1122,6 +1143,8 @@ static void link_recover(const link_fault_t *fault)
     }
     s_last_fault_sr = LINK_SPI->SR;
 
+    (void)link_recovery_run(link_recovery_apply, NULL);
+
     dbg_puts("!! ERR051588 recovery #");
     dbg_dec32(s_recoveries);
     dbg_puts("  SR=");
@@ -1132,8 +1155,6 @@ static void link_recover(const link_fault_t *fault)
     dbg_puts(fault->dma_controller_halted ? " HALT" : "");
     dbg_puts(fault->receive_framing_lost ? " FRAMING" : "");
     dbg_puts("\n");
-
-    (void)link_recovery_run(link_recovery_apply, NULL);
 
     dbg_puts("   recovered, SR=");
     dbg_hex32(LINK_SPI->SR);
@@ -1600,6 +1621,11 @@ static void link_report(void)
 
 void link_poll(void)
 {
+    // Normal diagnostics become queued at the end of link_init(). Drain only
+    // what the UART can accept now, with a fixed per-pass ceiling, so neither
+    // reports nor recovery messages can stall the fault monitor.
+    dbg_uart_poll();
+
     const uint32_t slots = link_retire_counters()->slots;
 
     // Sampled unconditionally, acted on only when armed. Sampling inside the
@@ -1644,7 +1670,7 @@ void link_poll(void)
 
 void link_init(void)
 {
-    dbg_uart_init();
+    reset_cause_report_debug();
     link_wire_probe();
 
     link_pins_init();
@@ -1662,8 +1688,9 @@ void link_init(void)
     hid_descriptor_reassembly_init(&s_desc, 0u);
     s_desc_publish_pending = false;
 
+    link_idle_slot_cache_init();
     for (uint8_t bank = 0u; bank < LINK_SLOT_BANKS; ++bank) {
-        link_build_idle_slot(s_tx_bank[bank]);
+        link_copy_cached_idle_slot(s_tx_bank[bank]);
         for (uint32_t index = 0u; index < INJ_FRAME_SIZE; ++index) {
             s_rx_bank[bank][index] = 0u;
         }
@@ -1767,6 +1794,12 @@ void link_init(void)
     // The report cadence starts from whatever the boot dump cost, so the first
     // periodic line is one full interval away rather than immediate.
     s_report_ms = platform_ticks();
+
+    // Boot diagnostics above are intentionally blocking because no foreground
+    // drain exists yet. This is the mode boundary: every later ordinary
+    // dbg_* call (the 1 Hz reports and ERR051588 recovery included) queues and
+    // returns; only the architectural-fault emergency API remains blocking.
+    dbg_uart_async_enable();
 }
 
 #endif  // MCXN947

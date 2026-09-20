@@ -89,6 +89,12 @@ _Static_assert(LINK_SPI_FRAMESZ == 255u, "the FPGA clocks 256 bits per CS");
 // INJ_FRAME_SIZE bytes.
 void link_build_idle_slot(uint8_t slot[INJ_FRAME_SIZE]);
 
+// Pack the steady-state IDLE cache once during link_init(), then copy it into
+// a TX bank without recomputing the payload fill and CRC. Recovery deliberately
+// keeps using link_build_idle_slot() so it does not depend on cache integrity.
+void link_idle_slot_cache_init(void);
+void link_copy_cached_idle_slot(uint8_t slot[INJ_FRAME_SIZE]);
+
 // True when `slot` is exactly what step 2 promises the FPGA: well formed
 // enough that no `spi_bad_*` counter can move, and IDLE, so `valid_return` is
 // false and it can never be delivered.

@@ -38,6 +38,12 @@
 // noise, and silently discarding it would look like the console had hung.
 #define CONSOLE_LINE_MAX 63u
 
+// Portable spelling of the CPU1 fault publication bits. usb_console.c sees
+// this contract and shared_window.h together and holds the two spellings equal.
+#define CONSOLE_CPU1_FAULT_KIND_SHIFT 28u
+#define CONSOLE_CPU1_FAULT_KIND_MASK  0x30000000u
+#define CONSOLE_CPU1_FAULT_VALID      0x80000000u
+
 // Everything `stats` reports. Flat, by value, and a copy: the provider takes
 // the snapshot with the retirement interrupt masked, so the console never
 // reads counters that an ISR is mid-update on.
@@ -66,6 +72,7 @@ typedef struct {
     uint32_t recoveries;
     uint32_t framing_recoveries;
     uint32_t gap_wait_timeouts;
+    uint32_t debug_tx_drop;
 
     uint32_t uptime_ms;
     uint32_t cpu1_boot_count;
@@ -82,6 +89,14 @@ typedef struct {
     uint32_t cpu1_display_flags;
     uint32_t cpu1_blits;
     uint32_t cpu1_blit_rejects;
+    uint32_t reset_srs;
+    uint32_t cpu1_fault_flags;
+    uint32_t cpu1_fault_cfsr;
+    uint32_t cpu1_fault_hfsr;
+    uint32_t cpu1_fault_mmfar;
+    uint32_t cpu1_fault_bfar;
+    uint32_t cpu1_fault_pc;
+    uint32_t cpu1_fault_lr;
 } console_stats_t;
 
 typedef struct {

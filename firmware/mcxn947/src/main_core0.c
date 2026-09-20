@@ -26,15 +26,30 @@
 // link state would make a stalled foreground look like a dead link.
 
 #include "core1_release.h"
+#include "dbg_uart.h"
+#include "fault.h"
 #include "heartbeat.h"
 #include "link.h"
 #include "platform.h"
+#include "reset_cause.h"
 #include "shared_window.h"
+#include "stack_limit.h"
 #include "usb_console.h"
 
 int main(void)
 {
+    stack_limit_init();
+    // FRO12M is a reset-available source and this UART configures its own
+    // clock attachment, divider, peripheral reset and pin mux. Arm diagnostic
+    // faults only after their reporting path is complete.
+    dbg_uart_init();
+    fault_handlers_init();
     platform_init();
+
+    // Read the reset source once, before any later peripheral setup can make
+    // the original boot reason less obvious. link_init() prints the saved word
+    // immediately; the debug UART is already live above.
+    reset_cause_latch();
 
     // One second period: 500 ms lit, 500 ms dark.
     heartbeat_start(PLATFORM_TICK_HZ / 2u);
