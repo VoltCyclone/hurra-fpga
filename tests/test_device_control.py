@@ -1,5 +1,5 @@
 from _descriptor_store_helpers import seed_descriptor
-from amaranth import Elaboratable, Module
+from amaranth import Elaboratable, Module, Signal
 from amaranth.sim import Simulator
 from usb_protocol.types import USBRequestType, USBStandardRequests
 
@@ -712,3 +712,180 @@ def test_start_coincident_first_packet_of_multipacket_descriptor():
 
     sim.add_testbench(bench)
     sim.run()
+
+
+HID_GET_REPORT = 0x01
+HID_SET_REPORT = 0x09
+
+
+class _RelayStub(Elaboratable):
+    """Stands in for ControlRelay so the handler can be tested alone."""
+
+    def __init__(self):
+        self.request_valid = Signal()
+        self.request_ready = Signal(init=1)
+        self.request_type = Signal(8)
+        self.request = Signal(8)
+        self.value = Signal(16)
+        self.index = Signal(16)
+        self.length = Signal(16)
+        self.out_valid = Signal()
+        self.out_data = Signal(8)
+        self.response_valid = Signal()
+        self.response_error = Signal()
+        self.response_length = Signal(16)
+        self.response_ack = Signal()
+        self.read_addr = Signal(6)
+        self.read_data = Signal(8)
+
+    def elaborate(self, platform):
+        del platform
+        return Module()
+
+
+class _DeferHarness(Elaboratable):
+    def __init__(self, timeout_cycles: int = 64):
+        self.relay = _RelayStub()
+        self.dut = HIDClassRequestHandler(relay=self.relay, timeout_cycles=timeout_cycles)
+
+    def elaborate(self, platform):
+        del platform
+        m = Module()
+        m.submodules.relay = self.relay
+        m.submodules.dut = self.dut
+        return m
+
+
+def _simulate_handler(bench, *, timeout_cycles: int = 64) -> None:
+    harness = _DeferHarness(timeout_cycles=timeout_cycles)
+    simulation = Simulator(harness)
+    simulation.add_clock(1e-6, domain="usb")
+
+    async def wrapped(ctx) -> None:
+        await ctx.tick("usb")
+        await bench(ctx, harness.dut, harness.relay)
+
+    simulation.add_testbench(wrapped)
+    simulation.run()
+
+
+async def _send_setup(ctx, dut, *, request_type, request, value, index, length):
+    setup = dut.interface.setup
+    ctx.set(setup.recipient, request_type & 0x1F)
+    ctx.set(setup.type, (request_type >> 5) & 0x03)
+    ctx.set(setup.is_in_request, (request_type >> 7) & 1)
+    ctx.set(setup.request, request)
+    ctx.set(setup.value, value)
+    ctx.set(setup.index, index)
+    ctx.set(setup.length, length)
+    ctx.set(setup.received, 1)
+    await ctx.tick("usb")
+    ctx.set(setup.received, 0)
+    await ctx.tick("usb")
+
+
+def test_deferring_handler_naks_rather_than_going_silent() -> None:
+    """The single most important property in this design.
+
+    LUNA emits nothing unless a handler drives a handshake. Silence is a
+    transaction timeout, not flow control -- the host retries about three
+    times and then marks the device unresponsive. So while waiting on the
+    relay, every data_requested/status_requested strobe MUST produce a NAK.
+    """
+
+    async def bench(ctx, dut, relay) -> None:
+        await _send_setup(
+            ctx,
+            dut,
+            request_type=0xA1,
+            request=HID_GET_REPORT,
+            value=0x03F1,
+            index=3,
+            length=64,
+        )
+        assert ctx.get(relay.response_valid) == 0
+
+        for strobe in range(3):
+            ctx.set(dut.interface.data_requested, 1)
+            await ctx.delay(1e-9)
+            assert (
+                ctx.get(dut.interface.handshakes_out.nak) == 1
+            ), f"strobe {strobe}: handler went silent instead of NAKing"
+            assert ctx.get(dut.interface.tx.valid) == 0, "must not drive tx while deferring"
+            ctx.set(dut.interface.data_requested, 0)
+            await ctx.tick("usb")
+
+    _simulate_handler(bench)
+
+
+def test_claim_is_held_across_the_entire_deferral() -> None:
+    """A dropped claim routes outputs to the STALL fallback.
+
+    USBRequestHandlerMultiplexer selects with a one-hot Encoder, whose .n
+    asserts when none OR multiple inputs are set -- so losing claim mid
+    transfer silently stalls the endpoint rather than failing loudly.
+    """
+
+    async def bench(ctx, dut, relay) -> None:
+        await _send_setup(
+            ctx,
+            dut,
+            request_type=0xA1,
+            request=HID_GET_REPORT,
+            value=0x03F1,
+            index=3,
+            length=64,
+        )
+        for _ in range(20):
+            await ctx.tick("usb")
+            assert ctx.get(dut.interface.claim) == 1, "claim dropped mid-deferral"
+
+    _simulate_handler(bench, timeout_cycles=1000)
+
+
+def test_set_idle_still_acks_locally_without_touching_the_relay() -> None:
+    async def bench(ctx, dut, relay) -> None:
+        setup = dut.interface.setup
+        ctx.set(setup.recipient, 0x01)
+        ctx.set(setup.type, 1)
+        ctx.set(setup.is_in_request, 0)
+        ctx.set(setup.request, HID_SET_IDLE)
+        ctx.set(setup.length, 0)
+        ctx.set(setup.received, 1)
+        await ctx.delay(1e-9)
+        assert ctx.get(relay.request_valid) == 0, "SET_IDLE must not round-trip to the target"
+        await ctx.tick("usb")
+        ctx.set(setup.received, 0)
+        ctx.set(dut.interface.status_requested, 1)
+        await ctx.delay(1e-9)
+        assert ctx.get(dut.interface.handshakes_out.ack) == 1
+
+    _simulate_handler(bench)
+
+
+def test_wedged_target_stalls_instead_of_naking_forever() -> None:
+    """LUNA has no timeout in its control path; the bound must be ours.
+
+    USB 2.0 s9.2.6.4 allows only 50 ms for a no-data-stage status phase, so
+    a relay that never answers has to become a STALL, not an endless NAK.
+    """
+
+    async def bench(ctx, dut, relay) -> None:
+        await _send_setup(
+            ctx,
+            dut,
+            request_type=0xA1,
+            request=HID_GET_REPORT,
+            value=0x03F1,
+            index=3,
+            length=64,
+        )
+        # relay.response_valid is never asserted: the target is wedged.
+        for _ in range(80):
+            await ctx.tick("usb")
+        ctx.set(dut.interface.data_requested, 1)
+        await ctx.delay(1e-9)
+        assert ctx.get(dut.interface.handshakes_out.stall) == 1
+        assert ctx.get(dut.interface.handshakes_out.nak) == 0
+
+    _simulate_handler(bench, timeout_cycles=64)

@@ -2,7 +2,7 @@
 
 # ruff: noqa: SIM117
 
-from amaranth import Elaboratable, Module, Mux, Signal
+from amaranth import Cat, Elaboratable, Module, Mux, Signal
 from luna.gateware.usb.request.standard import StandardRequestHandler
 from luna.gateware.usb.stream import USBInStreamInterface
 from luna.gateware.usb.usb2.request import USBRequestHandler
@@ -304,11 +304,23 @@ class HIDClassRequestHandler(USBRequestHandler):
     coexists alongside a STANDARD-request handler (and a catch-all) attached
     to the same control endpoint. ACKs the status phase of SET_IDLE (0x0A)
     and SET_PROTOCOL (0x0B) -- the two class requests most OSes require a
-    HID device to acknowledge before it will bind -- and STALLs everything
-    else (e.g. GET_REPORT/GET_PROTOCOL). Stalling is a safe default for v1:
-    most OSes fall back to reading the interrupt IN endpoint instead of
-    GET_REPORT.
+    HID device to acknowledge before it will bind.
+
+    Any *other* class request is forwarded verbatim to the real device
+    through ``relay``, which is how a console's authentication handshake
+    reaches the controller that can actually sign it. Nothing here inspects
+    ``bRequest`` beyond those two constants, so the path is protocol-agnostic
+    -- GET_REPORT/SET_REPORT of any report ID, and vendor schemes, all travel
+    the same way.
+
+    With ``relay=None`` the pre-relay behaviour is kept (STALL everything
+    else), which is what the diagnostic tops and the descriptor tests expect.
     """
+
+    def __init__(self, *, relay=None, timeout_cycles: int = 1_200_000):
+        super().__init__()
+        self._relay = relay
+        self._timeout_cycles = timeout_cycles
 
     def elaborate(self, platform):
         del platform
@@ -316,21 +328,132 @@ class HIDClassRequestHandler(USBRequestHandler):
         interface = self.interface
         setup = interface.setup
         handshake_generator = interface.handshakes_out
+        relay = self._relay
 
+        # ``claim`` is a function of the LATCHED setup record, never of FSM
+        # state: LUNA holds setup.* until the next SETUP packet, and
+        # USBRequestHandlerMultiplexer selects outputs with a ONE-HOT encoder
+        # whose .n asserts when none *or multiple* handlers claim. Dropping
+        # claim mid-transfer therefore routes the endpoint to the STALL
+        # fallback silently rather than failing loudly.
         with m.If(setup.type == USBRequestType.CLASS):
             m.d.comb += interface.claim.eq(1)
+
+            if relay is None:
+                with m.FSM(domain="usb"):
+                    with m.State("IDLE"):
+                        with m.If(setup.received):
+                            with m.Switch(setup.request):
+                                with m.Case(_HID_SET_IDLE, _HID_SET_PROTOCOL):
+                                    m.next = "ACK_STATUS"
+                                with m.Default():
+                                    m.next = "STALL"
+                    with m.State("ACK_STATUS"):
+                        with m.If(interface.status_requested):
+                            m.d.comb += handshake_generator.ack.eq(1)
+                            m.next = "IDLE"
+                    with m.State("STALL"):
+                        with m.If(interface.data_requested | interface.status_requested):
+                            m.d.comb += handshake_generator.stall.eq(1)
+                            m.next = "IDLE"
+                return m
+
+            defer_timer = Signal(range(self._timeout_cycles + 1))
+            response_cursor = Signal(range(DESCRIPTOR_STORE_SIZE))
+            out_cursor = Signal(16)
+
+            # LUNA's SetupPacket has no raw bmRequestType byte: it splits the
+            # byte into recipient[5] / type[2] / is_in_request[1], which is
+            # exactly that byte's bit layout. Reassemble it so the target sees
+            # the request the host actually sent, direction bit included.
+            request_type = Cat(setup.recipient, setup.type, setup.is_in_request)
+
             with m.FSM(domain="usb"):
                 with m.State("IDLE"):
+                    m.d.usb += [defer_timer.eq(0), response_cursor.eq(0), out_cursor.eq(0)]
                     with m.If(setup.received):
                         with m.Switch(setup.request):
                             with m.Case(_HID_SET_IDLE, _HID_SET_PROTOCOL):
                                 m.next = "ACK_STATUS"
                             with m.Default():
-                                m.next = "STALL"
+                                m.d.comb += [
+                                    relay.request_valid.eq(1),
+                                    relay.request_type.eq(request_type),
+                                    relay.request.eq(setup.request),
+                                    relay.value.eq(setup.value),
+                                    relay.index.eq(setup.index),
+                                    relay.length.eq(setup.length),
+                                ]
+                                with m.If(setup.is_in_request | (setup.length == 0)):
+                                    m.next = "AWAITING_TARGET"
+                                with m.Else():
+                                    m.next = "CAPTURE_OUT"
+
+                with m.State("CAPTURE_OUT"):
+                    # LUNA's OUT stream has NO backpressure and no buffer: a
+                    # byte exists only on the cycle rx.valid & rx.next is
+                    # high, so it must be forwarded the same cycle or lost.
+                    with m.If(interface.rx.valid & interface.rx.next):
+                        m.d.comb += [
+                            relay.out_valid.eq(1),
+                            relay.out_data.eq(interface.rx.payload),
+                        ]
+                        m.d.usb += out_cursor.eq(out_cursor + 1)
+                    with m.If(interface.rx_ready_for_response):
+                        m.d.comb += handshake_generator.ack.eq(1)
+                        m.next = "AWAITING_TARGET"
+
+                with m.State("AWAITING_TARGET"):
+                    # LUNA does NOT auto-NAK. A handler that claims a request
+                    # and drives nothing emits bus SILENCE, which the host
+                    # reads as a transaction error and abandons after about
+                    # three retries -- not as flow control. data_requested and
+                    # status_requested are single-cycle combinational strobes,
+                    # so the NAK has to be driven in the same cycle. This is
+                    # the idiom LUNA's own USBInTransferManager uses.
+                    with m.If(interface.data_requested | interface.status_requested):
+                        m.d.comb += handshake_generator.nak.eq(1)
+                    m.d.usb += defer_timer.eq(defer_timer + 1)
+                    with m.If(relay.response_valid & ~relay.response_error):
+                        m.next = "RESPOND"
+                    with m.Elif(relay.response_valid | (defer_timer == self._timeout_cycles)):
+                        # LUNA has no timeout anywhere in its control path, so
+                        # without this bound a wedged target would hold EP0
+                        # open forever. USB 2.0 s9.2.6.4 allows only 50 ms for
+                        # a no-data-stage status phase.
+                        m.d.comb += relay.response_ack.eq(1)
+                        m.next = "STALL"
+
+                with m.State("RESPOND"):
+                    m.d.comb += [
+                        relay.read_addr.eq(response_cursor),
+                        interface.tx.payload.eq(relay.read_data),
+                    ]
+                    with m.If(interface.data_requested):
+                        with m.If(response_cursor < relay.response_length):
+                            m.d.comb += [
+                                interface.tx.valid.eq(1),
+                                interface.tx.first.eq(response_cursor == 0),
+                                interface.tx.last.eq(
+                                    response_cursor == (relay.response_length - 1)
+                                ),
+                            ]
+                            with m.If(interface.tx.ready):
+                                m.d.usb += response_cursor.eq(response_cursor + 1)
+                        with m.Else():
+                            m.d.comb += self.send_zlp()
+                    with m.If(interface.status_requested):
+                        m.d.comb += [
+                            handshake_generator.ack.eq(1),
+                            relay.response_ack.eq(1),
+                        ]
+                        m.next = "IDLE"
+
                 with m.State("ACK_STATUS"):
                     with m.If(interface.status_requested):
                         m.d.comb += handshake_generator.ack.eq(1)
                         m.next = "IDLE"
+
                 with m.State("STALL"):
                     with m.If(interface.data_requested | interface.status_requested):
                         m.d.comb += handshake_generator.stall.eq(1)
