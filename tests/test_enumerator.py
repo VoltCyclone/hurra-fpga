@@ -1538,3 +1538,54 @@ def test_force_full_speed_suppresses_the_chirp_entirely() -> None:
         assert not ctx.get(dut.high_speed)
 
     simulate_with(CHIRP_TIMING, bench)
+
+
+def test_relay_owns_control_engine_after_ready() -> None:
+    """Once enumeration completes, the relay's request reaches the engine.
+
+    The enumerator is the sole Amaranth driver of ``control.*``, so ownership
+    has to transfer inside it -- host.py cannot mux those signals without
+    creating a second driver.
+    """
+
+    async def bench(ctx, dut, control, timing) -> None:
+        await power_attach_and_reset(ctx, dut, timing)
+        await serve_all(ctx, dut, control, descriptor_requests())
+        await settle(ctx)
+        assert ctx.get(dut.ready)
+
+        ctx.set(dut.relay_request_type, 0xA1)
+        ctx.set(dut.relay_request, 0x01)
+        ctx.set(dut.relay_value, 0x03F2)
+        ctx.set(dut.relay_index, 3)
+        ctx.set(dut.relay_length, 16)
+        ctx.set(dut.relay_start, 1)
+        await settle(ctx)
+
+        assert ctx.get(dut.control.request_type) == 0xA1
+        assert ctx.get(dut.control.request) == 0x01
+        assert ctx.get(dut.control.value) == 0x03F2
+        assert ctx.get(dut.control.start) == 1
+
+    simulate(bench)
+
+
+def test_relay_is_ignored_before_enumeration_completes() -> None:
+    """Before ready, the enumeration FSM must keep full ownership.
+
+    Without this, a relay request racing enumeration would corrupt a
+    descriptor fetch mid-flight.
+    """
+
+    async def bench(ctx, dut, control, timing) -> None:
+        await power_attach_and_reset(ctx, dut, timing)
+        assert not ctx.get(dut.ready)
+
+        ctx.set(dut.relay_request_type, 0xA1)
+        ctx.set(dut.relay_request, 0x01)
+        ctx.set(dut.relay_start, 1)
+        await settle(ctx)
+
+        assert ctx.get(dut.control.request_type) != 0xA1
+
+    simulate(bench)

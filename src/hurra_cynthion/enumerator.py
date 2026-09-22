@@ -120,6 +120,23 @@ class BoundedMouseEnumerator(Elaboratable):
             [Signal(16, name=f"ep_report_length_{k}") for k in range(MAX_ENDPOINTS)]
         )
 
+        # Post-enumeration control ownership.
+        #
+        # This enumerator is the only Amaranth driver of ``control.*`` -- it
+        # sets blanket defaults every cycle and overrides them per state. A
+        # second module driving those signals is a driver conflict, not a mux,
+        # so the control relay cannot reach the engine from host.py. Ownership
+        # therefore transfers here instead: while ``ready`` is high these
+        # inputs are forwarded to the engine verbatim.
+        self.relay_start = Signal()
+        self.relay_request_type = Signal(8)
+        self.relay_request = Signal(8)
+        self.relay_value = Signal(16)
+        self.relay_index = Signal(16)
+        self.relay_length = Signal(16)
+        self.relay_out_payload = Signal(8)
+        self.relay_data_ready = Signal()
+
     def elaborate(self, platform) -> Module:
         del platform
         m = Module()
@@ -1237,5 +1254,23 @@ class BoundedMouseEnumerator(Elaboratable):
                     m.next = "POWER_OFF"
                 with m.Elif(detached):
                     go_detached()
+
+        # Hand the control engine to the relay once enumeration has finished.
+        #
+        # Placed after the FSM so it overrides both the blanket defaults above
+        # and anything a state drives. That is safe because ``ready`` only goes
+        # high in the terminal state, which issues no control requests of its
+        # own -- so there is no cycle where both want the engine.
+        with m.If(self.ready):
+            m.d.comb += [
+                control.start.eq(self.relay_start),
+                control.request_type.eq(self.relay_request_type),
+                control.request.eq(self.relay_request),
+                control.value.eq(self.relay_value),
+                control.index.eq(self.relay_index),
+                control.length.eq(self.relay_length),
+                control.out_payload.eq(self.relay_out_payload),
+                control.data_ready.eq(self.relay_data_ready),
+            ]
 
         return m
