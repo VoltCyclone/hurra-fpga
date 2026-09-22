@@ -359,8 +359,24 @@ class HIDClassRequestHandler(USBRequestHandler):
                 return m
 
             defer_timer = Signal(range(self._timeout_cycles + 1))
-            response_cursor = Signal(range(DESCRIPTOR_STORE_SIZE))
+            # Size the cursor to the RELAY's buffer, not to the descriptor
+            # store. relay.read_addr is only wide enough for that buffer, and
+            # Amaranth's .eq() truncates silently -- a wider cursor would wrap
+            # the address back through zero on any response longer than the
+            # buffer and hand the host corrupted bytes with no error signal.
+            relay_buffer_bytes = 1 << len(relay.read_addr)
+            response_cursor = Signal(range(relay_buffer_bytes + 1))
             out_cursor = Signal(16)
+            # A target that reports more bytes than the buffer can hold must
+            # not be able to drive the cursor past the end.
+            response_limit = Signal(range(relay_buffer_bytes + 1))
+            m.d.comb += response_limit.eq(
+                Mux(
+                    relay.response_length > relay_buffer_bytes,
+                    relay_buffer_bytes,
+                    relay.response_length,
+                )
+            )
 
             # LUNA's SetupPacket has no raw bmRequestType byte: it splits the
             # byte into recipient[5] / type[2] / is_in_request[1], which is
@@ -371,6 +387,11 @@ class HIDClassRequestHandler(USBRequestHandler):
             with m.FSM(domain="usb"):
                 with m.State("IDLE"):
                     m.d.usb += [defer_timer.eq(0), response_cursor.eq(0), out_cursor.eq(0)]
+                    # We have claimed the request but have nothing to say yet.
+                    # Driving nothing would be bus SILENCE, which the host
+                    # reads as a transaction error rather than flow control.
+                    with m.If(interface.data_requested | interface.status_requested):
+                        m.d.comb += handshake_generator.nak.eq(1)
                     with m.If(setup.received):
                         with m.Switch(setup.request):
                             with m.Case(_HID_SET_IDLE, _HID_SET_PROTOCOL):
@@ -398,6 +419,14 @@ class HIDClassRequestHandler(USBRequestHandler):
                                         m.next = "CAPTURE_OUT"
 
                 with m.State("CAPTURE_OUT"):
+                    # Same reasoning as IDLE: a stray IN or status strobe
+                    # during the OUT data stage must get a handshake, not
+                    # silence.
+                    with m.If(
+                        (interface.data_requested | interface.status_requested)
+                        & ~interface.rx_ready_for_response
+                    ):
+                        m.d.comb += handshake_generator.nak.eq(1)
                     # LUNA's OUT stream has NO backpressure and no buffer: a
                     # byte exists only on the cycle rx.valid & rx.next is
                     # high, so it must be forwarded the same cycle or lost.
@@ -447,13 +476,11 @@ class HIDClassRequestHandler(USBRequestHandler):
                         interface.tx.payload.eq(relay.read_data),
                     ]
                     with m.If(interface.data_requested):
-                        with m.If(response_cursor < relay.response_length):
+                        with m.If(response_cursor < response_limit):
                             m.d.comb += [
                                 interface.tx.valid.eq(1),
                                 interface.tx.first.eq(response_cursor == 0),
-                                interface.tx.last.eq(
-                                    response_cursor == (relay.response_length - 1)
-                                ),
+                                interface.tx.last.eq(response_cursor == (response_limit - 1)),
                             ]
                             with m.If(interface.tx.ready):
                                 m.d.usb += response_cursor.eq(response_cursor + 1)

@@ -935,3 +935,64 @@ def test_timeout_still_releases_the_relay_or_pollers_starve_forever() -> None:
         )
 
     _simulate_handler(bench, timeout_cycles=64)
+
+
+def test_oversized_relay_response_cannot_wrap_the_read_address() -> None:
+    """Regression: the response cursor must be bounded by the relay buffer.
+
+    ``relay.read_addr`` is only as wide as the relay's 64-byte buffer, and
+    Amaranth's ``.eq()`` truncates silently. A cursor sized to anything
+    larger would wrap back through zero on a response longer than the
+    buffer and hand the host corrupted bytes with no error signal -- which
+    would silently break exactly the crypto-auth responses this path exists
+    to carry.
+    """
+
+    async def bench(ctx, dut, relay) -> None:
+        await _send_setup(
+            ctx,
+            dut,
+            request_type=0xA1,
+            request=HID_GET_REPORT,
+            value=0x03F1,
+            index=3,
+            length=64,
+        )
+        # A misbehaving target claims to have returned far more than fits.
+        ctx.set(relay.response_length, 4096)
+        ctx.set(relay.response_valid, 1)
+        ctx.set(relay.response_error, 0)
+        await ctx.tick("usb")
+        await ctx.tick("usb")
+
+        # Drain more packets than the buffer holds; the address must never
+        # wrap back to a byte it already served.
+        # data_requested must stay high ACROSS the clock edge: the cursor
+        # advances in m.d.usb, so deasserting it before the edge would mean
+        # it never increments and the test would prove nothing.
+        seen = []
+        last_at = None
+        ctx.set(dut.interface.tx.ready, 1)
+        for _ in range(80):
+            ctx.set(dut.interface.data_requested, 1)
+            await ctx.delay(1e-9)
+            if ctx.get(dut.interface.tx.valid):
+                if ctx.get(dut.interface.tx.last) and last_at is None:
+                    last_at = len(seen)
+                seen.append(ctx.get(relay.read_addr))
+            await ctx.tick("usb")
+
+        # The data phase must walk the buffer exactly once, in order, and
+        # END there. read_addr alone cannot prove this -- it reads 0 both
+        # when the cursor wraps and when the transfer is legitimately over --
+        # so the discriminator is tx.last: bounded, it lands on the 64th
+        # byte; unbounded, the handler would keep streaming toward the
+        # target's claimed 4096 and never assert it inside this window.
+        assert seen[:64] == list(range(64)), f"data phase did not walk 0..63: {seen[:70]}"
+        assert all(addr < 64 for addr in seen), f"read_addr left the buffer: {seen}"
+        assert last_at == 63, (
+            f"tx.last landed at {last_at}, not on the 64th byte -- the cursor "
+            f"is not bounded by the relay buffer and is wrapping"
+        )
+
+    _simulate_handler(bench, timeout_cycles=100000)
