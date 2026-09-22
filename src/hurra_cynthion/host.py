@@ -7,6 +7,7 @@ from amaranth import Array, Cat, DomainRenamer, Elaboratable, Module, Mux, Signa
 from luna.gateware.interface.utmi import UTMIInterface
 
 from .control import USBControlTransferEngine
+from .control_relay import ControlRelay
 from .descriptors import MAX_ENDPOINTS, DescriptorStore
 from .enumerator import BoundedMouseEnumerator
 from .poller import InterruptInPoller
@@ -222,6 +223,7 @@ class BoundedMouseHost(Elaboratable):
             control=self.control,
             descriptor_store=self.descriptor_store,
         )
+        self.control_relay = ControlRelay()
         self.scheduler = FrameScheduler(timing)
 
         # One interrupt poller per capturable endpoint, all sharing the single
@@ -322,6 +324,7 @@ class BoundedMouseHost(Elaboratable):
         m.submodules.enumerator = self.enumerator
         m.submodules.scheduler = DomainRenamer({"sync": "usb"})(self.scheduler)
         m.submodules.arbiter = self.arbiter
+        m.submodules.control_relay = relay = self.control_relay
         m.submodules.report_merge = self.merge
         for k, poller in enumerate(self.pollers):
             m.submodules[f"poller_{k}"] = poller
@@ -390,7 +393,30 @@ class BoundedMouseHost(Elaboratable):
             self.scheduler.high_speed.eq(enumerator.high_speed),
             self.transaction.high_speed.eq(enumerator.high_speed),
             self.scheduler.token_ready.eq(self.arbiter.sof_ready),
-            self.arbiter.control_phase.eq(~enumerator.ready),
+            # The relay preempts the pollers while a forward is in flight.
+            # Report gaps of a few frames at connect and on re-auth are
+            # ordinary USB; starving the auth handshake is not.
+            self.arbiter.control_phase.eq(~enumerator.ready | relay.request_pending),
+            # Relay -> engine, by way of the enumerator, which is the only
+            # module permitted to drive control.* (see its port comment).
+            enumerator.relay_start.eq(relay.ctl_start),
+            enumerator.relay_request_type.eq(relay.ctl_request_type),
+            enumerator.relay_request.eq(relay.ctl_request),
+            enumerator.relay_value.eq(relay.ctl_value),
+            enumerator.relay_index.eq(relay.ctl_index),
+            enumerator.relay_length.eq(relay.ctl_length),
+            enumerator.relay_out_payload.eq(relay.ctl_out_payload),
+            enumerator.relay_data_ready.eq(relay.ctl_data_ready),
+            # Engine -> relay.
+            relay.ctl_busy.eq(self.control.busy),
+            relay.ctl_done.eq(self.control.done),
+            relay.ctl_status.eq(self.control.status),
+            relay.ctl_transferred.eq(self.control.transferred),
+            relay.ctl_data.eq(self.control.data),
+            relay.ctl_data_valid.eq(self.control.data_valid),
+            relay.ctl_data_first.eq(self.control.data_first),
+            relay.ctl_data_last.eq(self.control.data_last),
+            relay.ctl_out_index.eq(self.control.out_index),
             self.arbiter.connected.eq(enumerator.connected),
             self.arbiter.sof_start.eq(self.scheduler.sof_start),
             self.arbiter.sof_frame.eq(self.scheduler.frame_number),

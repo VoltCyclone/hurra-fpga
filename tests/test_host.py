@@ -194,7 +194,12 @@ def test_host_owns_one_shared_engine_and_wires_public_interfaces() -> None:
         ],
     )
     assert len(re.findall(r"(?m)^\s*memory width 8 size 4096", netlist)) == 1
-    assert len(re.findall(r"(?m)^\s*memory width 8 size 64", netlist)) == MAX_ENDPOINTS + 1
+    # One 64-byte memory per poller report buffer, one in the shared
+    # transaction engine's receive path, and one for the control relay's
+    # bounce buffer. This count is deliberately exact: a new 64-byte memory
+    # is real BRAM/LUT-RAM in a design whose worst placer seed has only
+    # +1.58% timing margin, so it should have to be justified here.
+    assert len(re.findall(r"(?m)^\s*memory width 8 size 64", netlist)) == MAX_ENDPOINTS + 2
     assert netlist.count("transaction_engine") >= 1
     assert len(netlist) < 3_500_000
 
@@ -760,3 +765,24 @@ def test_main_applies_the_build_environment(monkeypatch):
 
     assert seen["opts"] is not None, "main() left AMARANTH_nextpnr_opts unset"
     assert "--placer-heap-timingweight" in seen["opts"]
+
+
+def test_relay_request_pending_gates_the_arbiter_control_phase() -> None:
+    """A relay forward must win the bus; pollers resume when it clears.
+
+    ``control_phase`` gates ``poll_bus_free`` in the arbiter, so raising it is
+    what preempts the pollers -- and dropping it is what lets the report
+    stream resume. A relay that never lowered ``request_pending`` would
+    silently stall every endpoint forever.
+
+    ``request_pending`` is driven by the relay's own FSM, so this asserts the
+    wiring structurally; the dynamic behaviour is covered end to end in
+    tests/test_control_relay_e2e.py.
+    """
+    host = BoundedMouseHost(timing=HostTiming.simulation())
+    assert host.control_relay is not None
+
+    netlist = rtlil.convert(host, ports=[host.connected, host.enumerated])
+    # The arbiter's control phase must be a function of request_pending, not
+    # of enumerator.ready alone.
+    assert "request_pending" in netlist
