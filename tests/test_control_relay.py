@@ -81,3 +81,70 @@ def test_in_transfer_is_forwarded_verbatim():
         assert ctx.get(dut.request_pending) == 0
 
     simulate(bench)
+
+
+def test_out_transfer_payload_is_replayed_to_target():
+    payload = [0xF0, 0x01] + list(range(62))
+
+    async def bench(ctx, dut):
+        ctx.set(dut.request_type, 0x21)  # host->device, class, interface
+        ctx.set(dut.request, 0x09)  # SET_REPORT
+        ctx.set(dut.value, 0x03F0)
+        ctx.set(dut.index, 3)
+        ctx.set(dut.length, len(payload))
+        ctx.set(dut.request_valid, 1)
+        await ctx.tick("usb").until(dut.request_ready)
+        ctx.set(dut.request_valid, 0)
+
+        for byte in payload:
+            ctx.set(dut.out_data, byte)
+            ctx.set(dut.out_valid, 1)
+            await ctx.tick("usb")
+        ctx.set(dut.out_valid, 0)
+        await ctx.tick("usb").until(dut.ctl_start)
+
+        # The relay must hand the engine each captured byte on demand.
+        for offset, byte in enumerate(payload):
+            ctx.set(dut.ctl_out_index, offset)
+            await ctx.tick("usb")
+            assert ctx.get(dut.ctl_out_payload) == byte, f"byte {offset}"
+
+    simulate(bench)
+
+
+def test_oversized_request_is_rejected_not_truncated():
+    async def bench(ctx, dut):
+        ctx.set(dut.request_type, 0xA1)
+        ctx.set(dut.request, 0x01)
+        ctx.set(dut.value, 0)
+        ctx.set(dut.index, 0)
+        ctx.set(dut.length, 65)  # one past the 64-byte buffer
+        ctx.set(dut.request_valid, 1)
+        await ctx.tick("usb").until(dut.request_ready)
+        ctx.set(dut.request_valid, 0)
+        await ctx.tick("usb").until(dut.response_valid)
+
+        assert ctx.get(dut.overflow) == 1
+        assert ctx.get(dut.response_error) == 1
+        assert ctx.get(dut.ctl_start) == 0, "must not issue an oversized transfer"
+
+    simulate(bench)
+
+
+def test_unresponsive_target_times_out():
+    async def bench(ctx, dut):
+        ctx.set(dut.request_type, 0xA1)
+        ctx.set(dut.request, 0x01)
+        ctx.set(dut.value, 0)
+        ctx.set(dut.index, 0)
+        ctx.set(dut.length, 8)
+        ctx.set(dut.request_valid, 1)
+        await ctx.tick("usb").until(dut.request_ready)
+        ctx.set(dut.request_valid, 0)
+
+        # ctl_done is never asserted: the target is wedged.
+        await ctx.tick("usb").until(dut.response_valid)
+        assert ctx.get(dut.timed_out) == 1
+        assert ctx.get(dut.response_error) == 1
+
+    simulate(bench, timeout_cycles=64)

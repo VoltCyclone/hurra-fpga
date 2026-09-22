@@ -12,7 +12,7 @@ data stage.
 
 # ruff: noqa: SIM117
 
-from amaranth import Elaboratable, Module, Signal, unsigned
+from amaranth import Elaboratable, Module, Mux, Signal, unsigned
 from amaranth.lib.memory import Memory
 
 
@@ -71,6 +71,7 @@ class ControlRelay(Elaboratable):
         m.submodules.buffer = buffer
         write_port = buffer.write_port(domain="usb")
         read_port = buffer.read_port(domain="comb")
+        out_read_port = buffer.read_port(domain="comb")
 
         latched_type = Signal(8)
         latched_request = Signal(8)
@@ -84,9 +85,22 @@ class ControlRelay(Elaboratable):
         # (as the target's IN data stage may hold it) is not consumed twice.
         gap = Signal()
 
+        # Direction lives in bit 7 of bmRequestType: 1 = device->host.
+        is_in_transfer = latched_type[7]
+
+        # The control engine indexes the OUT payload with a 16-bit counter,
+        # but the buffer address is only wide enough for buffer_bytes. Slicing
+        # the low bits would silently wrap past the end and serve an unrelated
+        # byte as if it were payload, so bound it explicitly and serve zero
+        # out of range -- a wrong byte is far worse than a zero byte, because
+        # the target would sign it as if it were the host's data.
+        out_index_in_range = self.ctl_out_index < self._buffer_bytes
+
         m.d.comb += [
             read_port.addr.eq(self.read_addr),
             self.read_data.eq(read_port.data),
+            out_read_port.addr.eq(Mux(out_index_in_range, self.ctl_out_index, 0)),
+            self.ctl_out_payload.eq(Mux(out_index_in_range, out_read_port.data, 0)),
             self.ctl_request_type.eq(latched_type),
             self.ctl_request.eq(latched_request),
             self.ctl_value.eq(latched_value),
@@ -116,8 +130,30 @@ class ControlRelay(Elaboratable):
                     with m.If(self.length > self._buffer_bytes):
                         m.d.usb += [self.overflow.eq(1), self.response_error.eq(1)]
                         m.next = "COMPLETE"
-                    with m.Else():
+                    with m.Elif(self.request_type[7] | (self.length == 0)):
+                        # Device->host, or no data stage at all: nothing to
+                        # collect from the AUX side before issuing.
                         m.next = "ISSUE"
+                    with m.Else():
+                        m.next = "CAPTURE_OUT"
+
+            with m.State("CAPTURE_OUT"):
+                # Host->device. Take the payload from the AUX side into the
+                # bounce buffer before issuing, so the control engine can
+                # index it at its own pace during the OUT data stage.
+                with m.If(self.out_valid):
+                    m.d.comb += [
+                        write_port.addr.eq(cursor),
+                        write_port.data.eq(self.out_data),
+                        write_port.en.eq(1),
+                    ]
+                    m.d.usb += cursor.eq(cursor + 1)
+                with m.If(cursor + self.out_valid >= latched_length):
+                    # Rewind for the engine's own indexing. This assignment is
+                    # later than the increment above, and Amaranth takes the
+                    # last, so the final byte is still written.
+                    m.d.usb += cursor.eq(0)
+                    m.next = "ISSUE"
 
             with m.State("ISSUE"):
                 m.d.comb += self.ctl_start.eq(1)
@@ -125,7 +161,7 @@ class ControlRelay(Elaboratable):
 
             with m.State("AWAIT"):
                 m.d.usb += timer.eq(timer + 1)
-                with m.If(~gap):
+                with m.If(~gap & is_in_transfer):
                     m.d.comb += self.ctl_data_ready.eq(1)
                     with m.If(self.ctl_data_valid):
                         m.d.comb += [
