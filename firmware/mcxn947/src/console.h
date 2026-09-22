@@ -33,6 +33,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "fault.h"
+
 // Longest command line accepted. Anything longer is truncated at the limit
 // and the line is still dispatched -- an overlong line is a typo or line
 // noise, and silently discarding it would look like the console had hung.
@@ -114,6 +116,11 @@ typedef struct {
     // instrument section 9 step 5 configuration (c) is measured with.
     void (*cpu1_halt)(void *ctx);
     void (*cpu1_start)(void *ctx);
+
+    // Intentionally destructive diagnostic. A supported action does not
+    // return on target; host tests return true after recording the route.
+    // False makes an unsupported or unexpectedly non-faulting action visible.
+    bool (*fault_inject)(void *ctx, fault_injection_t injection);
     void *ctx;
 } console_ops_t;
 

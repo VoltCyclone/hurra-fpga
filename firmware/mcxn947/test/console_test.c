@@ -58,6 +58,9 @@ static capture_t g_capture;
 
 static uint32_t g_cpu1_halts;
 static uint32_t g_cpu1_starts;
+static uint32_t g_fault_injections;
+static fault_injection_t g_last_fault_injection;
+static bool g_fault_injection_supported;
 
 static void capture_cpu1_halt(void *ctx)
 {
@@ -71,6 +74,14 @@ static void capture_cpu1_start(void *ctx)
     g_cpu1_starts++;
 }
 
+static bool capture_fault_injection(void *ctx, fault_injection_t injection)
+{
+    (void)ctx;
+    g_fault_injections++;
+    g_last_fault_injection = injection;
+    return g_fault_injection_supported;
+}
+
 static void setup(uint32_t budget)
 {
     memset(&g_capture, 0, sizeof(g_capture));
@@ -78,12 +89,16 @@ static void setup(uint32_t budget)
     g_stats_calls = 0u;
     g_cpu1_halts = 0u;
     g_cpu1_starts = 0u;
+    g_fault_injections = 0u;
+    g_last_fault_injection = FAULT_INJECTION_USAGE;
+    g_fault_injection_supported = true;
 
     const console_ops_t ops = {
         .write = capture_write,
         .stats = capture_stats,
         .cpu1_halt = capture_cpu1_halt,
         .cpu1_start = capture_cpu1_start,
+        .fault_inject = capture_fault_injection,
         .ctx = &g_capture,
     };
     console_init(&ops);
@@ -378,6 +393,8 @@ static void test_help_and_version(void)
     feed("help\r");
     assert(captured("stats"));
     assert(captured("flood"));
+    assert(captured("fault"));
+    assert(captured("HALTS"));
 
     setup(0xFFFFFFFFu);
     feed("?\r");
@@ -386,6 +403,53 @@ static void test_help_and_version(void)
     setup(0xFFFFFFFFu);
     feed("version\r");
     assert(captured("mcxn947"));
+}
+
+static void test_fault_requires_a_known_explicit_subcommand(void)
+{
+    setup(0xFFFFFFFFu);
+    feed("fault\r");
+    assert(g_fault_injections == 0u);
+    assert(captured("usage: fault"));
+
+    setup(0xFFFFFFFFu);
+    feed("fault mem\r");
+    assert(g_fault_injections == 0u);
+    assert(captured("usage: fault"));
+}
+
+static void test_each_fault_subcommand_routes_to_its_action(void)
+{
+    static const struct {
+        const char *command;
+        const char *name;
+        fault_injection_t injection;
+    } cases[] = {
+        {"fault usage\r", "UsageFault", FAULT_INJECTION_USAGE},
+        {"fault bus\r", "BusFault", FAULT_INJECTION_BUS},
+        {"fault hard\r", "HardFault", FAULT_INJECTION_HARD},
+        {"fault stack\r", "stack overflow", FAULT_INJECTION_STACK},
+        {"fault fp\r", "FP extended frame", FAULT_INJECTION_FP},
+    };
+
+    for (uint32_t i = 0u; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        setup(0xFFFFFFFFu);
+        feed(cases[i].command);
+        assert(g_fault_injections == 1u);
+        assert(g_last_fault_injection == cases[i].injection);
+        assert(captured("WILL HALT"));
+        assert(captured(cases[i].name));
+    }
+}
+
+static void test_unsupported_fault_is_rejected_visibly(void)
+{
+    setup(0xFFFFFFFFu);
+    g_fault_injection_supported = false;
+    feed("fault fp\r");
+    assert(g_fault_injections == 1u);
+    assert(g_last_fault_injection == FAULT_INJECTION_FP);
+    assert(captured("did not trap or is unsupported"));
 }
 
 static void test_greet(void)
@@ -617,6 +681,9 @@ int main(void)
     test_stats_distinguishes_no_image_from_crashed();
     test_stats_reports_link_down();
     test_help_and_version();
+    test_fault_requires_a_known_explicit_subcommand();
+    test_each_fault_subcommand_routes_to_its_action();
+    test_unsupported_fault_is_rejected_visibly();
     test_greet();
     test_flood_runs_and_stops();
     test_flood_yields_when_the_writer_is_full();

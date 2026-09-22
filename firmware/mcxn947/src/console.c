@@ -107,7 +107,7 @@ static bool console_equal(const char *a, const char *b)
 
 // `name` matched, and the rest of the line is either empty or begins with a
 // space. Returns the first argument character (possibly the terminator) or NULL
-// when `name` is not the command on this line. Only `kmmode` takes an argument;
+// when `name` is not the command on this line. `kmmode` and `fault` use this;
 // every other command is an exact match.
 static const char *console_argument(const char *line, const char *name)
 {
@@ -136,7 +136,8 @@ static void cmd_help(void)
                 "  flood    saturate this pipe until a key is pressed\r\n"
                 "  cpu1halt hold CPU1 in reset (the link must not notice)\r\n"
                 "  cpu1start release CPU1 again\r\n"
-                "  kmmode   KMBox/MAKCU command input: off|makcu|kmbox\r\n");
+                "  kmmode   KMBox/MAKCU command input: off|makcu|kmbox\r\n"
+                "  fault    DANGER: HALTS MCU; usage|bus|hard|stack|fp\r\n");
 }
 
 static const char *km_mode_name(kmcmd_mode_t mode)
@@ -322,13 +323,57 @@ static void cmd_cpu1(bool start)
     console_put(start ? "cpu1 release requested\r\n" : "cpu1 held in reset\r\n");
 }
 
+static void fault_usage(void)
+{
+    console_put("usage: fault usage|bus|hard|stack|fp (DANGER: HALTS MCU)\r\n");
+}
+
+static void cmd_fault(const char *argument)
+{
+    fault_injection_t injection;
+    const char *intent;
+
+    if (console_equal(argument, "usage")) {
+        injection = FAULT_INJECTION_USAGE;
+        intent = "UsageFault (UDF)";
+    } else if (console_equal(argument, "bus")) {
+        injection = FAULT_INJECTION_BUS;
+        intent = "BusFault (reserved-address read)";
+    } else if (console_equal(argument, "hard")) {
+        injection = FAULT_INJECTION_HARD;
+        intent = "HardFault (forced BusFault escalation)";
+    } else if (console_equal(argument, "stack")) {
+        injection = FAULT_INJECTION_STACK;
+        intent = "stack overflow (MSPLIM)";
+    } else if (console_equal(argument, "fp")) {
+        injection = FAULT_INJECTION_FP;
+        intent = "FP extended frame plus UsageFault";
+    } else {
+        fault_usage();
+        return;
+    }
+
+    if (s_ops.fault_inject == NULL) {
+        console_put("fault injection unavailable on this build\r\n");
+        return;
+    }
+
+    console_put("WARNING: fault injection WILL HALT MCU; provoking ");
+    console_put(intent);
+    console_put("\r\n");
+    if (!s_ops.fault_inject(s_ops.ctx, injection)) {
+        console_put("fault injection did not trap or is unsupported on this core\r\n");
+    }
+}
+
 static void console_dispatch(void)
 {
     s_line[s_length] = '\0';
 
-    // `kmmode` is the only command that takes an argument, so its match is
-    // resolved once here rather than inside the chain below.
+    // Argument-taking built-ins are resolved once here rather than inside the
+    // exact-match chain below.
     const char *const km_argument = console_argument(s_line, "kmmode");
+    const char *const fault_argument = console_argument(s_line, "fault");
 
     if (s_overflowed) {
         // Say so rather than acting on a truncated line: acting would run
@@ -348,6 +393,8 @@ static void console_dispatch(void)
         cmd_cpu1(false);
     } else if (console_equal(s_line, "cpu1start")) {
         cmd_cpu1(true);
+    } else if (fault_argument != NULL) {
+        cmd_fault(fault_argument);
     } else if (km_argument != NULL) {
         cmd_kmmode(km_argument);
     } else {

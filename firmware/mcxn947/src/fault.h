@@ -18,6 +18,14 @@ typedef enum {
     FAULT_STACK_PSP = 1,
 } fault_stack_source_t;
 
+typedef enum {
+    FAULT_INJECTION_USAGE = 0,
+    FAULT_INJECTION_BUS = 1,
+    FAULT_INJECTION_HARD = 2,
+    FAULT_INJECTION_STACK = 3,
+    FAULT_INJECTION_FP = 4,
+} fault_injection_t;
+
 // CFSR cause bits. Kept as architectural literals so the portable decoder has
 // no CMSIS dependency; target-only static assertions below hold them to CMSIS.
 #define FAULT_CAUSE_IACCVIOL   0x00000001u
@@ -67,6 +75,7 @@ typedef struct {
 } fault_diagnosis_t;
 
 fault_stack_source_t fault_stack_source(uint32_t exc_return);
+bool fault_frame_is_extended(uint32_t exc_return);
 const uint32_t *fault_stacked_frame(const uint32_t *msp, const uint32_t *psp,
                                     uint32_t exc_return);
 fault_diagnosis_t fault_decode(fault_kind_t kind, uint32_t cfsr,
@@ -77,6 +86,12 @@ uint32_t fault_format_causes(uint32_t cause_flags, char *out,
                              uint32_t capacity);
 
 void fault_handlers_init(void);
+
+// Deliberately provoke one of the faults above. Supported injections do not
+// return. False means either that this core cannot perform the request (FP on
+// core1) or that a fallible provocation unexpectedly returned (the reserved
+// bus address responded); the console makes either failure visible.
+bool fault_inject(fault_injection_t injection);
 
 void HardFault_Handler(void);
 void MemManage_Handler(void);

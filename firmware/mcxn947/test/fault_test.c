@@ -18,6 +18,14 @@ static void test_exc_return_selects_the_interrupted_stack(void)
     assert(fault_stack_source(0x00000004u) == FAULT_STACK_PSP);
 }
 
+static void test_exc_return_reports_basic_and_extended_frames(void)
+{
+    assert(!fault_frame_is_extended(0xFFFFFFF9u));
+    assert(fault_frame_is_extended(0xFFFFFFE9u));
+    assert(!fault_frame_is_extended(0xFFFFFFFDu));
+    assert(fault_frame_is_extended(0xFFFFFFEDu));
+}
+
 static void test_shipped_frame_selection_uses_exact_stack_base(void)
 {
     uint32_t msp[26] = {0};
@@ -132,6 +140,7 @@ static void test_decode_rejects_unmarked_fault_addresses(void)
 int main(void)
 {
     test_exc_return_selects_the_interrupted_stack();
+    test_exc_return_reports_basic_and_extended_frames();
     test_shipped_frame_selection_uses_exact_stack_base();
     test_every_required_cfsr_subcause_has_the_right_name();
     test_additional_lazy_state_errors_are_not_hidden();

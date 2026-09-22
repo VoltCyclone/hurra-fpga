@@ -339,11 +339,18 @@ static void usb_console_cpu1_start(void *ctx)
     (void)core1_release();
 }
 
+static bool usb_console_fault_inject(void *ctx, fault_injection_t injection)
+{
+    (void)ctx;
+    return fault_inject(injection);
+}
+
 static const console_ops_t s_console_ops = {
     .write = usb_console_write,
     .stats = usb_console_stats,
     .cpu1_halt = usb_console_cpu1_halt,
     .cpu1_start = usb_console_cpu1_start,
+    .fault_inject = usb_console_fault_inject,
     .ctx = NULL,
 };
 

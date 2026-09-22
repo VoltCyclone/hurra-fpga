@@ -37,6 +37,14 @@ fault_stack_source_t fault_stack_source(uint32_t exc_return)
     return ((exc_return & 0x4u) != 0u) ? FAULT_STACK_PSP : FAULT_STACK_MSP;
 }
 
+bool fault_frame_is_extended(uint32_t exc_return)
+{
+    // EXC_RETURN[4] is zero when floating-point state belongs to the frame.
+    // With lazy stacking, the space may only be reserved; the architectural
+    // basic frame still begins at offset zero in either case.
+    return (exc_return & 0x10u) == 0u;
+}
+
 __attribute__((noinline))
 const uint32_t *fault_stacked_frame(const uint32_t *msp, const uint32_t *psp,
                                     uint32_t exc_return)
@@ -170,6 +178,41 @@ _Static_assert(FAULT_CFSR_MMARVALID == SCB_CFSR_MMARVALID_Msk,
 _Static_assert(FAULT_CFSR_BFARVALID == SCB_CFSR_BFARVALID_Msk,
                "BFARVALID mask must match CMSIS");
 
+// Architecturally reserved System-space address. The MCXN947 headers describe
+// no responder here, but only the bench can prove that the interconnect returns
+// a precise BusFault rather than a value on this silicon revision.
+#define FAULT_INJECTION_BUS_ADDRESS ((uintptr_t)0xFFFFFFF0u)
+
+__attribute__((noinline, noreturn))
+static void fault_inject_undefined_instruction(void)
+{
+    __asm volatile("udf #0");
+    __builtin_unreachable();
+}
+
+__attribute__((noinline))
+static void fault_inject_reserved_read(void)
+{
+    const volatile uint32_t *const address =
+        (const volatile uint32_t *)FAULT_INJECTION_BUS_ADDRESS;
+    (void)*address;
+}
+
+typedef void (*fault_recursion_fn_t)(uint32_t depth);
+
+__attribute__((noinline))
+static void fault_inject_recurse(uint32_t depth)
+{
+    // Volatile storage plus an indirect recursive call prevents tail-call and
+    // loop conversion: every level must consume MSP until MSPLIM objects.
+    volatile uint32_t frame[16];
+    fault_recursion_fn_t volatile recurse = fault_inject_recurse;
+    frame[0] = depth;
+    frame[15] = depth ^ 0x5A5A5A5Au;
+    recurse(depth + 1u);
+    __asm volatile("" : : "r"(frame[0]), "r"(frame[15]) : "memory");
+}
+
 #if defined(CPU_MCXN947VDF_cm33_core0)
 
 #include "dbg_uart.h"
@@ -195,7 +238,8 @@ static void fault_red_led_on(void)
     GPIO_PortClear(FAULT_RED_LED_GPIO, 1u << FAULT_RED_LED_PIN);
 }
 
-static void fault_debug_print(const fault_diagnosis_t *diagnosis)
+static void fault_debug_print(const fault_diagnosis_t *diagnosis,
+                              uint32_t exc_return)
 {
     char causes[FAULT_CAUSE_TEXT_MAX];
     (void)fault_format_causes(diagnosis->cause_flags, causes, sizeof(causes));
@@ -208,7 +252,12 @@ static void fault_debug_print(const fault_diagnosis_t *diagnosis)
     dbg_uart_emergency_hex32(diagnosis->cfsr);
     dbg_uart_emergency_puts(" HFSR=");
     dbg_uart_emergency_hex32(diagnosis->hfsr);
-    dbg_uart_emergency_puts("\nPC=");
+    dbg_uart_emergency_puts("\nEXC_RETURN=");
+    dbg_uart_emergency_hex32(exc_return);
+    dbg_uart_emergency_puts(" frame=");
+    dbg_uart_emergency_puts(fault_frame_is_extended(exc_return)
+                                ? "extended" : "basic");
+    dbg_uart_emergency_puts(" PC=");
     dbg_uart_emergency_hex32(diagnosis->frame.pc);
     dbg_uart_emergency_puts(" LR=");
     dbg_uart_emergency_hex32(diagnosis->frame.lr);
@@ -223,6 +272,47 @@ static void fault_debug_print(const fault_diagnosis_t *diagnosis)
         dbg_uart_emergency_hex32(diagnosis->bfar);
     }
     dbg_uart_emergency_puts("\n*** HALTED ***\n");
+}
+
+static void fault_inject_log(fault_injection_t injection)
+{
+    dbg_uart_emergency_puts("\n[fault-inject] provoking ");
+    switch (injection) {
+    case FAULT_INJECTION_USAGE:
+        dbg_uart_emergency_puts("UsageFault with UDF\n");
+        break;
+    case FAULT_INJECTION_BUS:
+        dbg_uart_emergency_puts("BusFault by reading 0xFFFFFFF0\n");
+        break;
+    case FAULT_INJECTION_HARD:
+        dbg_uart_emergency_puts("HardFault by forced BusFault escalation\n");
+        break;
+    case FAULT_INJECTION_STACK:
+        dbg_uart_emergency_puts("MSPLIM stack overflow\n");
+        break;
+    case FAULT_INJECTION_FP:
+        dbg_uart_emergency_puts(
+            "FP extended frame with volatile VMUL then UDF (lazy stacking enabled)\n");
+        break;
+    default:
+        dbg_uart_emergency_puts("unknown fault\n");
+        break;
+    }
+}
+
+__attribute__((noinline, noreturn))
+static void fault_inject_fp_context(void)
+{
+    volatile float left = 3.25f;
+    volatile float right = -1.5f;
+    volatile float product = left * right;
+
+    // Keep the volatile result live through the synchronous exception. FPCCR
+    // retains its reset-default lazy policy; EXC_RETURN[4], printed by the
+    // handler, is the assertion that this operation set FPCA.
+    __asm volatile("" : : "m"(product) : "memory");
+    __asm volatile("udf #0");
+    __builtin_unreachable();
 }
 
 #else
@@ -245,6 +335,58 @@ static void fault_cpu1_publish(const fault_diagnosis_t *diagnosis)
 }
 
 #endif
+
+bool fault_inject(fault_injection_t injection)
+{
+#if defined(CPU_MCXN947VDF_cm33_core0)
+    fault_inject_log(injection);
+#else
+    // This image is built for the no-FPU core with -mfloat-abi=soft. Never
+    // disguise that limitation by turning `fp` into an ordinary UsageFault.
+    if (injection == FAULT_INJECTION_FP) {
+        return false;
+    }
+#endif
+
+    switch (injection) {
+    case FAULT_INJECTION_USAGE:
+        fault_inject_undefined_instruction();
+    case FAULT_INJECTION_BUS:
+        fault_inject_reserved_read();
+        break;
+    case FAULT_INJECTION_HARD: {
+        const bool bus_fault_was_enabled =
+            (SCB->SHCSR & SCB_SHCSR_BUSFAULTENA_Msk) != 0u;
+        SCB->SHCSR &= ~SCB_SHCSR_BUSFAULTENA_Msk;
+        __DSB();
+        __ISB();
+        fault_inject_reserved_read();
+        if (bus_fault_was_enabled) {
+            SCB->SHCSR |= SCB_SHCSR_BUSFAULTENA_Msk;
+            __DSB();
+            __ISB();
+        }
+        break;
+    }
+    case FAULT_INJECTION_STACK:
+        fault_inject_recurse(0u);
+        break;
+    case FAULT_INJECTION_FP:
+#if defined(CPU_MCXN947VDF_cm33_core0)
+        fault_inject_fp_context();
+#else
+        return false;
+#endif
+    default:
+        return false;
+    }
+
+#if defined(CPU_MCXN947VDF_cm33_core0)
+    dbg_uart_emergency_puts(
+        "[fault-inject] ERROR: provocation returned without a fault\n");
+#endif
+    return false;
+}
 
 void fault_handlers_init(void)
 {
@@ -285,7 +427,7 @@ static void fault_dispatch(const uint32_t *msp, const uint32_t *psp,
         SCB->MMFAR, SCB->BFAR, frame);
 
 #if defined(CPU_MCXN947VDF_cm33_core0)
-    fault_debug_print(&diagnosis);
+    fault_debug_print(&diagnosis, exc_return);
 #else
     fault_cpu1_publish(&diagnosis);
 #endif
