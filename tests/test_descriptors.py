@@ -849,3 +849,52 @@ def test_nine_byte_audio_endpoint_descriptor_is_accepted() -> None:
     parsed = parse_mouse_configuration(_config_with_audio_isoc_endpoint())
     assert len(parsed.endpoints) == 1, "only the HID interrupt IN is captured"
     assert parsed.endpoints[0].endpoint_number == 3
+
+
+def _config_with_alt_settings() -> bytes:
+    """Two interfaces, one of which declares altsettings 0, 1 and 2.
+
+    bNumInterfaces is 2, not 4: alternate settings are extra descriptions of
+    an interface already counted, which is exactly what a DS4's
+    AudioStreaming interface does. bInterfaceProtocol stays 2 on the HID
+    interface so this fails only for the reason it is testing.
+    """
+    hid = _interface(0, 3, 1, 2, 0x83, 52)
+    audio_alt0 = bytes([9, 4, 1, 0, 0, 1, 2, 0, 0])
+    audio_alt1 = bytes([9, 4, 1, 1, 1, 1, 2, 0, 0]) + _audio_endpoint(0x01)
+    audio_alt2 = bytes([9, 4, 1, 2, 1, 1, 2, 0, 0]) + _audio_endpoint(0x01)
+    body = hid + audio_alt0 + audio_alt1 + audio_alt2
+    total = 9 + len(body)
+    header = bytes([9, 2, total & 0xFF, total >> 8, 2, 7, 0, 0x80, 50])
+    return header + body
+
+
+def test_alternate_settings_are_skipped_not_fatal() -> None:
+    """bNumInterfaces counts interfaces, not alternate settings.
+
+    Both aborting on alt != 0 and counting alt settings toward
+    interface_count make a DS4 unenumerable.
+    """
+    parsed = parse_mouse_configuration(_config_with_alt_settings())
+    assert len(parsed.endpoints) == 1, "alt-setting endpoints must not be captured"
+    assert parsed.endpoints[0].endpoint_number == 3
+
+
+def test_alt_setting_endpoints_are_not_captured_even_when_hid() -> None:
+    """A non-zero alt setting of a HID interface must still be skipped.
+
+    Otherwise the same physical endpoint is captured once per alt setting and
+    the endpoint table fills with duplicates.
+    """
+    hid_alt0 = _interface(0, 3, 1, 2, 0x83, 52)
+    hid_alt1 = (
+        bytes([9, 4, 0, 1, 1, 3, 1, 2, 0])
+        + bytes([9, 0x21, 0x11, 0x01, 0, 1, 0x22, 52, 0])
+        + bytes([7, 5, 0x84, 3, 8, 0, 10])
+    )
+    body = hid_alt0 + hid_alt1
+    total = 9 + len(body)
+    header = bytes([9, 2, total & 0xFF, total >> 8, 1, 7, 0, 0x80, 50])
+    parsed = parse_mouse_configuration(header + body)
+    assert len(parsed.endpoints) == 1
+    assert parsed.endpoints[0].endpoint_number == 3

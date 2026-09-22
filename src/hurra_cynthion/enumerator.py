@@ -200,6 +200,7 @@ class BoundedMouseEnumerator(Elaboratable):
         interface_count = Signal(range(MAX_INTERFACES + 2))
         declared_interfaces = Signal(8)
         cur_is_hid = Signal()
+        cur_alt_nonzero = Signal()
         cur_interface = Signal(8)
         cur_report_length = Signal(16)
         mouse_seen = Signal()
@@ -875,6 +876,7 @@ class BoundedMouseEnumerator(Elaboratable):
                             m.d.usb += [
                                 interface_count.eq(interface_count + 1),
                                 cur_is_hid.eq(0),
+                                cur_alt_nonzero.eq(0),
                                 cur_report_length.eq(0),
                             ]
                             with m.If(current_descriptor_length != 9):
@@ -920,8 +922,17 @@ class BoundedMouseEnumerator(Elaboratable):
                                 with m.Case(2):
                                     m.d.usb += cur_interface.eq(control.data)
                                 with m.Case(3):
+                                    # An alternate setting redescribes an
+                                    # interface bNumInterfaces already counts
+                                    # once. Skip its endpoints, and undo the
+                                    # increment taken at type-byte time two
+                                    # positions ago -- bAlternateSetting is not
+                                    # readable until now.
                                     with m.If(control.data != 0):
-                                        m.d.usb += unsupported.eq(1)
+                                        m.d.usb += [
+                                            cur_alt_nonzero.eq(1),
+                                            interface_count.eq(interface_count - 1),
+                                        ]
                                 with m.Case(5):
                                     m.d.usb += cur_is_hid.eq(control.data == 3)
                                 with m.Case(7):
@@ -989,7 +1000,9 @@ class BoundedMouseEnumerator(Elaboratable):
                             with m.Elif(current_descriptor_type == 5):
                                 # capture a HID interrupt-IN endpoint of the current interface;
                                 # OUT and non-interrupt endpoints are skipped.
-                                with m.If(cur_is_hid & ep_addr[7] & (ep_attrs[:2] == 3)):
+                                with m.If(
+                                    cur_is_hid & ~cur_alt_nonzero & ep_addr[7] & (ep_attrs[:2] == 3)
+                                ):
                                     with m.If(
                                         (ep_addr[4:7] != 0)
                                         | (ep_addr[:4] == 0)

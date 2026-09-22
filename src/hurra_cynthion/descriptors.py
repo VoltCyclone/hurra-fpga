@@ -845,6 +845,7 @@ def parse_mouse_configuration(data: bytes) -> MouseConfiguration:
     interface_count = 0
     has_mouse = False
     current_is_hid = False
+    current_alt_nonzero = False
     current_interface = 0
     current_report_length = 0
 
@@ -863,11 +864,16 @@ def parse_mouse_configuration(data: bytes) -> MouseConfiguration:
         if descriptor_type == 4:
             if descriptor_length != 9:
                 raise MalformedDescriptorError("interface descriptor length must be nine")
-            if data[offset + 3] != 0:
-                raise UnsupportedTopologyError("alternate interface settings are unsupported")
-            interface_count += 1
-            if interface_count > MAX_INTERFACES:
-                raise UnsupportedTopologyError("too many interfaces")
+            # An alternate setting redescribes an interface that bNumInterfaces
+            # already counts once. Skip its endpoints rather than aborting, and
+            # do not count it -- a DS4's AudioStreaming interface declares
+            # altsettings 1 and 2, so counting them makes
+            # interface_count == declared_interfaces unsatisfiable.
+            current_alt_nonzero = data[offset + 3] != 0
+            if not current_alt_nonzero:
+                interface_count += 1
+                if interface_count > MAX_INTERFACES:
+                    raise UnsupportedTopologyError("too many interfaces")
             current_interface = data[offset + 2]
             current_is_hid = data[offset + 5] == 3
             current_report_length = 0
@@ -914,7 +920,7 @@ def parse_mouse_configuration(data: bytes) -> MouseConfiguration:
             is_interrupt_in = bool(endpoint_address & 0x80) and (attributes & 0x03) == 3
             # Only a HID interface's interrupt-IN endpoints are captured; OUT and
             # non-interrupt endpoints (e.g. a keyboard's LED endpoint) are skipped.
-            if current_is_hid and is_interrupt_in:
+            if current_is_hid and not current_alt_nonzero and is_interrupt_in:
                 if (endpoint_address & 0x70) != 0 or (endpoint_address & 0x0F) == 0:
                     raise UnsupportedTopologyError("endpoint must be a nonzero IN endpoint")
                 maximum_packet_size = int.from_bytes(data[offset + 4 : offset + 6], "little")
