@@ -39,7 +39,13 @@ _HOST_CHIRP_PAIRS = 3
 
 
 class BoundedMouseEnumerator(Elaboratable):
-    """Power, reset, and enumerate one bounded full-speed HID boot mouse."""
+    """Power, reset, and enumerate one bounded HID device.
+
+    Any HID device with at least one interrupt-IN endpoint is accepted --
+    a gamepad as readily as a mouse. There is no bInterfaceProtocol check:
+    endpoints are only captured from HID interfaces, so the existing
+    ``ep_count == 0`` failure already implies a HID interface was seen.
+    """
 
     def __init__(self, timing=None, control=None, descriptor_store=None) -> None:
         self.timing = timing if timing is not None else HostTiming.hardware()
@@ -203,7 +209,6 @@ class BoundedMouseEnumerator(Elaboratable):
         cur_alt_nonzero = Signal()
         cur_interface = Signal(8)
         cur_report_length = Signal(16)
-        mouse_seen = Signal()
         endpoint_mps_low = Signal(8)
         ep_addr = Signal(8)
         ep_attrs = Signal(8)
@@ -841,7 +846,6 @@ class BoundedMouseEnumerator(Elaboratable):
                     self.ep_count.eq(0),
                     cur_is_hid.eq(0),
                     cur_report_length.eq(0),
-                    mouse_seen.eq(0),
                     declared_interfaces.eq(0),
                 ]
                 m.next = "CONFIG_START"
@@ -935,9 +939,6 @@ class BoundedMouseEnumerator(Elaboratable):
                                         ]
                                 with m.Case(5):
                                     m.d.usb += cur_is_hid.eq(control.data == 3)
-                                with m.Case(7):
-                                    with m.If(cur_is_hid & (control.data == 2)):
-                                        m.d.usb += mouse_seen.eq(1)
                         with m.Elif(current_descriptor_type == 0x21):
                             with m.If(cur_is_hid):
                                 with m.If(descriptor_position == 5):
@@ -1059,7 +1060,6 @@ class BoundedMouseEnumerator(Elaboratable):
                     with m.Elif(
                         unsupported
                         | (interface_count != declared_interfaces)
-                        | ~mouse_seen
                         | (self.ep_count == 0)
                     ):
                         fail(HostError.UNSUPPORTED_TOPOLOGY)

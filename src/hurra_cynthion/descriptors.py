@@ -843,7 +843,6 @@ def parse_mouse_configuration(data: bytes) -> MouseConfiguration:
 
     endpoints: list[EndpointBinding] = []
     interface_count = 0
-    has_mouse = False
     current_is_hid = False
     current_alt_nonzero = False
     current_interface = 0
@@ -877,8 +876,6 @@ def parse_mouse_configuration(data: bytes) -> MouseConfiguration:
             current_interface = data[offset + 2]
             current_is_hid = data[offset + 5] == 3
             current_report_length = 0
-            if current_is_hid and data[offset + 7] == 2:
-                has_mouse = True
 
         elif descriptor_type == 0x21:
             # HID descriptor belongs to the current interface; non-HID interfaces skip it.
@@ -948,10 +945,12 @@ def parse_mouse_configuration(data: bytes) -> MouseConfiguration:
 
     if interface_count != declared_interfaces:
         raise UnsupportedTopologyError("declared interface count does not match descriptors")
-    if not has_mouse:
-        raise UnsupportedTopologyError("no HID mouse interface present")
     if not endpoints:
-        raise MalformedDescriptorError("no interrupt-IN endpoint found")
+        # UnsupportedTopologyError, not Malformed: the descriptors are
+        # well-formed, the device simply has no HID interrupt-IN endpoint to
+        # relay. This must match the gateware, which fails the equivalent
+        # `ep_count == 0` condition with HostError.UNSUPPORTED_TOPOLOGY.
+        raise UnsupportedTopologyError("no interrupt-IN endpoint found")
 
     return MouseConfiguration(configuration_value=data[5], endpoints=tuple(endpoints))
 

@@ -617,10 +617,30 @@ def test_parse_rejects_multiple_report_descriptors_on_one_interface() -> None:
         parse_mouse_configuration(descriptor)
 
 
-def test_parse_rejects_config_with_no_mouse_protocol_interface() -> None:
+def test_parse_accepts_hid_interfaces_that_are_not_boot_mice() -> None:
+    """Phase A deliberately reversed this.
+
+    This used to assert rejection: enumeration required an interface with
+    bInterfaceClass 3 AND bInterfaceProtocol 2. A gamepad declares protocol
+    0, so that gate had to go. Keyboards (protocol 1) and protocol-0 devices
+    are now first-class, and the real requirement -- at least one HID
+    interrupt-IN endpoint -- is enforced by the endpoint check instead.
+    """
     only_keyboards = [(3, 1, 1, 0x81, 65), (3, 0, 0, 0x82, 65)]
+    parsed = parse_mouse_configuration(composite_configuration(only_keyboards))
+    assert [e.endpoint_number for e in parsed.endpoints] == [1, 2]
+
+
+def test_parse_still_rejects_a_device_with_no_hid_interrupt_in_endpoint() -> None:
+    """Removing the boot-mouse gate must not accept just anything.
+
+    A non-HID interface contributes no endpoints, so the endpoint check is
+    what rejects it -- and it must report the same UNSUPPORTED_TOPOLOGY the
+    gateware reports for ep_count == 0.
+    """
+    vendor_only = [(0xFF, 0, 0, 0x81, 0)]
     with pytest.raises(UnsupportedTopologyError):
-        parse_mouse_configuration(composite_configuration(only_keyboards))
+        parse_mouse_configuration(composite_configuration(vendor_only))
 
 
 def test_parse_skips_non_hid_interface_but_keeps_mouse() -> None:
@@ -676,8 +696,6 @@ def test_parse_rejects_more_than_max_interfaces() -> None:
         replace_byte(mouse_configuration(), 28, 4),
         replace_byte(mouse_configuration(), 31, 0),
         replace_byte(mouse_configuration(), 33, 0),
-        replace_byte(mouse_configuration(), 29, 0x03),
-        replace_byte(mouse_configuration(), 30, 2),
     ],
 )
 def test_parse_configuration_rejects_truncated_zero_length_and_malformed(
@@ -704,10 +722,15 @@ def test_parse_configuration_rejects_oversized_report() -> None:
     "descriptor",
     [
         replace_byte(mouse_configuration(), 4, 2),
+        # Only endpoint is OUT (0x03), or is bulk rather than interrupt:
+        # nothing to relay, so the topology is unsupported. These moved here
+        # from the malformed list when the boot-mouse gate was removed -- the
+        # descriptors are well-formed, and the gateware agrees by failing the
+        # equivalent ep_count == 0 with UNSUPPORTED_TOPOLOGY.
+        replace_byte(mouse_configuration(), 29, 0x03),
+        replace_byte(mouse_configuration(), 30, 2),
         replace_byte(mouse_configuration(), 14, 0),
         replace_byte(mouse_configuration(), 14, 2),
-        replace_byte(mouse_configuration(), 16, 0),
-        replace_byte(mouse_configuration(), 16, 1),
         replace_byte(mouse_configuration(), 29, 0x93),
     ],
 )
@@ -898,3 +921,22 @@ def test_alt_setting_endpoints_are_not_captured_even_when_hid() -> None:
     parsed = parse_mouse_configuration(header + body)
     assert len(parsed.endpoints) == 1
     assert parsed.endpoints[0].endpoint_number == 3
+
+
+def test_ds4_configuration_enumerates() -> None:
+    """The whole point of phase A.
+
+    A DS4 declares bInterfaceProtocol 0, not 2, so the boot-mouse gate
+    rejected it -- but three unrelated gates rejected it first: alternate
+    settings, nine-byte audio endpoint descriptors, and counting alt settings
+    toward the declared interface count.
+    """
+    from _ds4_fixture import DS4_CONFIG_DESCRIPTOR
+
+    parsed = parse_mouse_configuration(DS4_CONFIG_DESCRIPTOR)
+    assert len(parsed.endpoints) == 1, "only the HID interrupt IN is captured"
+    endpoint = parsed.endpoints[0]
+    assert endpoint.endpoint_number == 4, "DS4 interrupt IN is 0x84"
+    assert endpoint.max_packet_size == 64
+    assert endpoint.interface_number == 3
+    assert endpoint.report_length == 507

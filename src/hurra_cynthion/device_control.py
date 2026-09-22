@@ -376,6 +376,13 @@ class HIDClassRequestHandler(USBRequestHandler):
                             with m.Case(_HID_SET_IDLE, _HID_SET_PROTOCOL):
                                 m.next = "ACK_STATUS"
                             with m.Default():
+                                # Only start a forward the relay can actually
+                                # accept. If it is still busy with a previous
+                                # transfer we would otherwise wait on its
+                                # stale response_valid and serve the previous
+                                # answer to this request.
+                                with m.If(~relay.request_ready):
+                                    m.next = "STALL"
                                 m.d.comb += [
                                     relay.request_valid.eq(1),
                                     relay.request_type.eq(request_type),
@@ -384,10 +391,11 @@ class HIDClassRequestHandler(USBRequestHandler):
                                     relay.index.eq(setup.index),
                                     relay.length.eq(setup.length),
                                 ]
-                                with m.If(setup.is_in_request | (setup.length == 0)):
-                                    m.next = "AWAITING_TARGET"
-                                with m.Else():
-                                    m.next = "CAPTURE_OUT"
+                                with m.If(relay.request_ready):
+                                    with m.If(setup.is_in_request | (setup.length == 0)):
+                                        m.next = "AWAITING_TARGET"
+                                    with m.Else():
+                                        m.next = "CAPTURE_OUT"
 
                 with m.State("CAPTURE_OUT"):
                     # LUNA's OUT stream has NO backpressure and no buffer: a
@@ -416,13 +424,22 @@ class HIDClassRequestHandler(USBRequestHandler):
                     m.d.usb += defer_timer.eq(defer_timer + 1)
                     with m.If(relay.response_valid & ~relay.response_error):
                         m.next = "RESPOND"
-                    with m.Elif(relay.response_valid | (defer_timer == self._timeout_cycles)):
+                    with m.Elif(relay.response_valid):
+                        # The relay finished, but reported an error.
+                        m.d.comb += relay.response_ack.eq(1)
+                        m.next = "STALL"
+                    with m.Elif(defer_timer == self._timeout_cycles):
                         # LUNA has no timeout anywhere in its control path, so
                         # without this bound a wedged target would hold EP0
                         # open forever. USB 2.0 s9.2.6.4 allows only 50 ms for
                         # a no-data-stage status phase.
-                        m.d.comb += relay.response_ack.eq(1)
-                        m.next = "STALL"
+                        #
+                        # We cannot simply ack here: the relay is still mid
+                        # transfer and only consumes response_ack once it
+                        # reaches its own COMPLETE state, so an ack driven now
+                        # is dropped. Stall the host promptly, then drain the
+                        # relay separately.
+                        m.next = "DRAIN_THEN_STALL"
 
                 with m.State("RESPOND"):
                     m.d.comb += [
@@ -447,6 +464,20 @@ class HIDClassRequestHandler(USBRequestHandler):
                             handshake_generator.ack.eq(1),
                             relay.response_ack.eq(1),
                         ]
+                        m.next = "IDLE"
+
+                with m.State("DRAIN_THEN_STALL"):
+                    # We gave up before the relay did. STALL the host now so
+                    # it is not left waiting, but keep watching for the
+                    # relay's eventual completion: request_pending stays high
+                    # until it is acked, and it gates the arbiter's control
+                    # phase -- an unacked relay starves every interrupt
+                    # poller for good, and its stale response_valid would be
+                    # served to whatever request came next.
+                    with m.If(interface.data_requested | interface.status_requested):
+                        m.d.comb += handshake_generator.stall.eq(1)
+                    with m.If(relay.response_valid):
+                        m.d.comb += relay.response_ack.eq(1)
                         m.next = "IDLE"
 
                 with m.State("ACK_STATUS"):

@@ -889,3 +889,49 @@ def test_wedged_target_stalls_instead_of_naking_forever() -> None:
         assert ctx.get(dut.interface.handshakes_out.nak) == 0
 
     _simulate_handler(bench, timeout_cycles=64)
+
+
+def test_timeout_still_releases_the_relay_or_pollers_starve_forever() -> None:
+    """Regression: a timed-out forward must still ack the relay.
+
+    ``request_pending`` stays high from request until ack, and it gates the
+    arbiter's control phase -- so a forward that is abandoned without an ack
+    starves every interrupt poller permanently, and the relay's eventual
+    ``response_valid`` would be served as a stale answer to whatever request
+    came next.
+
+    The handler cannot ack at the moment it gives up, because the relay only
+    consumes ``response_ack`` once it reaches its own COMPLETE state. It has
+    to stall the host promptly and drain the relay separately.
+    """
+
+    async def bench(ctx, dut, relay) -> None:
+        await _send_setup(
+            ctx,
+            dut,
+            request_type=0xA1,
+            request=HID_GET_REPORT,
+            value=0x03F1,
+            index=3,
+            length=64,
+        )
+        # Run past the handler's deadline with the relay still working.
+        for _ in range(80):
+            await ctx.tick("usb")
+
+        # The host must not be left hanging.
+        ctx.set(dut.interface.data_requested, 1)
+        await ctx.delay(1e-9)
+        assert ctx.get(dut.interface.handshakes_out.stall) == 1
+        ctx.set(dut.interface.data_requested, 0)
+        await ctx.tick("usb")
+
+        # Now the relay finishes, late. The handler must consume it.
+        ctx.set(relay.response_valid, 1)
+        await ctx.delay(1e-9)
+        assert ctx.get(relay.response_ack) == 1, (
+            "late relay completion was never acked: request_pending sticks "
+            "high and the interrupt pollers starve forever"
+        )
+
+    _simulate_handler(bench, timeout_cycles=64)
