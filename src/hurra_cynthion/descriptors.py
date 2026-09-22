@@ -902,8 +902,13 @@ def parse_mouse_configuration(data: bytes) -> MouseConfiguration:
                         current_report_length = subordinate_length
 
         elif descriptor_type == 5:
-            if descriptor_length != 7:
-                raise MalformedDescriptorError("endpoint descriptor length must be seven")
+            # 7 = standard endpoint descriptor; 9 = the USB Audio 1.0 form,
+            # which appends bRefresh and bSynchAddress. A DS4 carries three
+            # audio interfaces, so rejecting 9 aborts enumeration long before
+            # any HID logic runs -- and this check sits outside the
+            # current_is_hid guard, so it fires on interfaces we never wanted.
+            if descriptor_length not in (7, 9):
+                raise MalformedDescriptorError("endpoint descriptor length must be seven or nine")
             endpoint_address = data[offset + 2]
             attributes = data[offset + 3]
             is_interrupt_in = bool(endpoint_address & 0x80) and (attributes & 0x03) == 3

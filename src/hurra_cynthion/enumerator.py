@@ -886,7 +886,12 @@ class BoundedMouseEnumerator(Elaboratable):
                             with m.If(cur_is_hid & (current_descriptor_length < 9)):
                                 m.d.usb += malformed.eq(1)
                         with m.Elif(control.data == 5):
-                            with m.If(current_descriptor_length != 7):
+                            # 7 = standard endpoint; 9 = USB Audio 1.0, which
+                            # appends bRefresh/bSynchAddress. See the matching
+                            # comment in descriptors.py.
+                            with m.If(
+                                (current_descriptor_length != 7) & (current_descriptor_length != 9)
+                            ):
                                 m.d.usb += malformed.eq(1)
                         with m.If(current_descriptor_length == 2):
                             m.d.usb += descriptor_position.eq(0)

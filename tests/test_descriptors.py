@@ -816,3 +816,36 @@ def test_generation_changed_strobe_matches_a_delayed_comparison_cycle_for_cycle(
 
     simulation.add_testbench(bench)
     simulation.run()
+
+
+def _audio_endpoint(address: int) -> bytes:
+    """A USB Audio 1.0 isochronous endpoint descriptor: nine bytes, not seven.
+
+    The two extra bytes are bRefresh and bSynchAddress.
+    """
+    return bytes([9, 5, address, 0x01, 0xC0, 0x00, 0x01, 0x00, 0x00])
+
+
+def _config_with_audio_isoc_endpoint() -> bytes:
+    """One boot-mouse HID interface plus one audio interface, DS4-shaped.
+
+    bInterfaceProtocol stays 2 here: the boot-mouse gate is not removed until
+    a later task, and this test must fail only for the reason it is testing.
+    """
+    hid = _interface(0, 3, 1, 2, 0x83, 52)
+    audio = bytes([9, 4, 1, 0, 1, 1, 2, 0, 0]) + _audio_endpoint(0x01)
+    body = hid + audio
+    total = 9 + len(body)
+    header = bytes([9, 2, total & 0xFF, total >> 8, 2, 7, 0, 0x80, 50])
+    return header + body
+
+
+def test_nine_byte_audio_endpoint_descriptor_is_accepted() -> None:
+    """USB Audio 1.0 endpoint descriptors are nine bytes, not seven.
+
+    A DS4 carries three audio interfaces, so rejecting the nine-byte form
+    aborts enumeration before any HID logic runs.
+    """
+    parsed = parse_mouse_configuration(_config_with_audio_isoc_endpoint())
+    assert len(parsed.endpoints) == 1, "only the HID interrupt IN is captured"
+    assert parsed.endpoints[0].endpoint_number == 3
