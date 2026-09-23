@@ -56,7 +56,15 @@ class USBHostTransactionArbiter(Elaboratable):
         engine_done_d = Signal()
         m.d.usb += engine_done_d.eq(engine.done)
 
-        control_grant = self.control_phase & control.start & ~engine.busy
+        # Who owns the engine AND its shared receive buffer. A poller holds
+        # both from its grant until it has copied its report out
+        # (poller_busy), so control may not take over until then -- even with
+        # control_phase high. That could never happen while control only ran
+        # during enumeration; the control relay forwards transfers AFTER it,
+        # while pollers are live, and a control grant mid-copy overwrote the
+        # buffer the poller was still reading.
+        control_owns = self.control_phase & ~self.poller_busy
+        control_grant = control_owns & control.start & ~engine.busy
         sof_grant = self.sof_start & ~engine.busy & ~engine.done & ~engine_done_d & ~control_grant
         poll_bus_free = ~self.control_phase & ~self.sof_start & ~engine.busy & ~self.poller_busy
 
@@ -77,22 +85,25 @@ class USBHostTransactionArbiter(Elaboratable):
 
         m.d.comb += [
             self.sof_ready.eq(sof_grant),
-            control.start_ready.eq(self.control_phase & ~engine.busy),
+            control.start_ready.eq(control_owns & ~engine.busy),
             engine.start.eq(control_grant | sof_grant | poller_grant),
             engine.sof.eq(sof_grant),
             engine.frame.eq(self.sof_frame),
-            engine.token_pid.eq(Mux(self.control_phase, control.token_pid, token_pid)),
-            engine.address.eq(Mux(self.control_phase, control.address, address)),
-            engine.endpoint.eq(Mux(self.control_phase, control.endpoint, endpoint)),
-            engine.data_toggle.eq(Mux(self.control_phase, control.data_toggle, data_toggle)),
-            engine.tx_length.eq(Mux(self.control_phase, control.tx_length, tx_length)),
-            engine.tx_payload.eq(Mux(self.control_phase, control.tx_payload, tx_payload)),
+            engine.token_pid.eq(Mux(control_owns, control.token_pid, token_pid)),
+            engine.address.eq(Mux(control_owns, control.address, address)),
+            engine.endpoint.eq(Mux(control_owns, control.endpoint, endpoint)),
+            engine.data_toggle.eq(Mux(control_owns, control.data_toggle, data_toggle)),
+            engine.tx_length.eq(Mux(control_owns, control.tx_length, tx_length)),
+            engine.tx_payload.eq(Mux(control_owns, control.tx_payload, tx_payload)),
             engine.connected.eq(self.connected),
-            engine.rx_read_index.eq(Mux(self.control_phase, control.rx_read_index, rx_read_index)),
+            engine.rx_read_index.eq(Mux(control_owns, control.rx_read_index, rx_read_index)),
         ]
 
-        # Control transfers only run during enumeration, never concurrently
-        # with polling, so its result routing stays unconditional.
+        # Result routing stays unconditional: the control engine only acts on
+        # done/rx_* while one of its own transactions is in flight, and
+        # control_owns keeps that from overlapping a poller's. (Control used
+        # to run only during enumeration; the relay now runs it afterwards
+        # too, which is why ownership above is no longer just control_phase.)
         m.d.comb += [
             control.busy.eq(engine.busy),
             control.done.eq(engine.done),

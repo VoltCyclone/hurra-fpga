@@ -787,3 +787,73 @@ def test_relay_engine_ownership_gates_the_arbiter_control_phase() -> None:
     # enumerator.ready alone -- and not of request_pending, which also covers
     # time spent waiting on the AUX host (see ControlRelay.engine_owned).
     assert "engine_owned" in netlist
+
+
+class _ArbiterHarness(Elaboratable):
+    """A bare arbiter over a scripted engine, one control and one poller port."""
+
+    def __init__(self) -> None:
+        self.engine = ScriptedEngine()
+        self.control_port = USBHostTransactionPort()
+        self.poller_port = USBHostTransactionPort()
+        self.arbiter = USBHostTransactionArbiter(
+            engine=self.engine,
+            control_port=self.control_port,
+            poller_ports=[self.poller_port],
+        )
+
+    def elaborate(self, platform) -> Module:
+        del platform
+        m = Module()
+        m.submodules.engine = self.engine
+        m.submodules.arbiter = self.arbiter
+        return m
+
+
+def test_a_forwarded_control_transfer_waits_for_the_poller_to_finish_copying() -> None:
+    """Review: control transfers now happen AFTER enumeration.
+
+    The arbiter was written for control only ever preceding polling. Once
+    the relay forwards a control request, control_phase can rise while a
+    poller has finished its IN transaction but is still copying the report
+    out of the shared receive buffer (poller_busy). Two things went wrong:
+
+    - control_grant ignored poller_busy, so the control transaction started
+      at once and its received data overwrote the buffer mid-copy;
+    - engine.rx_read_index followed control_phase, so the copying poller
+      read the buffer with the CONTROL port's index.
+
+    Either way the poller copied garbage into a report sent to the PC.
+    """
+    dut = _ArbiterHarness()
+    simulation = Simulator(dut)
+    simulation.add_clock(1e-6, domain="usb")
+
+    async def bench(ctx) -> None:
+        arbiter = dut.arbiter
+        ctx.set(arbiter.connected, 1)
+        ctx.set(dut.poller_port.rx_read_index, 7)
+        ctx.set(dut.control_port.rx_read_index, 33)
+
+        # A poller is mid-copy; the relay now wants the engine.
+        ctx.set(arbiter.poller_busy, 1)
+        ctx.set(arbiter.control_phase, 1)
+        ctx.set(dut.control_port.start, 1)
+        for _ in range(5):
+            await ctx.delay(1e-9)
+            assert not ctx.get(dut.engine.start), "control granted while a poller owns the buffer"
+            assert not ctx.get(dut.control_port.start_ready)
+            assert (
+                ctx.get(dut.engine.rx_read_index) == 7
+            ), "the copying poller must keep reading with its own index"
+            await ctx.tick("usb")
+
+        # Copy done: now, and only now, control takes the engine.
+        ctx.set(arbiter.poller_busy, 0)
+        await ctx.delay(1e-9)
+        assert ctx.get(dut.control_port.start_ready)
+        assert ctx.get(dut.engine.start)
+        assert ctx.get(dut.engine.rx_read_index) == 33
+
+    simulation.add_testbench(bench)
+    simulation.run()
