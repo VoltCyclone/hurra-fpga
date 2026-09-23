@@ -135,7 +135,33 @@ REQUIRED_NEXTPNR_FLAG = "--placer-heap-timingweight"
 #: its --textcfg output: nextpnr writes the textcfg even when timing fails, so
 #: "the file exists" is not a pass signal. (In the full LUNA flow no *bitstream*
 #: appears, because ecppack never runs -- that one is a real signal.)
-DEFAULT_PLACER_SEED = 7
+#:
+#: **Re-swept 2026-09-23 after the control relay landed: 8 of 12 pass.** Netlist
+#: sha 05a170f1eca3e53a, built natively from ``~/hurra-work`` on the build
+#: server (so not comparable with the container sha above -- see the
+#: path-sensitivity note), same yosys 0.68+136 / nextpnr 0.11.1-19:
+#:
+#:     2: 63.83   1: 63.67   3: 63.57   10: 62.79  9: 62.13   8: 61.64
+#:     6: 61.63   12: 60.08  |  7: 59.23  11: 58.75  4: 58.21   5: 54.85
+#:
+#: The pin moved 7 -> 2: seed 7 is now the third-worst and FAILS. This is a
+#: real loss of margin, not only a redraw, and it is worth reading carefully:
+#:
+#: - The relay itself is not on any critical path. It adds about 1% logic
+#:   (+221 LUTs, 79% -> 80% of the device; +16 distributed-RAM slices; no
+#:   BRAM), and every failing seed's path runs through pre-existing
+#:   injection-plane logic on 1.5 ns cross-die routes.
+#: - Registering ``host.enumerated`` -- the head of the worst path -- moved
+#:   the critical path to ``injection_plane.active_bank`` / ``link_ready``
+#:   and swept 7 of 12, no better. There is a *family* of near-critical
+#:   paths in the injection plane, and at 80% utilisation any added logic
+#:   perturbs placement enough to surface one. It was reverted.
+#: - So a single-signal fix will not recover 12/12. Doing so needs a
+#:   timing pass over the injection plane's cross-die control signals.
+#:
+#: Note this is the -8 speed grade every build assumes. The BOM part is -6,
+#: which closed 0 of 12 even before this change.
+DEFAULT_PLACER_SEED = 2
 
 #: The full option, including the weight and seed that were actually measured.
 #: A caller-supplied ``--seed`` is composed after this one and wins, because
