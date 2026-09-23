@@ -471,6 +471,7 @@ class HIDClassRequestHandler(USBRequestHandler):
                     dispatch()
 
             with m.State("CAPTURE_OUT"):
+                m.d.usb += defer_timer.eq(defer_timer + 1)
                 # Same reasoning as IDLE: a stray IN or status strobe
                 # during the OUT data stage must get a handshake, not
                 # silence.
@@ -500,14 +501,20 @@ class HIDClassRequestHandler(USBRequestHandler):
                     with m.If(packet_ok):
                         m.d.comb += handshake_generator.ack.eq(1)
                         with m.If(out_cursor >= setup.length):
+                            # Restart the clock for the TARGET's answer. The
+                            # AUX host's pace delivering its data is not the
+                            # target's to pay for -- at Full Speed a long
+                            # SET_REPORT spans several frames.
+                            m.d.usb += defer_timer.eq(0)
                             m.next = "AWAITING_TARGET"
                     with m.Else():
                         # Caught mid-flight: we forwarded none of it. NAK, and
                         # the host resends the whole packet.
                         m.d.comb += handshake_generator.nak.eq(1)
                 # A host can also just stop sending (bus reset, cable
-                # pull) with no SETUP to tell us. Bound the wait.
-                m.d.usb += defer_timer.eq(defer_timer + 1)
+                # pull) with no SETUP to tell us. Bound the wait. (The
+                # increment is at the top of this state, so the restart on
+                # leaving for AWAITING_TARGET -- a later assignment -- wins.)
                 with m.If(defer_timer == self._timeout_cycles):
                     m.d.comb += relay.abort.eq(1)
                     m.next = "DRAIN_THEN_STALL"

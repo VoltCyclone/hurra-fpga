@@ -1054,3 +1054,51 @@ def test_a_standard_setup_racing_the_drain_is_never_forwarded() -> None:
             await ctx.tick("usb")
 
     _simulate_handler(bench, timeout_cycles=1000)
+
+
+def test_time_spent_collecting_out_data_is_not_charged_to_the_target() -> None:
+    """Review: defer_timer ran on from CAPTURE_OUT into AWAITING_TARGET.
+
+    So time the AUX host spent delivering its OUT data -- at Full Speed a
+    64-byte SET_REPORT over an 8-byte EP0 spans several frames -- came out
+    of the budget for the TARGET's answer. The handler then gave up on a
+    transfer the engine was still legitimately completing, and the host got
+    a STALL for a request that would have succeeded.
+    """
+
+    async def bench(ctx, dut, relay) -> None:
+        iface = dut.interface
+        await _send_setup(
+            ctx, dut, request_type=0x21, request=HID_SET_REPORT, value=0x03F0, index=3, length=4
+        )
+        ctx.set(relay.request_pending, 1)
+        # The host is slow to send its data: 50 of the 64-cycle budget.
+        for _ in range(50):
+            await ctx.tick("usb")
+        # One OUT packet of 4 bytes, then its handshake point.
+        ctx.set(iface.rx.valid, 1)
+        await ctx.tick("usb")
+        for byte in (0xF0, 1, 2, 3):
+            ctx.set(iface.rx.payload, byte)
+            ctx.set(iface.rx.next, 1)
+            await ctx.tick("usb")
+        ctx.set(iface.rx.next, 0)
+        ctx.set(iface.rx.valid, 0)
+        await ctx.tick("usb")
+        ctx.set(iface.rx_ready_for_response, 1)
+        await ctx.delay(1e-9)
+        assert ctx.get(iface.handshakes_out.ack), "the OUT packet was not ACKed"
+        await ctx.tick("usb")
+        ctx.set(iface.rx_ready_for_response, 0)
+
+        # The target takes 40 cycles -- well inside its own budget of 64.
+        for _ in range(40):
+            await ctx.tick("usb")
+        ctx.set(iface.status_requested, 1)
+        await ctx.delay(1e-9)
+        assert not ctx.get(
+            iface.handshakes_out.stall
+        ), "gave up on the target after 40 cycles: the host's slow OUT stage was charged to it"
+        assert ctx.get(iface.handshakes_out.nak)
+
+    _simulate_handler(bench, timeout_cycles=64)
