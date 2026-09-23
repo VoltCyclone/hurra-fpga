@@ -9,6 +9,8 @@ def simulate(bench, **kwargs) -> None:
     simulation.add_clock(1e-6, domain="usb")
 
     async def wrapped(ctx) -> None:
+        # In production the host drives this from enumerator.ready.
+        ctx.set(dut.enable, 1)
         await ctx.tick("usb")
         await bench(ctx, dut)
 
@@ -131,20 +133,83 @@ def test_oversized_request_is_rejected_not_truncated():
     simulate(bench)
 
 
-def test_unresponsive_target_times_out():
+def test_relay_waits_for_the_engine_rather_than_timing_out() -> None:
+    """Review I1: the relay must not give up while the engine is still working.
+
+    It used to time out after 20 ms and return to IDLE, but the engine's own
+    NAK timeout is 500 ms, so the engine carried on -- and its late done and
+    data were taken as the NEXT request's answer. The engine is guaranteed to
+    finish (every wait state ends in TIMEOUT or DISCONNECTED), so the relay
+    waits for it. Bounding the AUX host's wait is the handler's job.
+    """
+
     async def bench(ctx, dut):
-        ctx.set(dut.request_type, 0xA1)
-        ctx.set(dut.request, 0x01)
-        ctx.set(dut.value, 0)
-        ctx.set(dut.index, 0)
-        ctx.set(dut.length, 8)
-        ctx.set(dut.request_valid, 1)
-        await ctx.tick("usb").until(dut.request_ready)
-        ctx.set(dut.request_valid, 0)
+        await _issue(ctx, dut, request_type=0xA1, request=0x01, value=0, index=0, length=8)
+        # Let the relay start an idle engine, then hold the engine busy.
+        await ctx.tick("usb").until(dut.ctl_start)
+        await ctx.tick("usb")
+        ctx.set(dut.ctl_busy, 1)
+        for _ in range(500):
+            await ctx.tick("usb")
+            assert not ctx.get(dut.response_valid), "relay gave up while the engine was busy"
+            assert ctx.get(dut.request_pending)
+            assert ctx.get(dut.engine_owned), "pollers must stay pre-empted while engine works"
 
-        # ctl_done is never asserted: the target is wedged.
+        # The engine finishes, late, with an error: now the relay completes.
+        ctx.set(dut.ctl_status, 2)
+        ctx.set(dut.ctl_done, 1)
+        await ctx.tick("usb")
+        ctx.set(dut.ctl_done, 0)
+        ctx.set(dut.ctl_busy, 0)
         await ctx.tick("usb").until(dut.response_valid)
-        assert ctx.get(dut.timed_out) == 1
-        assert ctx.get(dut.response_error) == 1
+        assert ctx.get(dut.response_error)
+        assert not ctx.get(dut.engine_owned)
 
-    simulate(bench, timeout_cycles=64)
+    simulate(bench)
+
+
+def test_relay_refuses_requests_until_the_engine_is_handed_over() -> None:
+    """Review I5: before TARGET is enumerated the engine is the enumerator's.
+
+    Accepting then would drop our start pulse and let the enumerator's own
+    traffic be taken as our answer.
+    """
+
+    async def bench(ctx, dut):
+        ctx.set(dut.enable, 0)
+        ctx.set(dut.request_valid, 1)
+        ctx.set(dut.length, 8)
+        await ctx.tick("usb")
+        assert not ctx.get(dut.request_ready)
+        assert not ctx.get(dut.request_pending)
+        assert not ctx.get(dut.ctl_start)
+
+    simulate(bench)
+
+
+def test_abort_releases_an_abandoned_out_capture() -> None:
+    """Review C1: a host abandoning a SET_REPORT mid-capture.
+
+    CAPTURE_OUT had no exit but a full payload, so the relay sat there
+    forever holding request_pending.
+    """
+
+    async def bench(ctx, dut):
+        await _issue(ctx, dut, request_type=0x21, request=0x09, value=0, index=0, length=16)
+        ctx.set(dut.out_data, 0xAA)
+        ctx.set(dut.out_valid, 1)
+        await ctx.tick("usb")
+        ctx.set(dut.out_valid, 0)
+        ctx.set(dut.abort, 1)
+        await ctx.tick("usb")
+        ctx.set(dut.abort, 0)
+        await ctx.tick("usb").until(dut.response_valid)
+        assert ctx.get(dut.response_error)
+        assert not ctx.get(dut.ctl_start), "an aborted capture must never reach the engine"
+        ctx.set(dut.response_ack, 1)
+        await ctx.tick("usb")
+        ctx.set(dut.response_ack, 0)
+        await ctx.tick("usb")
+        assert not ctx.get(dut.request_pending)
+
+    simulate(bench)

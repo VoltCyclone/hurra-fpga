@@ -17,9 +17,8 @@ from amaranth.lib.memory import Memory
 
 
 class ControlRelay(Elaboratable):
-    def __init__(self, *, buffer_bytes: int = 64, timeout_cycles: int = 1_200_000):
+    def __init__(self, *, buffer_bytes: int = 64):
         self._buffer_bytes = buffer_bytes
-        self._timeout_cycles = timeout_cycles
 
         # AUX-facing request
         self.request_valid = Signal()
@@ -38,7 +37,11 @@ class ControlRelay(Elaboratable):
         self.response_length = Signal(16)
         self.response_ack = Signal()
         self.overflow = Signal()
-        self.timed_out = Signal()
+        #: Abandon a request whose OUT payload is still being captured -- the
+        #: AUX host moved on (new SETUP, bus reset) before sending it all.
+        #: Ignored once the engine has been started: an in-flight engine
+        #: transfer cannot be cancelled, only waited out.
+        self.abort = Signal()
         self.read_addr = Signal(range(buffer_bytes))
         self.read_data = Signal(8)
 
@@ -62,6 +65,16 @@ class ControlRelay(Elaboratable):
         self.ctl_data_last = Signal()
 
         self.request_pending = Signal()
+        #: High only while the control engine is actually working for us.
+        #: This, not request_pending, is what pre-empts the interrupt
+        #: pollers: request_pending also covers time spent waiting on the AUX
+        #: host's data and status stages, and starving the pollers for that
+        #: would let a slow or absent AUX host silence the controller.
+        self.engine_owned = Signal()
+        #: The enumerator hands the engine over only once TARGET is
+        #: enumerated. Issuing before then would drop our start pulse and let
+        #: the enumerator's own traffic be taken as our answer.
+        self.enable = Signal()
 
     def elaborate(self, platform):
         del platform
@@ -79,7 +92,6 @@ class ControlRelay(Elaboratable):
         latched_index = Signal(16)
         latched_length = Signal(16)
         cursor = Signal(range(self._buffer_bytes + 1))
-        timer = Signal(range(self._timeout_cycles + 1))
         # Set for one cycle immediately after a byte is captured, so a
         # data-valid strobe that stays asserted across multiple cycles
         # (as the target's IN data stage may hold it) is not consumed twice.
@@ -110,8 +122,8 @@ class ControlRelay(Elaboratable):
 
         with m.FSM(domain="usb"):
             with m.State("IDLE"):
-                m.d.comb += self.request_ready.eq(1)
-                with m.If(self.request_valid):
+                m.d.comb += self.request_ready.eq(self.enable)
+                with m.If(self.request_valid & self.enable):
                     m.d.usb += [
                         latched_type.eq(self.request_type),
                         latched_request.eq(self.request),
@@ -119,10 +131,8 @@ class ControlRelay(Elaboratable):
                         latched_index.eq(self.index),
                         latched_length.eq(self.length),
                         cursor.eq(0),
-                        timer.eq(0),
                         gap.eq(0),
                         self.overflow.eq(0),
-                        self.timed_out.eq(0),
                         self.response_error.eq(0),
                         self.response_length.eq(0),
                         self.request_pending.eq(1),
@@ -148,7 +158,13 @@ class ControlRelay(Elaboratable):
                         write_port.en.eq(1),
                     ]
                     m.d.usb += cursor.eq(cursor + 1)
-                with m.If(cursor + self.out_valid >= latched_length):
+                with m.If(self.abort):
+                    # Nothing has reached the engine yet, so giving up here is
+                    # safe. Without this exit a host that abandoned the
+                    # transfer left us here forever, holding request_pending.
+                    m.d.usb += [cursor.eq(0), self.response_error.eq(1)]
+                    m.next = "COMPLETE"
+                with m.Elif(cursor + self.out_valid >= latched_length):
                     # Rewind for the engine's own indexing. This assignment is
                     # later than the increment above, and Amaranth takes the
                     # last, so the final byte is still written.
@@ -156,11 +172,26 @@ class ControlRelay(Elaboratable):
                     m.next = "ISSUE"
 
             with m.State("ISSUE"):
-                m.d.comb += self.ctl_start.eq(1)
-                m.next = "AWAIT"
+                m.d.comb += self.engine_owned.eq(1)
+                # The engine samples start only in its own IDLE state, so a
+                # pulse while it is busy would simply be lost -- and we would
+                # then wait on a done that belongs to someone else.
+                with m.If(~self.enable):
+                    m.d.usb += self.response_error.eq(1)
+                    m.next = "COMPLETE"
+                with m.Elif(~self.ctl_busy):
+                    m.d.comb += self.ctl_start.eq(1)
+                    m.next = "AWAIT"
 
             with m.State("AWAIT"):
-                m.d.usb += timer.eq(timer + 1)
+                # No timeout of our own. The engine is guaranteed to finish --
+                # every one of its wait states ends in TIMEOUT (500 ms of NAKs)
+                # or DISCONNECTED -- whereas giving up first would return us to
+                # IDLE with the engine still mid-transfer, and its late done
+                # and data would then be taken as the NEXT request's answer.
+                # Keeping the AUX host from waiting too long is the handler's
+                # job; it stalls the host and drains us separately.
+                m.d.comb += self.engine_owned.eq(1)
                 with m.If(~gap & is_in_transfer):
                     m.d.comb += self.ctl_data_ready.eq(1)
                     with m.If(self.ctl_data_valid):
@@ -179,12 +210,6 @@ class ControlRelay(Elaboratable):
                     m.d.usb += [
                         self.response_length.eq(self.ctl_transferred),
                         self.response_error.eq(self.ctl_status != 0),
-                    ]
-                    m.next = "COMPLETE"
-                with m.Elif(timer == self._timeout_cycles):
-                    m.d.usb += [
-                        self.timed_out.eq(1),
-                        self.response_error.eq(1),
                     ]
                     m.next = "COMPLETE"
 

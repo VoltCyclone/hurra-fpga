@@ -767,7 +767,7 @@ def test_main_applies_the_build_environment(monkeypatch):
     assert "--placer-heap-timingweight" in seen["opts"]
 
 
-def test_relay_request_pending_gates_the_arbiter_control_phase() -> None:
+def test_relay_engine_ownership_gates_the_arbiter_control_phase() -> None:
     """A relay forward must win the bus; pollers resume when it clears.
 
     ``control_phase`` gates ``poll_bus_free`` in the arbiter, so raising it is
@@ -783,6 +783,7 @@ def test_relay_request_pending_gates_the_arbiter_control_phase() -> None:
     assert host.control_relay is not None
 
     netlist = rtlil.convert(host, ports=[host.connected, host.enumerated])
-    # The arbiter's control phase must be a function of request_pending, not
-    # of enumerator.ready alone.
-    assert "request_pending" in netlist
+    # The arbiter's control phase must be a function of engine_owned, not of
+    # enumerator.ready alone -- and not of request_pending, which also covers
+    # time spent waiting on the AUX host (see ControlRelay.engine_owned).
+    assert "engine_owned" in netlist

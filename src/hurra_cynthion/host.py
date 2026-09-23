@@ -393,10 +393,14 @@ class BoundedMouseHost(Elaboratable):
             self.scheduler.high_speed.eq(enumerator.high_speed),
             self.transaction.high_speed.eq(enumerator.high_speed),
             self.scheduler.token_ready.eq(self.arbiter.sof_ready),
-            # The relay preempts the pollers while a forward is in flight.
-            # Report gaps of a few frames at connect and on re-auth are
-            # ordinary USB; starving the auth handshake is not.
-            self.arbiter.control_phase.eq(~enumerator.ready | relay.request_pending),
+            # The relay pre-empts the pollers only while the control engine is
+            # actually working for it -- not while it waits on the AUX host's
+            # own data and status stages, or a slow or absent AUX host could
+            # silence the controller. A report gap of a few frames per forward
+            # is ordinary USB; starving the auth handshake is not.
+            self.arbiter.control_phase.eq(~enumerator.ready | relay.engine_owned),
+            # The engine is the enumerator's until TARGET is enumerated.
+            relay.enable.eq(enumerator.ready),
             # Relay -> engine, by way of the enumerator, which is the only
             # module permitted to drive control.* (see its port comment).
             enumerator.relay_start.eq(relay.ctl_start),

@@ -363,183 +363,260 @@ class HIDClassRequestHandler(USBRequestHandler):
                             m.next = "IDLE"
                 return m
 
-            defer_timer = Signal(range(self._timeout_cycles + 1))
-            # Size the cursor to the RELAY's buffer, not to the descriptor
-            # store. relay.read_addr is only wide enough for that buffer, and
-            # Amaranth's .eq() truncates silently -- a wider cursor would wrap
-            # the address back through zero on any response longer than the
-            # buffer and hand the host corrupted bytes with no error signal.
-            relay_buffer_bytes = 1 << len(relay.read_addr)
-            response_cursor = Signal(range(relay_buffer_bytes + 1))
-            out_cursor = Signal(16)
-            sending = Signal()
-            # A target that reports more bytes than the buffer can hold must
-            # not be able to drive the cursor past the end.
-            response_limit = Signal(range(relay_buffer_bytes + 1))
-            m.d.comb += response_limit.eq(
-                Mux(
-                    relay.response_length > relay_buffer_bytes,
-                    relay_buffer_bytes,
-                    relay.response_length,
-                )
+        # The forwarding FSM below runs OUTSIDE the CLASS gate on purpose.
+        # Inside it, the FSM froze whenever the latched SETUP was a STANDARD
+        # request -- mid-transfer -- so it could neither notice it had been
+        # abandoned nor release the relay. Only claim needs the gate: the
+        # request multiplexer ignores a handler's outputs unless it claims.
+        defer_timer = Signal(range(self._timeout_cycles + 1))
+        # Size the cursor to the RELAY's buffer, not to the descriptor
+        # store. relay.read_addr is only wide enough for that buffer, and
+        # Amaranth's .eq() truncates silently -- a wider cursor would wrap
+        # the address back through zero on any response longer than the
+        # buffer and hand the host corrupted bytes with no error signal.
+        relay_buffer_bytes = 1 << len(relay.read_addr)
+        response_cursor = Signal(range(relay_buffer_bytes + 1))
+        out_cursor = Signal(16)
+        sending = Signal()
+        # A target that reports more bytes than the buffer can hold must
+        # not be able to drive the cursor past the end.
+        response_limit = Signal(range(relay_buffer_bytes + 1))
+        m.d.comb += response_limit.eq(
+            Mux(
+                relay.response_length > relay_buffer_bytes,
+                relay_buffer_bytes,
+                relay.response_length,
             )
+        )
 
-            # LUNA's SetupPacket has no raw bmRequestType byte: it splits the
-            # byte into recipient[5] / type[2] / is_in_request[1], which is
-            # exactly that byte's bit layout. Reassemble it so the target sees
-            # the request the host actually sent, direction bit included.
-            request_type = Cat(setup.recipient, setup.type, setup.is_in_request)
+        # LUNA's SetupPacket has no raw bmRequestType byte: it splits the
+        # byte into recipient[5] / type[2] / is_in_request[1], which is
+        # exactly that byte's bit layout. Reassemble it so the target sees
+        # the request the host actually sent, direction bit included.
+        request_type = Cat(setup.recipient, setup.type, setup.is_in_request)
 
-            with m.FSM(domain="usb"):
-                with m.State("IDLE"):
-                    m.d.usb += [defer_timer.eq(0), response_cursor.eq(0), out_cursor.eq(0)]
-                    # We have claimed the request but have nothing to say yet.
-                    # Driving nothing would be bus SILENCE, which the host
-                    # reads as a transaction error rather than flow control.
-                    with m.If(interface.data_requested | interface.status_requested):
-                        m.d.comb += handshake_generator.nak.eq(1)
-                    with m.If(setup.received):
-                        with m.Switch(setup.request):
-                            with m.Case(_HID_SET_IDLE, _HID_SET_PROTOCOL):
-                                m.next = "ACK_STATUS"
-                            with m.Default():
-                                # Only start a forward the relay can actually
-                                # accept. If it is still busy with a previous
-                                # transfer we would otherwise wait on its
-                                # stale response_valid and serve the previous
-                                # answer to this request.
-                                with m.If(~relay.request_ready):
-                                    m.next = "STALL"
-                                m.d.comb += [
-                                    relay.request_valid.eq(1),
-                                    relay.request_type.eq(request_type),
-                                    relay.request.eq(setup.request),
-                                    relay.value.eq(setup.value),
-                                    relay.index.eq(setup.index),
-                                    relay.length.eq(setup.length),
-                                ]
-                                with m.If(relay.request_ready):
-                                    with m.If(setup.is_in_request | (setup.length == 0)):
-                                        m.next = "AWAITING_TARGET"
-                                    with m.Else():
-                                        m.next = "CAPTURE_OUT"
+        is_class = setup.type == USBRequestType.CLASS
+        setup_pending = Signal()
 
-                with m.State("CAPTURE_OUT"):
-                    # Same reasoning as IDLE: a stray IN or status strobe
-                    # during the OUT data stage must get a handshake, not
-                    # silence.
-                    with m.If(
-                        (interface.data_requested | interface.status_requested)
-                        & ~interface.rx_ready_for_response
-                    ):
-                        m.d.comb += handshake_generator.nak.eq(1)
-                    # LUNA's OUT stream has NO backpressure and no buffer: a
-                    # byte exists only on the cycle rx.valid & rx.next is
-                    # high, so it must be forwarded the same cycle or lost.
-                    with m.If(interface.rx.valid & interface.rx.next):
-                        m.d.comb += [
-                            relay.out_valid.eq(1),
-                            relay.out_data.eq(interface.rx.payload),
-                        ]
-                        m.d.usb += out_cursor.eq(out_cursor + 1)
-                    with m.If(interface.rx_ready_for_response):
-                        m.d.comb += handshake_generator.ack.eq(1)
-                        m.next = "AWAITING_TARGET"
-
-                with m.State("AWAITING_TARGET"):
-                    # LUNA does NOT auto-NAK. A handler that claims a request
-                    # and drives nothing emits bus SILENCE, which the host
-                    # reads as a transaction error and abandons after about
-                    # three retries -- not as flow control. data_requested and
-                    # status_requested are single-cycle combinational strobes,
-                    # so the NAK has to be driven in the same cycle. This is
-                    # the idiom LUNA's own USBInTransferManager uses.
-                    with m.If(interface.data_requested | interface.status_requested):
-                        m.d.comb += handshake_generator.nak.eq(1)
-                    m.d.usb += defer_timer.eq(defer_timer + 1)
-                    with m.If(relay.response_valid & ~relay.response_error):
-                        m.next = "RESPOND"
-                    with m.Elif(relay.response_valid):
-                        # The relay finished, but reported an error.
-                        m.d.comb += relay.response_ack.eq(1)
+        def dispatch() -> None:
+            # Start handling the latched SETUP. Used by IDLE on a fresh
+            # SETUP, and by DISPATCH for one that arrived while draining.
+            m.d.usb += setup_pending.eq(0)
+            with m.Switch(setup.request):
+                with m.Case(_HID_SET_IDLE, _HID_SET_PROTOCOL):
+                    m.next = "ACK_STATUS"
+                with m.Default():
+                    # Only start a forward the relay can actually accept.
+                    # If it is still busy with a previous transfer we
+                    # would otherwise wait on its stale response_valid and
+                    # serve the previous answer to this request.
+                    with m.If(~relay.request_ready):
                         m.next = "STALL"
-                    with m.Elif(defer_timer == self._timeout_cycles):
-                        # LUNA has no timeout anywhere in its control path, so
-                        # without this bound a wedged target would hold EP0
-                        # open forever. USB 2.0 s9.2.6.4 allows only 50 ms for
-                        # a no-data-stage status phase.
-                        #
-                        # We cannot simply ack here: the relay is still mid
-                        # transfer and only consumes response_ack once it
-                        # reaches its own COMPLETE state, so an ack driven now
-                        # is dropped. Stall the host promptly, then drain the
-                        # relay separately.
-                        m.next = "DRAIN_THEN_STALL"
-
-                with m.State("RESPOND"):
                     m.d.comb += [
-                        relay.read_addr.eq(response_cursor),
-                        interface.tx.payload.eq(relay.read_data),
+                        relay.request_valid.eq(1),
+                        relay.request_type.eq(request_type),
+                        relay.request.eq(setup.request),
+                        relay.value.eq(setup.value),
+                        relay.index.eq(setup.index),
+                        relay.length.eq(setup.length),
                     ]
-                    # data_requested is a ONE-CYCLE strobe per IN token, so
-                    # it can only start a packet, never carry one. Latch it
-                    # and stream from the latch -- the idiom LUNA's own
-                    # transmitters use. Restarting at byte 0 on every strobe
-                    # also makes a retry after a lost host ACK resend the same
-                    # packet, which is what the protocol requires.
-                    with m.If(interface.data_requested):
-                        m.d.usb += response_cursor.eq(0)
-                        with m.If(response_limit == 0):
-                            m.d.comb += self.send_zlp()
+                    with m.If(relay.request_ready):
+                        with m.If(setup.is_in_request | (setup.length == 0)):
+                            m.next = "AWAITING_TARGET"
                         with m.Else():
-                            m.d.usb += sending.eq(1)
-                    with m.Elif(sending):
-                        m.d.comb += [
-                            interface.tx.valid.eq(1),
-                            interface.tx.first.eq(response_cursor == 0),
-                            interface.tx.last.eq(response_cursor == (response_limit - 1)),
-                        ]
-                        with m.If(interface.tx.ready):
-                            m.d.usb += response_cursor.eq(response_cursor + 1)
-                            with m.If(response_cursor == (response_limit - 1)):
-                                m.d.usb += sending.eq(0)
+                            m.next = "CAPTURE_OUT"
 
-                    # The status stage runs opposite to the data stage. After
-                    # IN data the host sends an OUT ZLP and we ACK it; after
-                    # OUT data (SET_REPORT) the host sends an IN token and we
-                    # answer with a ZLP. A handshake is not a valid reply to
-                    # an IN token.
-                    with m.If(interface.status_requested):
-                        with m.If(setup.is_in_request):
-                            m.d.comb += handshake_generator.ack.eq(1)
-                        with m.Else():
-                            m.d.comb += self.send_zlp()
-                        m.d.comb += relay.response_ack.eq(1)
-                        m.d.usb += sending.eq(0)
-                        m.next = "IDLE"
+        def abandon_on_new_setup() -> None:
+            # A new SETUP supersedes whatever this transfer was doing --
+            # the host has abandoned it (USB 2.0 s8.5.3). Only IDLE ever
+            # looked at setup.received, so an abandoned transfer carried
+            # on, and its answer was served to the NEXT request's IN
+            # token: the wrong report, delivered silently. Abort any OUT
+            # capture still in progress and drain the relay, then DISPATCH
+            # the new request. It is NAKed meanwhile, not STALLed: a host
+            # treats STALL as a failed transfer, so stalling would drop a
+            # perfectly good request on the floor.
+            # Called LAST in each state so its m.next takes precedence.
+            with m.If(setup.received):
+                m.d.comb += relay.abort.eq(1)
+                m.d.usb += setup_pending.eq(is_class)
+                m.next = "DRAIN_THEN_STALL"
 
-                with m.State("DRAIN_THEN_STALL"):
-                    # We gave up before the relay did. STALL the host now so
-                    # it is not left waiting, but keep watching for the
-                    # relay's eventual completion: request_pending stays high
-                    # until it is acked, and it gates the arbiter's control
-                    # phase -- an unacked relay starves every interrupt
-                    # poller for good, and its stale response_valid would be
-                    # served to whatever request came next.
-                    with m.If(interface.data_requested | interface.status_requested):
-                        m.d.comb += handshake_generator.stall.eq(1)
-                    with m.If(relay.response_valid):
-                        m.d.comb += relay.response_ack.eq(1)
-                        m.next = "IDLE"
+        with m.FSM(domain="usb"):
+            with m.State("IDLE"):
+                m.d.usb += [
+                    defer_timer.eq(0),
+                    response_cursor.eq(0),
+                    out_cursor.eq(0),
+                    sending.eq(0),
+                ]
+                # Nothing is in flight here, so a strobe means we missed
+                # its SETUP. It must get a handshake -- silence is a
+                # transaction error -- but not a NAK: we will never have
+                # an answer, and a NAK would keep the host retrying until
+                # its own timeout. STALL ends it; the host retries afresh.
+                with m.If(interface.data_requested | interface.status_requested):
+                    m.d.comb += handshake_generator.stall.eq(1)
+                with m.If(setup.received & is_class):
+                    dispatch()
 
-                with m.State("ACK_STATUS"):
-                    # See the matching comment in the relay-less FSM above.
-                    with m.If(interface.status_requested):
+            with m.State("CAPTURE_OUT"):
+                # Same reasoning as IDLE: a stray IN or status strobe
+                # during the OUT data stage must get a handshake, not
+                # silence.
+                with m.If(
+                    (interface.data_requested | interface.status_requested)
+                    & ~interface.rx_ready_for_response
+                ):
+                    m.d.comb += handshake_generator.nak.eq(1)
+                # LUNA's OUT stream has NO backpressure and no buffer: a
+                # byte exists only on the cycle rx.valid & rx.next is
+                # high, so it must be forwarded the same cycle or lost.
+                with m.If(interface.rx.valid & interface.rx.next):
+                    m.d.comb += [
+                        relay.out_valid.eq(1),
+                        relay.out_data.eq(interface.rx.payload),
+                    ]
+                    m.d.usb += out_cursor.eq(out_cursor + 1)
+                # ACK each packet, but leave only once all wLength bytes
+                # are in. At Full Speed the host splits the data stage
+                # into packets of the cloned device's bMaxPacketSize0,
+                # which may be 8, 16 or 32; leaving after the first
+                # stranded the relay short of its length, forever.
+                with m.If(interface.rx_ready_for_response):
+                    m.d.comb += handshake_generator.ack.eq(1)
+                    with m.If(out_cursor >= setup.length):
+                        m.next = "AWAITING_TARGET"
+                # A host can also just stop sending (bus reset, cable
+                # pull) with no SETUP to tell us. Bound the wait.
+                m.d.usb += defer_timer.eq(defer_timer + 1)
+                with m.If(defer_timer == self._timeout_cycles):
+                    m.d.comb += relay.abort.eq(1)
+                    m.next = "DRAIN_THEN_STALL"
+                abandon_on_new_setup()
+
+            with m.State("AWAITING_TARGET"):
+                # LUNA does NOT auto-NAK. A handler that claims a request
+                # and drives nothing emits bus SILENCE, which the host
+                # reads as a transaction error and abandons after about
+                # three retries -- not as flow control. data_requested and
+                # status_requested are single-cycle combinational strobes,
+                # so the NAK has to be driven in the same cycle. This is
+                # the idiom LUNA's own USBInTransferManager uses.
+                with m.If(interface.data_requested | interface.status_requested):
+                    m.d.comb += handshake_generator.nak.eq(1)
+                m.d.usb += defer_timer.eq(defer_timer + 1)
+                with m.If(relay.response_valid & ~relay.response_error):
+                    m.next = "RESPOND"
+                with m.Elif(relay.response_valid):
+                    # The relay finished, but reported an error.
+                    m.d.comb += relay.response_ack.eq(1)
+                    m.next = "STALL"
+                with m.Elif(defer_timer == self._timeout_cycles):
+                    # LUNA has no timeout anywhere in its control path, so
+                    # without this bound a wedged target would hold EP0
+                    # open forever. USB 2.0 s9.2.6.4 allows only 50 ms for
+                    # a no-data-stage status phase.
+                    #
+                    # We cannot simply ack here: the relay is still mid
+                    # transfer and only consumes response_ack once it
+                    # reaches its own COMPLETE state, so an ack driven now
+                    # is dropped. Stall the host promptly, then drain the
+                    # relay separately.
+                    m.next = "DRAIN_THEN_STALL"
+                abandon_on_new_setup()
+
+            with m.State("RESPOND"):
+                m.d.comb += [
+                    relay.read_addr.eq(response_cursor),
+                    interface.tx.payload.eq(relay.read_data),
+                ]
+                # data_requested is a ONE-CYCLE strobe per IN token, so
+                # it can only start a packet, never carry one. Latch it
+                # and stream from the latch -- the idiom LUNA's own
+                # transmitters use. Restarting at byte 0 on every strobe
+                # also makes a retry after a lost host ACK resend the same
+                # packet, which is what the protocol requires.
+                with m.If(interface.data_requested):
+                    m.d.usb += response_cursor.eq(0)
+                    with m.If(response_limit == 0):
                         m.d.comb += self.send_zlp()
+                    with m.Else():
+                        m.d.usb += sending.eq(1)
+                with m.Elif(sending):
+                    m.d.comb += [
+                        interface.tx.valid.eq(1),
+                        interface.tx.first.eq(response_cursor == 0),
+                        interface.tx.last.eq(response_cursor == (response_limit - 1)),
+                    ]
+                    with m.If(interface.tx.ready):
+                        m.d.usb += response_cursor.eq(response_cursor + 1)
+                        with m.If(response_cursor == (response_limit - 1)):
+                            m.d.usb += sending.eq(0)
+
+                # The status stage runs opposite to the data stage. After
+                # IN data the host sends an OUT ZLP and we ACK it; after
+                # OUT data (SET_REPORT) the host sends an IN token and we
+                # answer with a ZLP. A handshake is not a valid reply to
+                # an IN token.
+                with m.If(interface.status_requested):
+                    with m.If(setup.is_in_request):
+                        m.d.comb += handshake_generator.ack.eq(1)
+                    with m.Else():
+                        m.d.comb += self.send_zlp()
+                    m.d.comb += relay.response_ack.eq(1)
+                    m.d.usb += sending.eq(0)
+                    m.next = "IDLE"
+                abandon_on_new_setup()
+
+            with m.State("DRAIN_THEN_STALL"):
+                # We gave up before the relay did. STALL the host now so
+                # it is not left waiting, but keep watching for the
+                # relay's eventual completion: request_pending stays high
+                # until it is acked, and it gates the arbiter's control
+                # phase -- an unacked relay starves every interrupt
+                # poller for good, and its stale response_valid would be
+                # served to whatever request came next.
+                with m.If(setup.received):
+                    m.d.usb += setup_pending.eq(is_class)
+                with m.If(interface.data_requested | interface.status_requested):
+                    with m.If(setup_pending):
+                        # A new request is waiting on us: hold it off.
+                        m.d.comb += handshake_generator.nak.eq(1)
+                    with m.Else():
+                        # We gave up on this transfer ourselves.
+                        m.d.comb += handshake_generator.stall.eq(1)
+                with m.If(relay.response_valid):
+                    m.d.comb += relay.response_ack.eq(1)
+                # Nothing to drain is also an exit -- e.g. we arrived from
+                # a local state (ACK_STATUS, STALL) the relay never saw.
+                with m.If(relay.response_valid | ~relay.request_pending):
+                    with m.If(setup_pending | (setup.received & is_class)):
+                        m.next = "DISPATCH"
+                    with m.Else():
                         m.next = "IDLE"
 
-                with m.State("STALL"):
-                    with m.If(interface.data_requested | interface.status_requested):
-                        m.d.comb += handshake_generator.stall.eq(1)
-                        m.next = "IDLE"
+            with m.State("DISPATCH"):
+                m.d.usb += [
+                    defer_timer.eq(0),
+                    response_cursor.eq(0),
+                    out_cursor.eq(0),
+                    sending.eq(0),
+                ]
+                with m.If(interface.data_requested | interface.status_requested):
+                    m.d.comb += handshake_generator.nak.eq(1)
+                dispatch()
+
+            with m.State("ACK_STATUS"):
+                # See the matching comment in the relay-less FSM above.
+                with m.If(interface.status_requested):
+                    m.d.comb += self.send_zlp()
+                    m.next = "IDLE"
+                abandon_on_new_setup()
+
+            with m.State("STALL"):
+                with m.If(interface.data_requested | interface.status_requested):
+                    m.d.comb += handshake_generator.stall.eq(1)
+                    m.next = "IDLE"
+                abandon_on_new_setup()
         return m

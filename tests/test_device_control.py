@@ -742,6 +742,8 @@ class _RelayStub(Elaboratable):
         self.response_ack = Signal()
         self.read_addr = Signal(6)
         self.read_data = Signal(8)
+        self.abort = Signal()
+        self.request_pending = Signal()
 
     def elaborate(self, platform):
         del platform
@@ -923,6 +925,9 @@ def test_timeout_still_releases_the_relay_or_pollers_starve_forever() -> None:
             index=3,
             length=64,
         )
+        # A real relay holds request_pending for the whole forward; the stub
+        # must too, or the drain's "nothing pending" exit fires immediately.
+        ctx.set(relay.request_pending, 1)
         # Run past the handler's deadline with the relay still working.
         for _ in range(80):
             await ctx.tick("usb")

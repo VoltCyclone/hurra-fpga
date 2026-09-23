@@ -885,8 +885,6 @@ class BoundedMouseEnumerator(Elaboratable):
                             ]
                             with m.If(current_descriptor_length != 9):
                                 m.d.usb += malformed.eq(1)
-                            with m.If(interface_count >= MAX_INTERFACES):
-                                m.d.usb += unsupported.eq(1)
                         with m.Elif(control.data == 0x21):
                             m.d.usb += hid_subordinate_phase.eq(0)
                             with m.If(cur_is_hid & (current_descriptor_length < 9)):
@@ -937,6 +935,18 @@ class BoundedMouseEnumerator(Elaboratable):
                                             cur_alt_nonzero.eq(1),
                                             interface_count.eq(interface_count - 1),
                                         ]
+                                    # The interface limit is checked HERE, not
+                                    # at type-byte time: only now is it known
+                                    # whether this descriptor is a new
+                                    # interface or an alternate setting of
+                                    # one already counted. Checking earlier
+                                    # counted a trailing alt setting as a
+                                    # fifth interface -- and disagreed with
+                                    # the Python mirror, which counts alt 0
+                                    # only. interface_count is post-increment
+                                    # here, hence > rather than >=.
+                                    with m.Elif(interface_count > MAX_INTERFACES):
+                                        m.d.usb += unsupported.eq(1)
                                 with m.Case(5):
                                     m.d.usb += cur_is_hid.eq(control.data == 3)
                         with m.Elif(current_descriptor_type == 0x21):

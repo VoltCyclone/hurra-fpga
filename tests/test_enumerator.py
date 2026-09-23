@@ -1589,3 +1589,74 @@ def test_relay_is_ignored_before_enumeration_completes() -> None:
         assert ctx.get(dut.control.request_type) != 0xA1
 
     simulate(bench)
+
+
+def _requests_for(config: bytes, report_interface: int, report_length: int) -> list[Request]:
+    """The full enumeration exchange for one HID interface in ``config``."""
+    return [
+        Request(0, 0x80, 6, 0x0100, 0, 8, 8, DEVICE[:8]),
+        Request(0, 0x00, 5, 1, 0, 0, 64),
+        Request(1, 0x80, 6, 0x0100, 0, 18, 64, DEVICE),
+        Request(1, 0x80, 6, 0x0200, 0, 9, 64, config[:9]),
+        Request(1, 0x80, 6, 0x0200, 0, len(config), 64, config),
+        Request(1, 0x00, 9, config[5], 0, 0, 64),
+        Request(1, 0x81, 6, 0x2200, report_interface, report_length, 64, bytes(report_length)),
+    ]
+
+
+def _assert_gateware_accepts(config: bytes, report_interface: int, report_length: int):
+    """Enumerate ``config`` on the real gateware; it must reach ready."""
+
+    async def bench(ctx, dut, control, timing) -> None:
+        await power_attach_and_reset(ctx, dut, timing)
+        await serve_all(ctx, dut, control, _requests_for(config, report_interface, report_length))
+        await settle(ctx)
+        assert (
+            ctx.get(dut.error_code) == HostError.NONE
+        ), f"gateware rejected it: {HostError(ctx.get(dut.error_code)).name}"
+        assert ctx.get(dut.ready)
+        assert ctx.get(dut.ep_count) == 1
+
+    simulate(bench)
+
+
+def test_trailing_alt_setting_after_the_fourth_interface_mirrors_python() -> None:
+    """Review I4: the two parsers disagreed on this input.
+
+    Four interfaces, the last of which also has an alternate setting. The
+    gateware checked MAX_INTERFACES at type-byte time, before
+    bAlternateSetting is readable, so the alt-setting descriptor counted as a
+    fifth interface and was rejected. The Python mirror counts only alt 0 and
+    accepted it. A DS4 happens to be safe -- its alt settings come before its
+    fourth interface -- but any device with trailing alt settings was not.
+    """
+    from hurra_cynthion.descriptors import parse_mouse_configuration
+
+    hid = (
+        bytes([9, 4, 0, 0, 1, 3, 0, 0, 0])
+        + bytes([9, 0x21, 0x11, 0x01, 0, 1, 0x22, 52, 0])
+        + bytes([7, 5, 0x81, 3, 8, 0, 10])
+    )
+    audio_control = bytes([9, 4, 1, 0, 0, 1, 1, 0, 0])
+    stream_2 = bytes([9, 4, 2, 0, 0, 1, 2, 0, 0])
+    stream_3_alt0 = bytes([9, 4, 3, 0, 0, 1, 2, 0, 0])
+    stream_3_alt1 = bytes([9, 4, 3, 1, 1, 1, 2, 0, 0]) + bytes(
+        [9, 5, 0x02, 0x01, 0xC0, 0x00, 0x01, 0x00, 0x00]
+    )
+    body = hid + audio_control + stream_2 + stream_3_alt0 + stream_3_alt1
+    total = 9 + len(body)
+    config = bytes([9, 2, total & 0xFF, total >> 8, 4, 7, 0, 0x80, 50]) + body
+
+    assert len(parse_mouse_configuration(config).endpoints) == 1, "Python mirror rejects it"
+    _assert_gateware_accepts(config, report_interface=0, report_length=52)
+
+
+def test_ds4_configuration_enumerates_on_the_gateware() -> None:
+    """The DS4 fixture had only ever been parsed by the Python mirror.
+
+    Phase A exists so the real enumerator accepts a DS4; this is the test
+    that says it does.
+    """
+    from _ds4_fixture import DS4_CONFIG_DESCRIPTOR
+
+    _assert_gateware_accepts(DS4_CONFIG_DESCRIPTOR, report_interface=3, report_length=507)

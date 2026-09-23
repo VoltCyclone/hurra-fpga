@@ -112,7 +112,8 @@ def _scripted_target(relay, *, in_payload: bytes, seen: dict):
 
             transferred = 0
             if is_in:
-                for byte in in_payload[:length]:
+                answer = in_payload(seen["request"][2]) if callable(in_payload) else in_payload
+                for byte in answer[:length]:
                     ctx.set(relay.ctl_data, byte)
                     ctx.set(relay.ctl_data_valid, 1)
                     await ctx.tick("usb").until(relay.ctl_data_ready)
@@ -140,6 +141,8 @@ def _run(bench, *, in_payload: bytes = b"") -> dict:
     )
 
     async def wrapped(ctx) -> None:
+        # In production the host drives this from enumerator.ready.
+        ctx.set(top.relay.enable, 1)
         await _power_up(ctx, top.bus, top.dut)
         await bench(ctx, top.bus, top.relay)
 
@@ -248,3 +251,71 @@ def test_deferral_is_nak_not_silence_on_the_wire() -> None:
         assert response[0] == DATA1
 
     _run(bench, in_payload=AUTH_RESPONSE)
+
+
+def _answer_by_value(value: int) -> bytes:
+    """Byte 0 of the answer echoes the low byte of wValue (the report ID).
+
+    Lets a test tell one request's answer from another's, so a stale reply
+    served to the wrong request is visible rather than coincidentally equal.
+    """
+    return bytes([value & 0xFF]) + AUTH_RESPONSE[1:]
+
+
+async def _get_report(ctx, bus, value: int, length: int = 16) -> list[int]:
+    """Run a GET_REPORT to completion, retrying once if it is STALLed."""
+    for _ in range(2):
+        await pc_setup_transaction(
+            ctx, bus, 0, setup_packet(0xA1, HID_GET_REPORT, value, 3, length)
+        )
+        response = await pc_in_transaction(ctx, bus, 0, 0)
+        if response == [0x1E]:  # STALL -- the host's move is to retry
+            continue
+        await pc_send(ctx, bus, [ACK])
+        await pc_send(ctx, bus, token_packet(OUT_PID, 0, 0))
+        await pc_send(ctx, bus, data_packet(DATA1, []))
+        assert await pc_receive(ctx, bus) == [ACK]
+        return response
+    raise AssertionError("GET_REPORT was STALLed twice in a row")
+
+
+def test_abandoned_set_report_does_not_wedge_the_relay() -> None:
+    """Review C1: a SET_REPORT abandoned before its data stage.
+
+    The host sends the SETUP, then a new SETUP instead of the OUT data. The
+    relay was left in CAPTURE_OUT forever, holding request_pending -- which
+    gates the arbiter, so every interrupt poller would starve until power
+    cycle. The next control transfer must still work.
+    """
+
+    async def bench(ctx, bus, relay) -> None:
+        await pc_setup_transaction(ctx, bus, 0, setup_packet(0x21, HID_SET_REPORT, 0x03F0, 3, 16))
+        # ...and abandon it: no OUT data, straight to a new request.
+        response = await _get_report(ctx, bus, 0x03F2)
+        assert response[1] == 0xF2, f"expected the 0xF2 report, got {response[1]:#x}"
+        await _assert_relay_released(ctx, relay)
+
+    _run(bench, in_payload=_answer_by_value)
+
+
+def test_new_setup_mid_transfer_never_gets_the_old_answer() -> None:
+    """Review I2: GET_REPORT A abandoned while deferred, then GET_REPORT B.
+
+    The handler only consulted setup.received in IDLE, so B's IN token was
+    answered from the buffer A's transfer filled -- the console would get the
+    wrong report, silently. B may be STALLed (the host retries); it must
+    never receive A's bytes.
+    """
+
+    async def bench(ctx, bus, relay) -> None:
+        await pc_setup_transaction(ctx, bus, 0, setup_packet(0xA1, HID_GET_REPORT, 0x03F1, 3, 16))
+        # One NAKed IN token, so A is genuinely in flight, then abandon it.
+        await pc_send(ctx, bus, token_packet(0x9, 0, 0))
+        assert await pc_receive(ctx, bus) == [NAK]
+        response = await _get_report(ctx, bus, 0x03F2)
+        assert (
+            response[1] == 0xF2
+        ), f"GET_REPORT(0xF2) was answered with report {response[1]:#x}: a stale reply"
+        await _assert_relay_released(ctx, relay)
+
+    _run(bench, in_payload=_answer_by_value)
