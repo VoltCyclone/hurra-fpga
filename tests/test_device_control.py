@@ -1011,3 +1011,46 @@ def test_oversized_relay_response_cannot_wrap_the_read_address() -> None:
         )
 
     _simulate_handler(bench, timeout_cycles=100000)
+
+
+def test_a_standard_setup_racing_the_drain_is_never_forwarded() -> None:
+    """Re-review N1: DISPATCH must only ever dispatch CLASS requests.
+
+    During DRAIN a class request is pending. If a STANDARD setup lands on the
+    very cycle the relay releases, the handler reached DISPATCH on the stale
+    pending flag and dispatched the latched STANDARD request -- forwarding
+    e.g. SET_ADDRESS to the REAL controller and making it unreachable. No
+    claim gate prevents that: the damage happens on the other bus.
+    """
+
+    async def bench(ctx, dut, relay) -> None:
+        setup = dut.interface.setup
+        await _send_setup(
+            ctx, dut, request_type=0xA1, request=HID_GET_REPORT, value=0x03F1, index=3, length=16
+        )
+        ctx.set(relay.request_pending, 1)
+        # A newer CLASS setup abandons it: DRAIN, with a class request pending.
+        await _send_setup(
+            ctx, dut, request_type=0xA1, request=HID_GET_REPORT, value=0x03F2, index=3, length=16
+        )
+        # On the relay's release cycle, a STANDARD SET_ADDRESS replaces it.
+        ctx.set(setup.recipient, 0)
+        ctx.set(setup.type, 0)  # STANDARD
+        ctx.set(setup.is_in_request, 0)
+        ctx.set(setup.request, 0x05)  # SET_ADDRESS
+        ctx.set(setup.value, 9)
+        ctx.set(setup.length, 0)
+        ctx.set(setup.received, 1)
+        ctx.set(relay.response_valid, 1)
+        await ctx.tick("usb")
+        ctx.set(setup.received, 0)
+        ctx.set(relay.response_valid, 0)
+        ctx.set(relay.request_pending, 0)
+        for _ in range(8):
+            await ctx.delay(1e-9)
+            assert not (
+                ctx.get(relay.request_valid) and ctx.get(relay.request) == 0x05
+            ), "a STANDARD SET_ADDRESS was forwarded to the real controller"
+            await ctx.tick("usb")
+
+    _simulate_handler(bench, timeout_cycles=1000)

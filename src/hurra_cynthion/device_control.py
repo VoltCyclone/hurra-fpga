@@ -397,11 +397,21 @@ class HIDClassRequestHandler(USBRequestHandler):
 
         is_class = setup.type == USBRequestType.CLASS
         setup_pending = Signal()
+        # CAPTURE_OUT may be entered while an OUT packet is already mid-flight
+        # (via DISPATCH). Accept only packets that STARTED while capturing.
+        # Arming on "rx.valid low" is wrong: LUNA drops rx.valid at the END of
+        # a packet, before rx_ready_for_response, so a packet whose bytes all
+        # went by during DISPATCH would arm in that gap and be ACKed with
+        # none of its bytes forwarded.
+        packet_ok = Signal()
+        rx_valid_prev = Signal()
+        m.d.usb += rx_valid_prev.eq(interface.rx.valid)
+        packet_start = interface.rx.valid & ~rx_valid_prev
 
         def dispatch() -> None:
             # Start handling the latched SETUP. Used by IDLE on a fresh
             # SETUP, and by DISPATCH for one that arrived while draining.
-            m.d.usb += setup_pending.eq(0)
+            m.d.usb += [setup_pending.eq(0), packet_ok.eq(0)]
             with m.Switch(setup.request):
                 with m.Case(_HID_SET_IDLE, _HID_SET_PROTOCOL):
                     m.next = "ACK_STATUS"
@@ -472,7 +482,9 @@ class HIDClassRequestHandler(USBRequestHandler):
                 # LUNA's OUT stream has NO backpressure and no buffer: a
                 # byte exists only on the cycle rx.valid & rx.next is
                 # high, so it must be forwarded the same cycle or lost.
-                with m.If(interface.rx.valid & interface.rx.next):
+                with m.If(packet_start):
+                    m.d.usb += packet_ok.eq(1)
+                with m.If((packet_ok | packet_start) & interface.rx.valid & interface.rx.next):
                     m.d.comb += [
                         relay.out_valid.eq(1),
                         relay.out_data.eq(interface.rx.payload),
@@ -484,9 +496,15 @@ class HIDClassRequestHandler(USBRequestHandler):
                 # which may be 8, 16 or 32; leaving after the first
                 # stranded the relay short of its length, forever.
                 with m.If(interface.rx_ready_for_response):
-                    m.d.comb += handshake_generator.ack.eq(1)
-                    with m.If(out_cursor >= setup.length):
-                        m.next = "AWAITING_TARGET"
+                    m.d.usb += packet_ok.eq(0)
+                    with m.If(packet_ok):
+                        m.d.comb += handshake_generator.ack.eq(1)
+                        with m.If(out_cursor >= setup.length):
+                            m.next = "AWAITING_TARGET"
+                    with m.Else():
+                        # Caught mid-flight: we forwarded none of it. NAK, and
+                        # the host resends the whole packet.
+                        m.d.comb += handshake_generator.nak.eq(1)
                 # A host can also just stop sending (bus reset, cable
                 # pull) with no SETUP to tell us. Bound the wait.
                 m.d.usb += defer_timer.eq(defer_timer + 1)
@@ -586,6 +604,13 @@ class HIDClassRequestHandler(USBRequestHandler):
                     with m.Else():
                         # We gave up on this transfer ourselves.
                         m.d.comb += handshake_generator.stall.eq(1)
+                with m.If(interface.rx_ready_for_response & setup_pending):
+                    # Its OUT data too. That arrives as rx_ready_for_response,
+                    # not as a data/status strobe, and silence there is a
+                    # transaction error that fails the very request we are
+                    # holding for. NAK is a valid reply to OUT data; the host
+                    # resends the same packet.
+                    m.d.comb += handshake_generator.nak.eq(1)
                 with m.If(relay.response_valid):
                     m.d.comb += relay.response_ack.eq(1)
                 # Nothing to drain is also an exit -- e.g. we arrived from
@@ -603,9 +628,22 @@ class HIDClassRequestHandler(USBRequestHandler):
                     out_cursor.eq(0),
                     sending.eq(0),
                 ]
-                with m.If(interface.data_requested | interface.status_requested):
+                with m.If(
+                    interface.data_requested
+                    | interface.status_requested
+                    | interface.rx_ready_for_response
+                ):
                     m.d.comb += handshake_generator.nak.eq(1)
-                dispatch()
+                # setup_pending can have been sampled on the very cycle a
+                # STANDARD setup replaced the pending class one. Dispatching
+                # that would forward e.g. SET_ADDRESS to the REAL controller
+                # and make it unreachable -- a side effect no claim gate
+                # prevents, because it happens on the other bus.
+                with m.If(is_class):
+                    dispatch()
+                with m.Else():
+                    m.next = "IDLE"
+                abandon_on_new_setup()
 
             with m.State("ACK_STATUS"):
                 # See the matching comment in the relay-less FSM above.
@@ -615,7 +653,11 @@ class HIDClassRequestHandler(USBRequestHandler):
                 abandon_on_new_setup()
 
             with m.State("STALL"):
-                with m.If(interface.data_requested | interface.status_requested):
+                with m.If(
+                    interface.data_requested
+                    | interface.status_requested
+                    | interface.rx_ready_for_response
+                ):
                     m.d.comb += handshake_generator.stall.eq(1)
                     m.next = "IDLE"
                 abandon_on_new_setup()

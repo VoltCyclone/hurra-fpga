@@ -319,3 +319,43 @@ def test_new_setup_mid_transfer_never_gets_the_old_answer() -> None:
         await _assert_relay_released(ctx, relay)
 
     _run(bench, in_payload=_answer_by_value)
+
+
+async def _out_data_retrying_naks(ctx, bus, payload: list[int]) -> None:
+    """Send one OUT data packet, resending it on NAK as a host does."""
+    for _ in range(60):
+        await pc_send(ctx, bus, token_packet(OUT_PID, 0, 0))
+        await pc_send(ctx, bus, data_packet(DATA1, payload))
+        # pc_receive raises on silence, which is the failure this guards.
+        handshake = await pc_receive(ctx, bus)
+        if handshake == [ACK]:
+            return
+        assert handshake == [NAK], f"OUT data got {handshake!r}, not ACK or NAK"
+    raise AssertionError("OUT data NAKed past the retry budget")
+
+
+def test_set_report_arriving_during_a_drain_is_held_off_not_lost() -> None:
+    """Re-review N2: OUT data for a request queued behind a drain.
+
+    I2's fix NAKs a new request while the abandoned one drains, then runs it.
+    But a SET_REPORT's OUT data arrives as rx_ready_for_response, not as the
+    data/status strobes DRAIN answered, so it got SILENCE -- the host sees
+    transaction errors and fails exactly the request I2 meant to rescue.
+    """
+
+    async def bench(ctx, bus, relay) -> None:
+        # GET_REPORT A in flight, then abandoned for SET_REPORT B.
+        await pc_setup_transaction(ctx, bus, 0, setup_packet(0xA1, HID_GET_REPORT, 0x03F1, 3, 16))
+        await pc_send(ctx, bus, token_packet(0x9, 0, 0))
+        assert await pc_receive(ctx, bus) == [NAK]
+        challenge = list(AUTH_CHALLENGE[:16])
+        await pc_setup_transaction(ctx, bus, 0, setup_packet(0x21, HID_SET_REPORT, 0x03F0, 3, 16))
+        await _out_data_retrying_naks(ctx, bus, challenge)
+        status = await pc_in_transaction(ctx, bus, 0, 0)
+        assert status and status[0] in (DATA0, DATA1) and status[1:-2] == [], status
+        await pc_send(ctx, bus, [ACK])
+        await _assert_relay_released(ctx, relay)
+
+    seen = _run(bench, in_payload=_answer_by_value)
+    assert seen["request"][1] == HID_SET_REPORT, f"B never reached the target: {seen['request']}"
+    assert seen["out_payload"] == AUTH_CHALLENGE[:16]
