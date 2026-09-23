@@ -181,7 +181,21 @@ REQUIRED_NEXTPNR_FLAG = "--placer-heap-timingweight"
 #: Margin at the pin is +3.82%; the next netlist change should expect to
 #: re-pin, and recovering a comfortable distribution needs the injection-plane
 #: timing pass described above, or area back.
-DEFAULT_PLACER_SEED = 4
+#:
+#: **Re-swept 2026-09-23 after the /code-review fixes: 2 of 12 pass.** Netlist
+#: sha 1d28ff1e6c316110 (native), 20,261 LUTs = 83% of the device:
+#:
+#:     8: 63.70   5: 62.68  |  12: 59.73  4: 59.22  10: 59.19  9: 59.02
+#:     6: 58.52   11: 58.21  7: 57.72   2: 57.64   1: 56.88   3: 55.10
+#:
+#: The pin moved 4 -> 8: seed 4 now fails. The critical path is STILL entirely
+#: pre-existing injection-plane logic (injection_plane.engine, map_receiving,
+#: map_store) on every failing seed -- the arbiter, relay and handler appear
+#: on none. But the trend across this branch is 12 -> 8 -> 10 -> 5 -> 2 of 12
+#: as utilisation rose 79% -> 83%, and at 2/12 the next netlist edit is more
+#: likely than not to leave the pin failing. The injection-plane timing pass
+#: is no longer optional background work; it gates further RTL changes.
+DEFAULT_PLACER_SEED = 8
 
 #: The full option, including the weight and seed that were actually measured.
 #: A caller-supplied ``--seed`` is composed after this one and wins, because
