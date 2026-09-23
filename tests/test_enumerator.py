@@ -1660,3 +1660,44 @@ def test_ds4_configuration_enumerates_on_the_gateware() -> None:
     from _ds4_fixture import DS4_CONFIG_DESCRIPTOR
 
     _assert_gateware_accepts(DS4_CONFIG_DESCRIPTOR, report_interface=3, report_length=507)
+
+
+def _hid_with_nine_byte_endpoint(synch_address: int) -> bytes:
+    """A HID interface whose interrupt-IN endpoint uses the 9-byte form."""
+    interface = bytes([9, 4, 0, 0, 1, 3, 0, 0, 0])
+    hid = bytes([9, 0x21, 0x11, 0x01, 0, 1, 0x22, 52, 0])
+    # bLength 9: ... bInterval=10 at offset 6, bRefresh at 7, bSynchAddress at 8.
+    endpoint = bytes([9, 5, 0x81, 3, 8, 0, 10, 0, synch_address])
+    body = interface + hid + endpoint
+    total = 9 + len(body)
+    return bytes([9, 2, total & 0xFF, total >> 8, 1, 7, 0, 0x80, 50]) + body
+
+
+@pytest.mark.parametrize("synch_address", [0, 3])
+def test_nine_byte_endpoint_interval_is_read_from_offset_six(synch_address: int) -> None:
+    """Review: bInterval of a 9-byte endpoint came from bSynchAddress.
+
+    The gateware captures an endpoint on its descriptor's LAST byte and took
+    control.data there as bInterval. For the 7-byte form that is offset 6,
+    bInterval; for the 9-byte form it is offset 8, bSynchAddress. So a zero
+    bSynchAddress failed enumeration as malformed, and any other value was
+    captured as the polling interval and handed to the PC. The Python mirror
+    reads data[offset + 6], so the two parsers disagreed.
+    """
+    from hurra_cynthion.descriptors import parse_mouse_configuration
+
+    config = _hid_with_nine_byte_endpoint(synch_address)
+    assert parse_mouse_configuration(config).endpoints[0].interval == 10
+
+    async def bench(ctx, dut, control, timing) -> None:
+        await power_attach_and_reset(ctx, dut, timing)
+        await serve_all(ctx, dut, control, _requests_for(config, 0, 52))
+        await settle(ctx)
+        assert (
+            ctx.get(dut.error_code) == HostError.NONE
+        ), f"gateware rejected it: {HostError(ctx.get(dut.error_code)).name}"
+        assert (
+            ctx.get(dut.ep_interval[0]) == 10
+        ), f"bInterval captured as {ctx.get(dut.ep_interval[0])}, not 10"
+
+    simulate(bench)

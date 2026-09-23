@@ -212,6 +212,11 @@ class BoundedMouseEnumerator(Elaboratable):
         endpoint_mps_low = Signal(8)
         ep_addr = Signal(8)
         ep_attrs = Signal(8)
+        # bInterval, latched at offset 6. Capture happens on the descriptor's
+        # LAST byte, which is bInterval only for the 7-byte form; for the
+        # 9-byte USB Audio form it is bSynchAddress, at offset 8.
+        ep_interval_q = Signal(8)
+        ep_interval_now = Mux(descriptor_position == 6, control.data, ep_interval_q)
         ep_mps = Signal(16)
         hid_declared_count = Signal(8)
         hid_subordinate_phase = Signal(2)
@@ -1000,6 +1005,8 @@ class BoundedMouseEnumerator(Elaboratable):
                                     m.d.usb += endpoint_mps_low.eq(control.data)
                                 with m.Case(5):
                                     m.d.usb += ep_mps.eq((control.data << 8) | endpoint_mps_low)
+                                with m.Case(6):
+                                    m.d.usb += ep_interval_q.eq(control.data)
 
                         with m.If(descriptor_position == current_descriptor_length - 1):
                             with m.If(current_descriptor_type == 0x21):
@@ -1029,7 +1036,7 @@ class BoundedMouseEnumerator(Elaboratable):
                                         m.d.usb += malformed.eq(1)
                                     with m.Elif(ep_mps > MAX_PACKET_SIZE):
                                         m.d.usb += unsupported.eq(1)
-                                    with m.Elif(control.data == 0):
+                                    with m.Elif(ep_interval_now == 0):
                                         m.d.usb += malformed.eq(1)
                                     with m.Elif(cur_report_length == 0):
                                         m.d.usb += malformed.eq(1)
@@ -1040,7 +1047,7 @@ class BoundedMouseEnumerator(Elaboratable):
                                             self.ep_interface[self.ep_count].eq(cur_interface),
                                             self.ep_number[self.ep_count].eq(ep_addr[:4]),
                                             self.ep_max_packet[self.ep_count].eq(ep_mps[:7]),
-                                            self.ep_interval[self.ep_count].eq(control.data),
+                                            self.ep_interval[self.ep_count].eq(ep_interval_now),
                                             self.ep_report_length[self.ep_count].eq(
                                                 cur_report_length
                                             ),
