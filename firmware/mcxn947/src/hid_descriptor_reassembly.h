@@ -37,6 +37,10 @@ typedef struct {
     uint16_t received_count;
     uint8_t target_interface;
     bool active;
+    // For hid_descriptor_reassembly_follow(): the generation whose first
+    // fragment chose target_interface.
+    uint16_t followed_generation;
+    bool following;
 } hid_descriptor_reassembly_t;
 
 // One instance follows exactly one interface. Retargeting always discards the
@@ -47,6 +51,16 @@ void hid_descriptor_reassembly_init(hid_descriptor_reassembly_t *reassembly,
 void hid_descriptor_reassembly_retarget(hid_descriptor_reassembly_t *reassembly,
                                         uint8_t target_interface);
 hid_descriptor_fragment_result_t hid_descriptor_reassembly_push(
+    hid_descriptor_reassembly_t *reassembly,
+    const inj_descriptor_fragment_payload_t *fragment);
+
+// push(), but first locking onto the interface of the FIRST fragment seen for
+// each descriptor generation. For when the caller cannot know in advance which
+// interface carries the HID descriptor -- enumeration accepts any HID device,
+// and a DS4's is interface 3. The lock never moves within a generation, so a
+// composite device's other interfaces are ignored rather than spliced in; it
+// moves only on a new generation, which discards the old descriptor anyway.
+hid_descriptor_fragment_result_t hid_descriptor_reassembly_follow(
     hid_descriptor_reassembly_t *reassembly,
     const inj_descriptor_fragment_payload_t *fragment);
 

@@ -247,8 +247,10 @@ static inj_session_t s_inj;
 // onto the panel. Written only by the retirement interrupt; copied into the
 // shared window by link_poll() with that interrupt masked. One instance, and
 // one interface: the FPGA's whole descriptor store is 4 KB for all interfaces
-// combined and enumeration only ever commits a HID boot mouse, so four of these
-// could never fill. See hid_descriptor_reassembly.h.
+// combined, so four of these could never fill. Which interface is not known up
+// front -- enumeration accepts any HID device, and a DS4's HID interface is 3 --
+// so it follows the first one each descriptor generation streams. See
+// hid_descriptor_reassembly_follow() in hid_descriptor_reassembly.h.
 static hid_descriptor_reassembly_t s_desc;
 static volatile bool s_desc_publish_pending;
 
@@ -677,7 +679,7 @@ static void link_inject_consume(void)
         } else if (frame.type == INJ_TYPE_DESCRIPTOR_FRAGMENT) {
             inj_descriptor_fragment_payload_t fragment;
             memcpy(&fragment, frame.payload, sizeof(fragment));
-            if (hid_descriptor_reassembly_push(&s_desc, &fragment) ==
+            if (hid_descriptor_reassembly_follow(&s_desc, &fragment) ==
                 HID_DESCRIPTOR_FRAGMENT_COMPLETE) {
                 // Only a flag here. Publishing means copying up to 2 KB into
                 // the shared window, and this runs in the 8 kHz retirement
@@ -1681,10 +1683,11 @@ void link_init(void)
 
     // The injection session, before the RX ISR that feeds and drains it is armed.
     inj_session_init(&s_inj);
-    // Interface 0: enumeration only commits a HID boot mouse and that is the
-    // interface its report descriptor arrives on. A DESCRIPTOR_FRAGMENT for any
-    // other interface is ignored rather than spliced in -- see
-    // hid_descriptor_reassembly.h on why splicing is the failure that matters.
+    // The initial target is a placeholder: the consume path follows the first
+    // interface each descriptor generation streams, since enumeration accepts
+    // any HID device (a DS4's HID interface is 3, not 0). Within a generation a
+    // DESCRIPTOR_FRAGMENT for any other interface is ignored rather than spliced
+    // in -- see hid_descriptor_reassembly.h on why splicing is what matters.
     hid_descriptor_reassembly_init(&s_desc, 0u);
     s_desc_publish_pending = false;
 

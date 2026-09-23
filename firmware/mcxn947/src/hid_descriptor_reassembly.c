@@ -36,6 +36,8 @@ void hid_descriptor_reassembly_init(hid_descriptor_reassembly_t *reassembly,
         return;
     }
     reassembly->target_interface = target_interface;
+    reassembly->followed_generation = 0u;
+    reassembly->following = false;
     discard_descriptor(reassembly);
 }
 
@@ -152,4 +154,22 @@ uint8_t hid_descriptor_reassembly_target_interface(
     const hid_descriptor_reassembly_t *reassembly)
 {
     return reassembly != NULL ? reassembly->target_interface : 0u;
+}
+
+hid_descriptor_fragment_result_t hid_descriptor_reassembly_follow(
+    hid_descriptor_reassembly_t *reassembly,
+    const inj_descriptor_fragment_payload_t *fragment)
+{
+    if (reassembly == NULL || fragment == NULL) {
+        return HID_DESCRIPTOR_FRAGMENT_ERR_ARGUMENT;
+    }
+    if (!reassembly->following ||
+        fragment->descriptor_generation != reassembly->followed_generation) {
+        // A new generation is a newly enumerated device. Retargeting discards
+        // everything held, so this can never splice two devices together.
+        hid_descriptor_reassembly_retarget(reassembly, fragment->interface_number);
+        reassembly->followed_generation = fragment->descriptor_generation;
+        reassembly->following = true;
+    }
+    return hid_descriptor_reassembly_push(reassembly, fragment);
 }

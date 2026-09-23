@@ -266,6 +266,67 @@ static void test_null_arguments_are_total_functions(void)
     hid_descriptor_reassembly_retarget(NULL, 0u);
 }
 
+// Enumeration no longer commits only a boot mouse on interface 0: any HID
+// device is accepted, and a DS4's HID interface is interface 3. A reassembly
+// pinned to interface 0 ignored every fragment and never published.
+static void test_follow_locks_onto_the_first_interface_of_a_generation(void)
+{
+    hid_descriptor_reassembly_t reassembly;
+    hid_descriptor_reassembly_init(&reassembly, 0u);
+    const inj_descriptor_fragment_payload_t first = fragment(4u, 3u, 0u, 20u, 0u);
+    const inj_descriptor_fragment_payload_t last = fragment(4u, 3u, 18u, 20u, 18u);
+
+    assert(hid_descriptor_reassembly_follow(&reassembly, &first) ==
+           HID_DESCRIPTOR_FRAGMENT_ACCEPTED);
+    assert(hid_descriptor_reassembly_follow(&reassembly, &last) ==
+           HID_DESCRIPTOR_FRAGMENT_COMPLETE);
+    assert(hid_descriptor_reassembly_target_interface(&reassembly) == 3u);
+    assert(hid_descriptor_reassembly_data(&reassembly)[19] == 19u);
+}
+
+// Within one generation the lock holds: a composite device's second HID
+// interface must be ignored, never spliced in and never allowed to steal the
+// target mid-descriptor. Splicing is the failure that matters here.
+static void test_follow_never_switches_interface_within_a_generation(void)
+{
+    hid_descriptor_reassembly_t reassembly;
+    hid_descriptor_reassembly_init(&reassembly, 0u);
+    const inj_descriptor_fragment_payload_t first = fragment(5u, 1u, 0u, 20u, 0u);
+    const inj_descriptor_fragment_payload_t other = fragment(5u, 2u, 0u, 20u, 0xa0u);
+    const inj_descriptor_fragment_payload_t last = fragment(5u, 1u, 18u, 20u, 18u);
+
+    assert(hid_descriptor_reassembly_follow(&reassembly, &first) ==
+           HID_DESCRIPTOR_FRAGMENT_ACCEPTED);
+    assert(hid_descriptor_reassembly_follow(&reassembly, &other) ==
+           HID_DESCRIPTOR_FRAGMENT_IGNORED_INTERFACE);
+    assert(hid_descriptor_reassembly_target_interface(&reassembly) == 1u);
+    assert(hid_descriptor_reassembly_follow(&reassembly, &last) ==
+           HID_DESCRIPTOR_FRAGMENT_COMPLETE);
+    assert(hid_descriptor_reassembly_data(&reassembly)[0] == 0u);
+}
+
+// A new generation is a newly enumerated device, so it may be on a
+// different interface. Re-locking there cannot splice: the old descriptor is
+// discarded either way.
+static void test_follow_relocks_on_a_new_generation(void)
+{
+    hid_descriptor_reassembly_t reassembly;
+    hid_descriptor_reassembly_init(&reassembly, 0u);
+    const inj_descriptor_fragment_payload_t mouse = fragment(6u, 0u, 0u, 20u, 0u);
+    const inj_descriptor_fragment_payload_t pad_first = fragment(7u, 3u, 0u, 20u, 0x40u);
+    const inj_descriptor_fragment_payload_t pad_last = fragment(7u, 3u, 18u, 20u, 0x52u);
+
+    assert(hid_descriptor_reassembly_follow(&reassembly, &mouse) ==
+           HID_DESCRIPTOR_FRAGMENT_ACCEPTED);
+    assert(hid_descriptor_reassembly_follow(&reassembly, &pad_first) ==
+           HID_DESCRIPTOR_FRAGMENT_ACCEPTED);
+    assert(hid_descriptor_reassembly_target_interface(&reassembly) == 3u);
+    assert(hid_descriptor_reassembly_follow(&reassembly, &pad_last) ==
+           HID_DESCRIPTOR_FRAGMENT_COMPLETE);
+    assert(hid_descriptor_reassembly_generation(&reassembly) == 7u);
+    assert(hid_descriptor_reassembly_data(&reassembly)[0] == 0x40u);
+}
+
 int main(void)
 {
     test_out_of_order_fragments_complete_without_splicing_gaps();
@@ -282,6 +343,9 @@ int main(void)
     test_conflicting_duplicate_is_rejected_without_overwrite();
     test_same_generation_total_change_discards_partial_data();
     test_null_arguments_are_total_functions();
+    test_follow_locks_onto_the_first_interface_of_a_generation();
+    test_follow_never_switches_interface_within_a_generation();
+    test_follow_relocks_on_a_new_generation();
     puts("hid_descriptor_reassembly_test: all passed");
     return 0;
 }
