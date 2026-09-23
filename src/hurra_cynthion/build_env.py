@@ -161,7 +161,27 @@ REQUIRED_NEXTPNR_FLAG = "--placer-heap-timingweight"
 #:
 #: Note this is the -8 speed grade every build assumes. The BOM part is -6,
 #: which closed 0 of 12 even before this change.
-DEFAULT_PLACER_SEED = 2
+#:
+#: **Re-swept 2026-09-23 after the relay's correctness fixes: 5 of 12 pass.**
+#: Netlist sha 2ddb88fa23288f6a (native, ``~/hurra-work``):
+#:
+#:     4: 62.29   5: 61.72   1: 61.12   11: 60.38  9: 60.36  |  8: 59.96
+#:     6: 59.60   3: 59.48   12: 58.51  7: 57.79   2: 57.73  10: 55.09
+#:
+#: The pin moved 2 -> 4: seed 2 now fails. Two review waves fixed real
+#: defects in the relay's AUX handler (a permanent poller starvation, stale
+#: replies, a STANDARD request forwarded to the real device) and added about
+#: 550 LUTs doing it -- 19,448 -> 19,998, 80% -> 82% of the device. Seed 2
+#: was already failing on the intermediate netlist (10/12, sha 69356e96),
+#: which is the point: every netlist edit redraws this lottery.
+#:
+#: The critical path is still entirely pre-existing logic -- 26 hops in
+#: injection_plane.engine plus copy_enable -- on every failing seed; no
+#: relay or handler logic is on it. Placement pressure, not new slow logic.
+#: Margin at the pin is +3.82%; the next netlist change should expect to
+#: re-pin, and recovering a comfortable distribution needs the injection-plane
+#: timing pass described above, or area back.
+DEFAULT_PLACER_SEED = 4
 
 #: The full option, including the weight and seed that were actually measured.
 #: A caller-supplied ``--seed`` is composed after this one and wins, because
