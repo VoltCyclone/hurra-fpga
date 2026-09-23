@@ -349,8 +349,13 @@ class HIDClassRequestHandler(USBRequestHandler):
                                 with m.Default():
                                     m.next = "STALL"
                     with m.State("ACK_STATUS"):
+                        # SET_IDLE and SET_PROTOCOL carry no data stage, so
+                        # their status stage is an IN token, and the answer
+                        # is a zero-length DATA1 packet (USB 2.0 s8.5.3) --
+                        # not a bare ACK handshake, which is not a valid
+                        # reply to an IN token at all.
                         with m.If(interface.status_requested):
-                            m.d.comb += handshake_generator.ack.eq(1)
+                            m.d.comb += self.send_zlp()
                             m.next = "IDLE"
                     with m.State("STALL"):
                         with m.If(interface.data_requested | interface.status_requested):
@@ -367,6 +372,7 @@ class HIDClassRequestHandler(USBRequestHandler):
             relay_buffer_bytes = 1 << len(relay.read_addr)
             response_cursor = Signal(range(relay_buffer_bytes + 1))
             out_cursor = Signal(16)
+            sending = Signal()
             # A target that reports more bytes than the buffer can hold must
             # not be able to drive the cursor past the end.
             response_limit = Signal(range(relay_buffer_bytes + 1))
@@ -475,22 +481,41 @@ class HIDClassRequestHandler(USBRequestHandler):
                         relay.read_addr.eq(response_cursor),
                         interface.tx.payload.eq(relay.read_data),
                     ]
+                    # data_requested is a ONE-CYCLE strobe per IN token, so
+                    # it can only start a packet, never carry one. Latch it
+                    # and stream from the latch -- the idiom LUNA's own
+                    # transmitters use. Restarting at byte 0 on every strobe
+                    # also makes a retry after a lost host ACK resend the same
+                    # packet, which is what the protocol requires.
                     with m.If(interface.data_requested):
-                        with m.If(response_cursor < response_limit):
-                            m.d.comb += [
-                                interface.tx.valid.eq(1),
-                                interface.tx.first.eq(response_cursor == 0),
-                                interface.tx.last.eq(response_cursor == (response_limit - 1)),
-                            ]
-                            with m.If(interface.tx.ready):
-                                m.d.usb += response_cursor.eq(response_cursor + 1)
+                        m.d.usb += response_cursor.eq(0)
+                        with m.If(response_limit == 0):
+                            m.d.comb += self.send_zlp()
+                        with m.Else():
+                            m.d.usb += sending.eq(1)
+                    with m.Elif(sending):
+                        m.d.comb += [
+                            interface.tx.valid.eq(1),
+                            interface.tx.first.eq(response_cursor == 0),
+                            interface.tx.last.eq(response_cursor == (response_limit - 1)),
+                        ]
+                        with m.If(interface.tx.ready):
+                            m.d.usb += response_cursor.eq(response_cursor + 1)
+                            with m.If(response_cursor == (response_limit - 1)):
+                                m.d.usb += sending.eq(0)
+
+                    # The status stage runs opposite to the data stage. After
+                    # IN data the host sends an OUT ZLP and we ACK it; after
+                    # OUT data (SET_REPORT) the host sends an IN token and we
+                    # answer with a ZLP. A handshake is not a valid reply to
+                    # an IN token.
+                    with m.If(interface.status_requested):
+                        with m.If(setup.is_in_request):
+                            m.d.comb += handshake_generator.ack.eq(1)
                         with m.Else():
                             m.d.comb += self.send_zlp()
-                    with m.If(interface.status_requested):
-                        m.d.comb += [
-                            handshake_generator.ack.eq(1),
-                            relay.response_ack.eq(1),
-                        ]
+                        m.d.comb += relay.response_ack.eq(1)
+                        m.d.usb += sending.eq(0)
                         m.next = "IDLE"
 
                 with m.State("DRAIN_THEN_STALL"):
@@ -508,8 +533,9 @@ class HIDClassRequestHandler(USBRequestHandler):
                         m.next = "IDLE"
 
                 with m.State("ACK_STATUS"):
+                    # See the matching comment in the relay-less FSM above.
                     with m.If(interface.status_requested):
-                        m.d.comb += handshake_generator.ack.eq(1)
+                        m.d.comb += self.send_zlp()
                         m.next = "IDLE"
 
                 with m.State("STALL"):

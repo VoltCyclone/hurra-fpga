@@ -551,7 +551,11 @@ def test_get_descriptor_routes_through_handler_to_streamer():
     sim.run()
 
 
-def test_hid_set_idle_is_acked():
+def test_hid_set_idle_status_stage_sends_a_zlp():
+    # Renamed from test_hid_set_idle_is_acked, which asserted a bare ACK
+    # handshake -- not a valid reply to the IN token that SET_IDLE's status
+    # stage carries. tests/test_device_clone_e2e.py checks the same thing on
+    # the wire.
     handler = HIDClassRequestHandler()
     m = Module()
     m.submodules.handler = handler
@@ -571,13 +575,14 @@ def test_hid_set_idle_is_acked():
         await ctx.tick("usb")
         ctx.set(iface.setup.received, 0)
         ctx.set(iface.status_requested, 1)
-        acked = False
+        zlp = False
         for _ in range(10):
-            if ctx.get(iface.handshakes_out.ack):
-                acked = True
+            if ctx.get(iface.tx.valid) and ctx.get(iface.tx.last) and not ctx.get(iface.tx.first):
+                zlp = True
                 break
             await ctx.tick("usb")
-        assert acked
+        assert zlp, "SET_IDLE status stage must be a zero-length packet"
+        assert not ctx.get(iface.handshakes_out.ack), "a handshake is not a reply to IN"
 
     sim.add_testbench(bench)
     sim.run()
@@ -843,7 +848,7 @@ def test_claim_is_held_across_the_entire_deferral() -> None:
     _simulate_handler(bench, timeout_cycles=1000)
 
 
-def test_set_idle_still_acks_locally_without_touching_the_relay() -> None:
+def test_set_idle_answers_locally_without_touching_the_relay() -> None:
     async def bench(ctx, dut, relay) -> None:
         setup = dut.interface.setup
         ctx.set(setup.recipient, 0x01)
@@ -858,7 +863,10 @@ def test_set_idle_still_acks_locally_without_touching_the_relay() -> None:
         ctx.set(setup.received, 0)
         ctx.set(dut.interface.status_requested, 1)
         await ctx.delay(1e-9)
-        assert ctx.get(dut.interface.handshakes_out.ack) == 1
+        # A ZLP: valid and last without first (LUNA's send_zlp idiom).
+        assert ctx.get(dut.interface.tx.valid) == 1
+        assert ctx.get(dut.interface.tx.last) == 1
+        assert ctx.get(dut.interface.handshakes_out.ack) == 0
 
     _simulate_handler(bench)
 
@@ -967,14 +975,16 @@ def test_oversized_relay_response_cannot_wrap_the_read_address() -> None:
 
         # Drain more packets than the buffer holds; the address must never
         # wrap back to a byte it already served.
-        # data_requested must stay high ACROSS the clock edge: the cursor
-        # advances in m.d.usb, so deasserting it before the edge would mean
-        # it never increments and the test would prove nothing.
+        # data_requested is a ONE-cycle strobe per IN token in LUNA; holding it
+        # high would restart the packet every cycle. Pulse it once, then let
+        # the handler stream the packet from its own latch.
         seen = []
         last_at = None
         ctx.set(dut.interface.tx.ready, 1)
+        ctx.set(dut.interface.data_requested, 1)
+        await ctx.tick("usb")
+        ctx.set(dut.interface.data_requested, 0)
         for _ in range(80):
-            ctx.set(dut.interface.data_requested, 1)
             await ctx.delay(1e-9)
             if ctx.get(dut.interface.tx.valid):
                 if ctx.get(dut.interface.tx.last) and last_at is None:

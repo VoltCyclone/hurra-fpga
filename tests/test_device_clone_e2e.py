@@ -501,3 +501,34 @@ def test_get_descriptor_at_every_directory_slot(n_decoys: int):
 
     sim.add_testbench(bench)
     sim.run()
+
+
+HID_SET_IDLE = 0x0A
+
+
+def test_hid_set_idle_status_stage_is_a_zero_length_packet():
+    """SET_IDLE is a no-data host->device request, so its status stage is IN.
+
+    USB 2.0 s8.5.3: the device answers a status-stage IN token with a
+    zero-length DATA1 packet. A bare ACK handshake is not a valid answer to an
+    IN token -- the host is waiting for a data packet. LUNA's own SET_ADDRESS
+    and CDC-ACM SET_LINE_CODING handlers both send_zlp() here.
+
+    This is checked on the wire rather than at the handler's outputs, because
+    at the handler both answers look like "a handshake signal went high".
+    """
+    top, sim = _make_top()
+    bus, dut = top.bus, top.dut
+
+    async def bench(ctx):
+        await _power_up(ctx, bus, dut)
+        await pc_setup_transaction(ctx, bus, 0, setup_packet(0x21, HID_SET_IDLE, 0, 0, 0))
+        status = await pc_in_transaction(ctx, bus, 0, 0)
+        assert status and status[0] in (
+            DATA0,
+            DATA1,
+        ), f"SET_IDLE status stage was not a DATA packet: {status!r}"
+        assert status[1:-2] == [], "SET_IDLE status stage was not zero-length"
+
+    sim.add_testbench(bench)
+    sim.run()
