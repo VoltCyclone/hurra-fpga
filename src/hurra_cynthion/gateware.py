@@ -755,7 +755,14 @@ class CynthionMouseHostTop(Elaboratable):
         # silently overrides the speed policy register. This port measured
         # "Up to 12 Mb/s" on the host until the translator was removed here.
         aux_phy = platform.request("aux_phy")
-        m.submodules.device = device = MouseCloneDevice(bus=aux_phy, store=host.descriptor_store)
+        m.submodules.device = device = MouseCloneDevice(
+            bus=aux_phy,
+            store=host.descriptor_store,
+            # Forward the PC's HID class control requests to the real device.
+            # Same `usb` domain as the host -- the descriptor store above
+            # already crosses this boundary with no CDC.
+            control_relay=host.control_relay,
+        )
         self.device = device
 
         m.submodules.injection_plane = injection_plane = ReportInjectionDataPlane(

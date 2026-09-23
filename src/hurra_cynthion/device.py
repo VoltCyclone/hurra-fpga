@@ -188,9 +188,14 @@ class MouseCloneDevice(Elaboratable):
     change output.
     """
 
-    def __init__(self, bus, store):
+    def __init__(self, bus, store, control_relay=None):
         self._bus = bus
         self.store = store
+        # The host-side ControlRelay that forwards HID class control requests
+        # to the real device on TARGET. None keeps the relay-less behaviour
+        # (STALL unknown class requests), which the diagnostic tops use.
+        # Distinct from ``self.relay`` below, which relays *reports*.
+        self.control_relay = control_relay
 
         self.connect = Signal()
         self.configured = Signal()
@@ -248,7 +253,7 @@ class MouseCloneDevice(Elaboratable):
 
         control_ep = device.add_control_endpoint()
         control_ep.add_request_handler(self._std_handler)
-        control_ep.add_request_handler(HIDClassRequestHandler())
+        control_ep.add_request_handler(HIDClassRequestHandler(relay=self.control_relay))
         setup = self._std_handler.interface.setup
 
         for index, epnum in enumerate(RELAY_ENDPOINT_NUMBERS):
