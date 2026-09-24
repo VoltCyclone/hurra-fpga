@@ -219,7 +219,17 @@ REQUIRED_NEXTPNR_FLAG = "--placer-heap-timingweight"
 #: The new limiters are ``map_store`` bank state -> ``engine.working_*`` (the
 #: snapshot path) and, on 3 seeds, ``control_relay.response_length`` ->
 #: descriptor memory. The pin moved 8 -> 1; seed 8 is now the worst.
-DEFAULT_PLACER_SEED = 1
+#:
+#: **Re-swept 2026-09-24 after the zero-length-IN status fix: 12 of 12.**
+#: Netlist sha 3227b06bb4985a69 (native), 19,370 LUTs = 79%:
+#:
+#:     6: 72.91   10: 71.64  4: 70.20   9: 69.81   2: 69.27   3: 69.18
+#:     8: 69.06   1: 68.92   5: 68.75   11: 68.14  7: 66.02   12: 65.01
+#:
+#: A one-term handler change redrew placement and the whole distribution
+#: moved up (median 66.2 -> 69.1, worst +5.3% -> +8.4%) -- noise, not an
+#: improvement, but noise now well clear of the constraint. Pin 1 -> 6.
+DEFAULT_PLACER_SEED = 6
 
 #: The full option, including the weight and seed that were actually measured.
 #: A caller-supplied ``--seed`` is composed after this one and wins, because
