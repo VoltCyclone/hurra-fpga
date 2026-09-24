@@ -583,9 +583,11 @@ class HIDClassRequestHandler(USBRequestHandler):
                 # IN data the host sends an OUT ZLP and we ACK it; after
                 # OUT data (SET_REPORT) the host sends an IN token and we
                 # answer with a ZLP. A handshake is not a valid reply to
-                # an IN token.
+                # an IN token. With no data stage at all the status stage
+                # is IN whatever bmRequestType's direction [USB2.0 8.5.3],
+                # so a zero-length IN request also gets the ZLP.
                 with m.If(interface.status_requested):
-                    with m.If(setup.is_in_request):
+                    with m.If(setup.is_in_request & (setup.length != 0)):
                         m.d.comb += handshake_generator.ack.eq(1)
                     with m.Else():
                         m.d.comb += self.send_zlp()

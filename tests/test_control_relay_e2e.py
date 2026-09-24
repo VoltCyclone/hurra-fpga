@@ -229,6 +229,29 @@ def test_set_report_round_trips_verbatim(length: int) -> None:
         ), f"payload altered in transit: {seen['out_payload'].hex()}"
 
 
+def test_zero_length_in_request_ends_with_a_status_zlp() -> None:
+    """PR review: an IN request with wLength 0 has no data stage.
+
+    With no data stage the status stage is always IN [USB2.0 8.5.3], so the
+    device must answer the host's IN token with a zero-length DATA1 packet --
+    whatever direction bmRequestType names. Choosing the status reply from
+    ``is_in_request`` alone answered it with a bare ACK handshake, which is
+    not a valid reply to an IN token.
+    """
+
+    async def bench(ctx, bus, relay) -> None:
+        await pc_setup_transaction(ctx, bus, 0, setup_packet(0xA1, HID_GET_REPORT, 0x03F1, 3, 0))
+        status = await pc_in_transaction(ctx, bus, 0, 0)
+        assert status and status[0] == DATA1, f"status IN was not DATA1: {status!r}"
+        assert status[1:-2] == [], "status IN stage was not a zero-length packet"
+        await pc_send(ctx, bus, [ACK])
+
+        await _assert_relay_released(ctx, relay)
+
+    seen = _run(bench, in_payload=AUTH_RESPONSE)
+    assert seen["request"] == (0xA1, HID_GET_REPORT, 0x03F1, 3, 0)
+
+
 def test_deferral_is_nak_not_silence_on_the_wire() -> None:
     """While the target works, every IN token gets a NAK.
 

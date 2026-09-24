@@ -9,6 +9,8 @@ from amaranth.sim import Simulator
 from cynthion.gateware.platform import CynthionPlatformRev1D4
 from luna.gateware.interface.utmi import UTMIInterface
 
+from hurra_cynthion.control import USBControlTransferEngine
+from hurra_cynthion.control_relay import ControlRelay
 from hurra_cynthion.descriptors import MAX_ENDPOINTS
 from hurra_cynthion.gateware import (
     _INJECTION_LINK_PMOD_A,
@@ -855,5 +857,136 @@ def test_a_forwarded_control_transfer_waits_for_the_poller_to_finish_copying() -
         assert ctx.get(dut.engine.start)
         assert ctx.get(dut.engine.rx_read_index) == 33
 
+    simulation.add_testbench(bench)
+    simulation.run()
+
+
+class _RelayOverArbiterHarness(Elaboratable):
+    """ControlRelay -> real USBControlTransferEngine -> real arbiter -> scripted engine.
+
+    Wired as host.py wires them, minus the enumerator's passthrough (which
+    only forwards the same signals once ``ready``).
+    """
+
+    def __init__(self) -> None:
+        self.engine = ScriptedEngine()
+        self.control_port = USBHostTransactionPort()
+        self.poller_port = USBHostTransactionPort()
+        self.arbiter = USBHostTransactionArbiter(
+            engine=self.engine,
+            control_port=self.control_port,
+            poller_ports=[self.poller_port],
+        )
+        self.control = USBControlTransferEngine(
+            transaction=self.control_port,
+            timing=HostTiming.simulation(),
+            add_transaction_submodule=False,
+        )
+        self.relay = ControlRelay()
+
+    def elaborate(self, platform) -> Module:
+        del platform
+        m = Module()
+        m.submodules.engine = self.engine
+        m.submodules.arbiter = self.arbiter
+        m.submodules.control = self.control
+        m.submodules.relay = relay = self.relay
+        control = self.control
+        m.d.comb += [
+            self.arbiter.connected.eq(1),
+            self.arbiter.control_phase.eq(relay.engine_owned),
+            relay.enable.eq(1),
+            control.connected.eq(1),
+            control.address.eq(5),
+            control.max_packet_size.eq(8),
+            control.start.eq(relay.ctl_start),
+            control.request_type.eq(relay.ctl_request_type),
+            control.request.eq(relay.ctl_request),
+            control.value.eq(relay.ctl_value),
+            control.index.eq(relay.ctl_index),
+            control.length.eq(relay.ctl_length),
+            control.out_payload.eq(relay.ctl_out_payload),
+            control.data_ready.eq(relay.ctl_data_ready),
+            relay.ctl_busy.eq(control.busy),
+            relay.ctl_done.eq(control.done),
+            relay.ctl_status.eq(control.status),
+            relay.ctl_transferred.eq(control.transferred),
+            relay.ctl_data.eq(control.data),
+            relay.ctl_data_valid.eq(control.data_valid),
+            relay.ctl_data_first.eq(control.data_first),
+            relay.ctl_data_last.eq(control.data_last),
+            relay.ctl_out_index.eq(control.out_index),
+        ]
+        return m
+
+
+def test_a_relay_start_while_a_poller_is_busy_completes_once_the_poller_releases() -> None:
+    """PR review: does the relay hang if the arbiter withholds its start?
+
+    The concern was that ControlRelay leaves ISSUE on ``~ctl_busy`` without
+    the arbiter's grant, so a start suppressed by ``poller_busy`` would leave
+    it in AWAIT forever with ``engine_owned`` -- and so ``control_phase`` --
+    held high.
+
+    It does not, because the two handshakes are at different levels. The
+    relay's ``ctl_start`` goes to USBControlTransferEngine, which accepts it
+    in IDLE unconditionally. The arbiter's ``start_ready`` gates the
+    *transactions* that engine then issues, and it holds each one in its
+    ISSUE_* state until granted. This drives a poller-busy window across the
+    relay's start and checks the transfer still completes.
+    """
+    dut = _RelayOverArbiterHarness()
+    simulation = Simulator(dut)
+    simulation.add_clock(1e-6, domain="usb")
+
+    async def responder(ctx) -> None:
+        # Answer every transaction the arbiter lets through with SUCCESS.
+        async for _, _, start in ctx.tick("usb").sample(dut.engine.start):
+            if start:
+                ctx.set(dut.engine.done, 1)
+                ctx.set(dut.engine.status, TransactionStatus.SUCCESS.value)
+            else:
+                ctx.set(dut.engine.done, 0)
+
+    async def bench(ctx) -> None:
+        relay = dut.relay
+        ctx.set(dut.arbiter.poller_busy, 1)
+        # SET_IDLE-shaped: class OUT to the interface, no data stage.
+        ctx.set(relay.request_type, 0x21)
+        ctx.set(relay.request, 0x0A)
+        ctx.set(relay.length, 0)
+        ctx.set(relay.request_valid, 1)
+        await ctx.tick("usb")
+        ctx.set(relay.request_valid, 0)
+
+        saw_control_start = False
+        for _ in range(40):
+            await ctx.tick("usb")
+            saw_control_start |= bool(ctx.get(dut.control.busy))
+            assert not ctx.get(dut.engine.start), "granted while a poller owns the buffer"
+            assert not ctx.get(relay.response_valid)
+        assert saw_control_start, "the control engine must have taken the relay's start"
+        assert ctx.get(relay.engine_owned)
+
+        ctx.set(dut.arbiter.poller_busy, 0)
+        grants = []
+        for _ in range(40):
+            await ctx.delay(1e-9)
+            if ctx.get(dut.engine.start):
+                grants.append(ctx.get(dut.engine.token_pid))
+            if ctx.get(relay.response_valid):
+                break
+            await ctx.tick("usb")
+        else:
+            raise AssertionError("relay never completed after the poller released")
+        assert not ctx.get(relay.response_error)
+        assert grants == [0b1101, 0b1001], f"expected SETUP then status IN, got {grants}"
+        ctx.set(relay.response_ack, 1)
+        await ctx.tick("usb")
+        ctx.set(relay.response_ack, 0)
+        await ctx.tick("usb")
+        assert not ctx.get(relay.engine_owned), "control_phase must be released"
+
+    simulation.add_process(responder)
     simulation.add_testbench(bench)
     simulation.run()
