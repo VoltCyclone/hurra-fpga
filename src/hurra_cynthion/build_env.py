@@ -195,7 +195,31 @@ REQUIRED_NEXTPNR_FLAG = "--placer-heap-timingweight"
 #: as utilisation rose 79% -> 83%, and at 2/12 the next netlist edit is more
 #: likely than not to leave the pin failing. The injection-plane timing pass
 #: is no longer optional background work; it gates further RTL changes.
-DEFAULT_PLACER_SEED = 8
+#:
+#: **Re-swept 2026-09-24 after the injection-plane timing pass: 12 of 12
+#: pass.** Netlist sha ad125c63565eb8de (native), 19,407 LUTs = 79%:
+#:
+#:     1: 70.16   10: 68.38  12: 67.65  4: 67.52   7: 67.21   9: 66.73
+#:     11: 65.81  6: 65.59   2: 65.21   5: 64.45   3: 63.27   8: 63.20
+#:
+#: Median 66.2 MHz, worst +5.3%. Every failing path of the 2/12 netlist was
+#: one of two 15-22 LUT combinational cones ending on map-store clock
+#: enables, both ~80% routing delay:
+#:
+#: - ``poller.failed -> host.enumerated -> session_active -> invalidate``,
+#:   cut by registering ``session_active`` / ``link_ready`` at the plane's
+#:   edge (gateware.py). Registering it inside the host, as tried above, also
+#:   delayed device.connect and broke the disconnect tests.
+#: - ``map_store.active_bank -> engine output handshake -> *_ready ->
+#:   command_ready -> rx_accept -> begin/entry/commit_accept``, cut by
+#:   giving map frames their own accept term without ``command_ready`` --
+#:   logically identical for them, since a map frame is never a command.
+#:
+#: Fixing only the first is the 7/12 attempt above: the second surfaced.
+#: The new limiters are ``map_store`` bank state -> ``engine.working_*`` (the
+#: snapshot path) and, on 3 seeds, ``control_relay.response_length`` ->
+#: descriptor memory. The pin moved 8 -> 1; seed 8 is now the worst.
+DEFAULT_PLACER_SEED = 1
 
 #: The full option, including the weight and seed that were actually measured.
 #: A caller-supplied ``--seed`` is composed after this one and wins, because

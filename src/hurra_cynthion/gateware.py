@@ -295,9 +295,18 @@ class ReportInjectionDataPlane(Elaboratable):
             )
         )
         rx_accept = rx_staged_valid & decoded_ready & ~invalidate
-        begin_accept = rx_accept & self.sequence_class_allowed & is_map_begin & ~map_store.busy
-        entry_accept = rx_accept & self.sequence_class_allowed & is_map_entry & map_receiving
-        commit_accept = rx_accept & self.sequence_class_allowed & is_map_commit & map_receiving
+        # rx_accept restated for map frames. For a non-command frame
+        # decoded_ready reduces to sequence_class_valid once ~invalidate holds,
+        # so this is the same predicate -- but it leaves command_ready out of
+        # the cone. Through rx_accept, the engine's report handshake
+        # (output_ready, snapshot_matches) reached every clock enable in the
+        # map store, and was the critical path on 5 of 12 seeds.
+        map_accept = (
+            rx_staged_valid & ~invalidate & self.sequence_class_valid & self.sequence_class_allowed
+        )
+        begin_accept = map_accept & is_map_begin & ~map_store.busy
+        entry_accept = map_accept & is_map_entry & map_receiving
+        commit_accept = map_accept & is_map_commit & map_receiving
         # Every in-window frame advances the window, whether or not its *content*
         # is acted on. Advancing only on accepted content freezes last_rx_sequence
         # while the sender keeps incrementing, so after 127 content-rejected frames
@@ -788,6 +797,22 @@ class CynthionMouseHostTop(Elaboratable):
             pmod_a["mcu_ready"].i, mcu_ready, o_domain="usb", stages=2
         )
 
+        # Registered at the plane's edge, not at their owners. Both feed the
+        # plane's ``invalidate``, which is a clock enable across most of the map
+        # store; combinationally, host.enumerated carried every poller's
+        # ``failed`` latch there from across the die, and was the head of the
+        # critical path on 5 of 12 seeds. Registering host.enumerated inside
+        # the host instead delays device.connect too, and broke the disconnect
+        # tests. One cycle is nothing to either: link_ready is already an async
+        # pin two synchroniser stages old, and a lost session invalidates the
+        # plane a cycle later than it otherwise would.
+        plane_session_active = Signal()
+        plane_link_ready = Signal()
+        m.d.usb += [
+            plane_session_active.eq(host.enumerated),
+            plane_link_ready.eq(mcu_ready),
+        ]
+
         m.d.comb += [
             # AUX vbus_valid stays low in the CONTROL-powered topology even
             # while the PC enumerates the clone. Connect only after the host has
@@ -808,8 +833,8 @@ class CynthionMouseHostTop(Elaboratable):
             device.report_last.eq(injection_plane.output_last),
             device.report_endpoint.eq(injection_plane.output_endpoint),
             injection_plane.sof_tick.eq(host.scheduler.frame_tick),
-            injection_plane.session_active.eq(host.enumerated),
-            injection_plane.link_ready.eq(mcu_ready),
+            injection_plane.session_active.eq(plane_session_active),
+            injection_plane.link_ready.eq(plane_link_ready),
             spi_link.mcu_ready.eq(mcu_ready),
             spi_link.sof_tick.eq(host.scheduler.frame_tick),
             # Never assign ``oe``: ``io.Buffer("o", ...)`` declares ``oe: Out(1, init=1)``
