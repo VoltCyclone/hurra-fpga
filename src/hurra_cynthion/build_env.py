@@ -293,7 +293,19 @@ REQUIRED_NEXTPNR_FLAG = "--placer-heap-timingweight"
 #: Median 71.3, worst 67.35 (+12.3%). The leading family, on 11 of 12 seeds,
 #: is G5's own: the clone's token timer -> a relay IN endpoint's runtime
 #: number compare -> its tx_manager data enables. Pin 7 -> 6.
-DEFAULT_PLACER_SEED = 6
+#:
+#: A PC session reset (bus reset or SET_CONFIGURATION) now flushes the report
+#: relay and resets every relay IN endpoint -- a reset mux on each of their
+#: registers. Netlist sha 634f5786c6dd5183 (native), 19,869 LUTs = 81%:
+#:
+#:     10: 72.16  8: 71.48   4: 71.39   2: 70.15   1: 69.36   6: 69.35
+#:     7: 69.21   9: 68.64   12: 68.64  3: 66.80   5: 65.04   11: 65.02
+#:
+#: Median 69.3, worst 65.02 (+8.4%). 11 of 12 seeds end in the clone ->
+#: descriptor_store.descriptor_memory read-address family (handshake, timer
+#: or setup decoder -> the GET_DESCRIPTOR streamer); the twelfth in a relay IN
+#: endpoint's tx_manager. None ends in the flush logic. Pin 6 -> 10.
+DEFAULT_PLACER_SEED = 10
 
 #: The full option, including the weight and seed that were actually measured.
 #: A caller-supplied ``--seed`` is composed after this one and wins, because

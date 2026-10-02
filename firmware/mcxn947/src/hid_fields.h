@@ -94,6 +94,8 @@ typedef struct {
     bool usage_overflow;
     hid_fields_usage_t usage_minimum;
     bool have_usage_minimum;
+    hid_fields_usage_t usage_maximum;
+    bool have_usage_maximum;
 
     uint8_t collection_depth;
     uint16_t app_usage_page;

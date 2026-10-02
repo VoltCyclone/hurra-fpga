@@ -145,6 +145,47 @@ static void test_explicit_usage_list_shorter_than_count(void)
     assert(!r.fields[2].usage_is_range);
 }
 
+// A Usage Minimum/Maximum range names as many elements as it spans; elements
+// past it share its maximum (HID 1.11 6.2.2.8), as with a short usage list.
+// Buttons 1..3 over eight bits are buttons 1, 2, 3 and five more button 3s.
+static void test_usage_range_shorter_than_count(void)
+{
+    const uint8_t d[] = {
+        0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01,
+        0x75, 0x01, 0x95, 0x08, 0x81, 0x02,
+    };
+    recorder_t r;
+    assert(walk(d, sizeof(d), &r) == HID_FIELDS_OK);
+    assert(r.count == 2u);
+    assert(r.fields[0].bit_offset == 0u && r.fields[0].count == 3u);
+    assert(r.fields[0].usage_page == 0x09u && r.fields[0].usage == 1u);
+    assert(r.fields[0].usage_is_range);
+    assert(r.fields[1].bit_offset == 3u && r.fields[1].count == 5u);
+    assert(r.fields[1].usage_page == 0x09u && r.fields[1].usage == 3u);
+    assert(!r.fields[1].usage_is_range);
+    assert(hid_fields_input_bits(&walker, 0u) == 8u);
+}
+
+// A range wider than the count names only the elements there are; one whose
+// maximum is below its minimum names none of them.
+static void test_usage_range_bounds(void)
+{
+    const uint8_t wide[] = {
+        0x05, 0x09, 0x19, 0x01, 0x29, 0x10, 0x75, 0x01, 0x95, 0x05, 0x81, 0x02,
+    };
+    recorder_t r;
+    assert(walk(wide, sizeof(wide), &r) == HID_FIELDS_OK);
+    assert(r.count == 1u);
+    assert(r.fields[0].count == 5u && r.fields[0].usage == 1u && r.fields[0].usage_is_range);
+
+    const uint8_t inverted[] = {
+        0x05, 0x09, 0x19, 0x05, 0x29, 0x02, 0x75, 0x01, 0x95, 0x04, 0x81, 0x02,
+    };
+    assert(walk(inverted, sizeof(inverted), &r) == HID_FIELDS_OK);
+    assert(r.count == 1u);
+    assert(r.fields[0].count == 4u && r.fields[0].usage_page == 0u && r.fields[0].usage == 0u);
+}
+
 // Locals clear after every main item: a Usage before one Input must not name
 // the next Input's elements.
 static void test_locals_clear_after_each_main_item(void)
@@ -292,6 +333,8 @@ int main(void)
     test_report_id_16bit_axes_and_consumer_pan();
     test_logical_maximum_signedness_follows_the_minimum();
     test_explicit_usage_list_shorter_than_count();
+    test_usage_range_shorter_than_count();
+    test_usage_range_bounds();
     test_locals_clear_after_each_main_item();
     test_push_and_pop_restore_globals();
     test_two_applications_with_interleaved_report_ids();

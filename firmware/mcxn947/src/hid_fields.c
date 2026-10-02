@@ -23,6 +23,7 @@
 
 #define LOCAL_USAGE 0x0u
 #define LOCAL_USAGE_MINIMUM 0x1u
+#define LOCAL_USAGE_MAXIMUM 0x2u
 
 #define COLLECTION_APPLICATION 0x01u
 
@@ -66,6 +67,23 @@ static void clear_locals(hid_fields_walker_t *w)
     w->usage_count = 0u;
     w->usage_overflow = false;
     w->have_usage_minimum = false;
+    w->have_usage_maximum = false;
+}
+
+// Elements a Usage Minimum/Maximum pair names; 0 when the pair is malformed --
+// a maximum below its minimum, or on another page -- and so names none.
+static uint32_t range_span(const hid_fields_walker_t *w, uint16_t current_page)
+{
+    uint16_t min_page;
+    uint16_t min_usage;
+    uint16_t max_page;
+    uint16_t max_usage;
+    resolve_usage(&w->usage_minimum, current_page, &min_page, &min_usage);
+    resolve_usage(&w->usage_maximum, current_page, &max_page, &max_usage);
+    if (min_page != max_page || max_usage < min_usage) {
+        return 0u;
+    }
+    return (uint32_t)(max_usage - min_usage) + 1u;
 }
 
 // A logical maximum is unsigned unless the minimum is negative (HID 1.11
@@ -172,10 +190,25 @@ static hid_fields_status_t walk_input(hid_fields_walker_t *w, uint32_t flags, hi
                 w->usage_overflow ? NULL : &w->usages[w->usage_count - 1u];
             keep_going = emit_run(&e, start + named * size, count - named, tail, false);
         }
+    } else if ((flags & HID_FIELD_VARIABLE) != 0u && w->have_usage_minimum &&
+               w->have_usage_maximum) {
+        // A range names element i as minimum + i up to its maximum; elements
+        // beyond it share the maximum, as a list's tail shares its last usage.
+        const uint32_t span = range_span(w, g->usage_page);
+        const uint32_t named = span < count ? span : count;
+        if (named == 0u) {
+            keep_going = emit_run(&e, start, count, NULL, false);
+        } else {
+            keep_going = emit_run(&e, start, named, &w->usage_minimum, true);
+            if (keep_going && count > named) {
+                keep_going = emit_run(&e, start + named * size, count - named,
+                                      &w->usage_maximum, false);
+            }
+        }
     } else {
-        // One run: a range names element i as minimum + i; an array's usages
-        // name the values its elements may hold, not the elements, so it is
-        // labelled with its first usage.
+        // One run: a range with no maximum names element i as minimum + i; an
+        // array's usages name the values its elements may hold, not the
+        // elements, so it is labelled with its first usage.
         keep_going = emit_run(&e, start, count, first_local_usage(w),
                               w->usage_count == 0u && w->have_usage_minimum);
     }
@@ -288,8 +321,12 @@ static void walk_local(hid_fields_walker_t *w, const hid_item_t *item)
         w->usage_minimum = local_usage(item);
         w->have_usage_minimum = true;
         break;
+    case LOCAL_USAGE_MAXIMUM:
+        w->usage_maximum = local_usage(item);
+        w->have_usage_maximum = true;
+        break;
     default:
-        break;  // Usage Maximum (a range is followed by count), designators, strings
+        break;  // designators, strings
     }
 }
 

@@ -589,3 +589,55 @@ def test_a_parked_slot_takes_nothing_and_a_rebound_slot_follows_its_number():
         assert await _drain_stream(ctx, dut.streams[0], 1) == ([0x22], True)
 
     _simulate_bound(bench, PARKED_SLOT_NUMBERS)
+
+
+# --- Flush: a new PC session starts with empty queues ---------------------------
+
+
+async def _pulse_flush(ctx, dut):
+    ctx.set(dut.flush, 1)
+    await ctx.tick("usb")
+    ctx.set(dut.flush, 0)
+
+
+def test_flush_empties_every_queue():
+    async def bench(ctx, dut):
+        for stream in dut.streams:
+            ctx.set(stream.ready, 0)
+        await _push_report(ctx, dut, 1, [0x11, 0x12])
+        await _push_report(ctx, dut, 2, [0x21])
+        await _pulse_flush(ctx, dut)
+        await ctx.tick("usb")
+        for stream in dut.streams:
+            assert not ctx.get(stream.valid)
+
+        await _push_report(ctx, dut, 1, [0x33])
+        assert await _drain_stream(ctx, dut.streams[0], 1) == ([0x33], True)
+        await ctx.tick("usb")
+        await ctx.tick("usb")
+        assert not ctx.get(dut.streams[0].valid)
+
+    _simulate_bound(bench, (1, 2, UNMATCHABLE_ENDPOINT_NUMBER, UNMATCHABLE_ENDPOINT_NUMBER))
+
+
+@pytest.mark.parametrize("on_a_byte", [False, True], ids=["between-bytes", "on-a-byte"])
+def test_flush_mid_report_drops_the_rest_of_that_report(on_a_byte: bool):
+    """The report in flight when a flush lands is discarded through its last
+    byte: its tail must not open the emptied queue as a partial report."""
+
+    async def bench(ctx, dut):
+        ctx.set(dut.streams[0].ready, 0)
+        await _push_byte(ctx, dut, 1, 0xA0)
+        if on_a_byte:
+            ctx.set(dut.flush, 1)
+            await _push_byte(ctx, dut, 1, 0xA1)
+            ctx.set(dut.flush, 0)
+        else:
+            await _push_byte(ctx, dut, 1, 0xA1)
+            await _pulse_flush(ctx, dut)
+        await _push_byte(ctx, dut, 1, 0xA2)
+        await _push_byte(ctx, dut, 1, 0xA3, last=True)
+        await _push_report(ctx, dut, 1, [0xB0, 0xB1])
+        assert await _drain_stream(ctx, dut.streams[0], 2) == ([0xB0, 0xB1], True)
+
+    _simulate_bound(bench, (1, 2, UNMATCHABLE_ENDPOINT_NUMBER, UNMATCHABLE_ENDPOINT_NUMBER))

@@ -277,6 +277,24 @@ static void test_button_list_tail_is_not_mapped(void)
     assert(find(&l, HID_MOUSE_BUTTONS, 1u) == NULL);
 }
 
+// Buttons 1..3 declared over eight bits: the five bits past the range repeat
+// button 3, so injecting "button 4" there would press button 3 on the PC.
+static void test_button_range_tail_is_not_mapped(void)
+{
+    const uint8_t d[] = {
+        0x05, 0x01, 0x09, 0x02, 0xA1, 0x01,
+        0x05, 0x09, 0x19, 0x01, 0x29, 0x03,
+        0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02,
+        0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08,
+        0x95, 0x02, 0x81, 0x06,
+        0xC0,
+    };
+    hid_mouse_layout_t l;
+    assert(hid_mouse_compile(d, sizeof(d), &l) == HID_MOUSE_OK);
+    assert_buttons(&l, 0u, 1u, 0u, 3u);
+    assert(find(&l, HID_MOUSE_BUTTONS, 1u) == NULL);
+}
+
 int main(void)
 {
     test_boot_mouse();
@@ -293,6 +311,7 @@ int main(void)
     test_first_report_with_both_axes_is_chosen();
     test_many_listed_buttons_do_not_crowd_out_the_axes();
     test_button_list_tail_is_not_mapped();
+    test_button_range_tail_is_not_mapped();
     printf("hid_mouse_layout_test: ok\n");
     return 0;
 }

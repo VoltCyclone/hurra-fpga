@@ -925,3 +925,92 @@ def test_an_in_and_an_out_endpoint_may_share_a_number():
 
     sim.add_testbench(bench)
     sim.run()
+
+
+# --- A new PC session starts clean ---------------------------------------------
+
+
+async def _end_pc_session(ctx, bus, dut, boundary: str) -> None:
+    """End the PC's session with the clone, the two ways a PC can."""
+    if boundary == "set-configuration":
+        new_config = await control_write_no_data(
+            ctx,
+            bus,
+            address=0,
+            request_type=0x00,
+            request=SET_CONFIGURATION,
+            value=1,
+            index=0,
+            pulse_signal=dut.debug_config_changed,
+            value_signal=dut.debug_new_config,
+        )
+        assert new_config == 1
+    else:
+        # SE0 for well over LUNA's 5 us (300-cycle) reset threshold.
+        saw_reset = False
+        ctx.set(bus.line_state, 0)
+        for _ in range(400):
+            await ctx.tick("usb")
+            saw_reset |= bool(ctx.get(dut.debug_reset_detected))
+        ctx.set(bus.line_state, 1)
+        assert saw_reset
+    # session_reset is registered a cycle behind either event.
+    for _ in range(4):
+        await ctx.tick("usb")
+
+
+@pytest.mark.parametrize("boundary", ["set-configuration", "bus-reset"])
+def test_reports_queued_before_a_pc_session_are_not_served_in_it(boundary: str):
+    """The host polls the real device from enumeration on, but the PC polls
+    nothing until it configures the clone, so reports queue meanwhile -- in the
+    relay and in the endpoint's own packet buffer. Served late, they replay
+    stale relative movement, or a key state the device has since left."""
+    top, sim = _make_top()
+    bus, dut = top.bus, top.dut
+
+    async def bench(ctx):
+        await _power_up(ctx, bus, dut)
+        # More than the endpoint's two packet buffers hold, so some stay in
+        # the relay's queue: each half of the session reset is exercised.
+        for _ in range(4):
+            await push_report(ctx, dut, 1, [0x01, 0x7F, 0x7F, 0x00])
+        for _ in range(8):
+            await ctx.tick("usb")
+        await _end_pc_session(ctx, bus, dut, boundary)
+
+        assert await pc_in_or_none(ctx, bus, 0, 1) == [NAK]
+        await push_report(ctx, dut, 1, MOUSE_REPORT)
+        for _ in range(4):
+            await ctx.tick("usb")
+        reply = await pc_in_or_none(ctx, bus, 0, 1)
+        assert reply is not None and reply[1:-2] == MOUSE_REPORT, reply
+
+    sim.add_testbench(bench)
+    sim.run()
+
+
+@pytest.mark.parametrize("boundary", ["set-configuration", "bus-reset"])
+def test_the_in_toggle_restarts_at_data0_in_a_new_pc_session(boundary: str):
+    """USB 2.0 9.1.1.5, 9.4.5: as for the OUT endpoint. A PC expecting DATA0
+    takes a DATA1 for a resend and discards that report."""
+    top, sim = _make_top()
+    bus, dut = top.bus, top.dut
+
+    async def bench(ctx):
+        await _power_up(ctx, bus, dut)
+        await push_report(ctx, dut, 1, MOUSE_REPORT)
+        for _ in range(4):
+            await ctx.tick("usb")
+        reply = await pc_in_or_none(ctx, bus, 0, 1)
+        assert reply is not None and reply[0] == DATA0, reply
+        await pc_send(ctx, bus, [ACK])
+        await _end_pc_session(ctx, bus, dut, boundary)
+
+        await push_report(ctx, dut, 1, MOUSE_REPORT)
+        for _ in range(4):
+            await ctx.tick("usb")
+        reply = await pc_in_or_none(ctx, bus, 0, 1)
+        assert reply is not None and reply[0] == DATA0, f"first IN of the new session: {reply!r}"
+
+    sim.add_testbench(bench)
+    sim.run()

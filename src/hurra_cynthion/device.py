@@ -159,6 +159,24 @@ class DescriptorStoreCopyEngine(Elaboratable):
         return m
 
 
+class _RelayInEndpoint(USBStreamInEndpoint):
+    """LUNA's IN stream endpoint, returned whole to its initial state by ``reset``.
+
+    As for ``_RelayOutEndpoint``: USB requires DATA0 after a bus reset and after
+    SET_CONFIGURATION [USB2.0 9.1.1.5, 9.4.5], and LUNA resets the toggle only
+    on ClearFeature(ENDPOINT_HALT). The reset also empties the transfer
+    manager's packet buffers, which fill from the relay whether or not the PC
+    is polling -- and the PC polls nothing until it configures the clone.
+    """
+
+    def __init__(self, *, endpoint_number: Signal, max_packet_size: int) -> None:
+        super().__init__(endpoint_number=endpoint_number, max_packet_size=max_packet_size)
+        self.reset = Signal()
+
+    def elaborate(self, platform):
+        return ResetInserter({"usb": self.reset})(super().elaborate(platform))
+
+
 #: One distinct subclass per relay endpoint, so that synthesis is reproducible.
 #:
 #: LUNA names endpoint submodules after their class, and falls back to
@@ -178,12 +196,11 @@ class DescriptorStoreCopyEngine(Elaboratable):
 #: one throwaway netlist.
 #:
 #: Giving each endpoint its own class keeps LUNA on its stable-name path;
-#: the endpoints are otherwise unmodified. One class per relay SLOT: a slot's
-#: endpoint number is bound at runtime (see MouseCloneDevice), so the classes
-#: no longer carry one.
+#: they differ from LUNA's only by ``_RelayInEndpoint``'s reset. One class per
+#: relay SLOT: a slot's endpoint number is bound at runtime (see
+#: MouseCloneDevice), so the classes no longer carry one.
 _RELAY_ENDPOINT_CLASSES = tuple(
-    type(f"USBStreamInEndpointSlot{slot}", (USBStreamInEndpoint,), {})
-    for slot in range(MAX_ENDPOINTS)
+    type(f"USBStreamInEndpointSlot{slot}", (_RelayInEndpoint,), {}) for slot in range(MAX_ENDPOINTS)
 )
 
 
@@ -315,10 +332,11 @@ class MouseCloneDevice(Elaboratable):
         self.out_present = Signal()
         self.out_endpoint_number = Signal(4)
         self._out_endpoint_number = Signal(5, init=UNMATCHABLE_ENDPOINT_NUMBER)
-        #: Registered: the PC bus-reset or (re)configured the clone. The OUT
-        #: endpoint and its FIFO reset on it, and so must whatever downstream
-        #: holds that PC session's state: the OUT writer's partial packet, and
-        #: a boot protocol the PC left the real device in.
+        #: Registered: the PC bus-reset or (re)configured the clone. Every
+        #: relay endpoint resets on it and the report relay flushes, so a new
+        #: session is served no report queued before it; so must whatever
+        #: downstream holds that PC session's state: the OUT writer's partial
+        #: packet, and a boot protocol the PC left the real device in.
         self.session_reset = Signal()
         self.out_valid = Signal()
         self.out_data = Signal(8)
@@ -357,6 +375,7 @@ class MouseCloneDevice(Elaboratable):
             m.d.comb += [
                 relay.slot_numbers[slot].eq(bound),
                 ep.stream.stream_eq(relay.streams[slot]),
+                ep.reset.eq(self.session_reset),
             ]
 
         out_ep = _RelayOutEndpoint(endpoint_number=self._out_endpoint_number)
@@ -372,6 +391,7 @@ class MouseCloneDevice(Elaboratable):
             device.reset_detected | self._std_handler.interface.config_changed
         )
         m.d.comb += [
+            relay.flush.eq(self.session_reset),
             out_ep.reset.eq(self.session_reset),
             self.out_valid.eq(out_ep.stream.valid),
             self.out_data.eq(out_ep.stream.payload),

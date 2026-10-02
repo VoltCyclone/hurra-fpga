@@ -54,7 +54,11 @@ keyboard LEDs) is relayed by `out_writer.py`. A device the PC puts in boot
 protocol (a BIOS) sends boot-layout reports the field map does not describe, so
 `boot_protocol.py` tracks it per endpoint, injection stands aside there, and a PC
 bus reset or SET_CONFIGURATION on the clone replays SET_PROTOCOL(report) to the
-real device, which never sees either event itself.
+real device, which never sees either event itself. Either event also starts the
+clone's own endpoints over: every data toggle restarts at DATA0, and reports
+queued before it are discarded rather than served late. The host polls the real
+device from enumeration on, but the PC polls nothing until it configures the
+clone.
 
 Vendor-type control requests are not forwarded: the clone STALLs them, by
 design. Forwarding them would let the PC send arbitrary vendor writes —

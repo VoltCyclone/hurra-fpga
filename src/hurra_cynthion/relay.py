@@ -50,6 +50,11 @@ class ReportRelay(Elaboratable):
         self.unmatched_report = Signal()
         self.congested_report = Signal()
 
+        #: Empty every queue and drop the report in flight through its last
+        #: byte: a new PC session must not be served the last one's reports.
+        #: Neither is counted as a drop -- they belong to no session.
+        self.flush = Signal()
+
         self.streams = [StreamInterface() for _ in self.slot_numbers]
 
     def elaborate(self, platform):
@@ -135,6 +140,10 @@ class ReportRelay(Elaboratable):
             # report's remaining bytes are not each re-evaluated as a fresh
             # report start.
             m.d.usb += in_report[bucket].eq(~self.report_last)
+        # Overrides the admission above. ``in_report`` keeps tracking, so the
+        # in-flight report's tail is dropped rather than taken for a new start.
+        with m.If(self.flush):
+            m.d.usb += [accepting[index].eq(0) for index in range(buckets)]
 
         # Write and read sides remain fully independent across endpoints.
         for index, stream in enumerate(self.streams):
@@ -177,5 +186,13 @@ class ReportRelay(Elaboratable):
                 m.d.usb += levels[index].eq(levels[index] + 1)
             with m.Elif(dequeues[index] & ~enqueue):
                 m.d.usb += levels[index].eq(levels[index] - 1)
+
+            with m.If(self.flush):
+                m.d.usb += [
+                    read_pointers[index].eq(0),
+                    write_pointers[index].eq(0),
+                    levels[index].eq(0),
+                    head_valids[index].eq(0),
+                ]
 
         return m
