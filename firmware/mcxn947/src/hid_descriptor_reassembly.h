@@ -37,6 +37,9 @@ typedef struct {
     uint16_t received_count;
     uint8_t target_interface;
     bool active;
+    // Bumped by every discard. A complete descriptor's bytes change only after
+    // a discard, so an unchanged revision proves a reader saw stable bytes.
+    volatile uint16_t revision;
 } hid_descriptor_reassembly_t;
 
 // One instance follows exactly one interface. Retargeting always discards the

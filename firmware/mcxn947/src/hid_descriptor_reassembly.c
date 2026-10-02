@@ -9,6 +9,7 @@ static void discard_descriptor(hid_descriptor_reassembly_t *reassembly)
     reassembly->total = 0u;
     reassembly->received_count = 0u;
     reassembly->active = false;
+    reassembly->revision = (uint16_t)(reassembly->revision + 1u);
 }
 
 static bool byte_received(const hid_descriptor_reassembly_t *reassembly,
@@ -36,6 +37,7 @@ void hid_descriptor_reassembly_init(hid_descriptor_reassembly_t *reassembly,
         return;
     }
     reassembly->target_interface = target_interface;
+    reassembly->revision = 0u;
     discard_descriptor(reassembly);
 }
 

@@ -84,6 +84,18 @@ def test_mouse_clone_device_elaborates_with_one_shared_descriptor_store():
     assert "top.dut.descriptor_store" not in netlist
     assert "top.dut.copy_engine" not in netlist
     assert len(dut.relay.streams) == 4
+    for name in (
+        "in_endpoint_count",
+        "in_endpoint_number",
+        "out_present",
+        "out_endpoint_number",
+        "session_reset",
+        "out_valid",
+        "out_data",
+        "out_last",
+        "out_ready",
+    ):
+        assert hasattr(dut, name), f"MouseCloneDevice lacks OUT relay port {name}"
 
 
 def test_clone_readiness_and_connection_drop_on_same_cycle_descriptor_mutation():
@@ -188,6 +200,31 @@ def test_endpoint_submodule_names_are_stable_across_elaborations():
     first_il = rtlil.convert(first, ports=[first.dut.connect])
     second_il = rtlil.convert(second, ports=[second.dut.connect])
 
-    stale = sorted(set(re.findall(r"USBStreamInEndpoint_\d{4,}", first_il)))
+    stale = sorted(set(re.findall(r"USBStream(?:In|Out)Endpoint\w*_\d{4,}", first_il)))
     assert not stale, f"endpoint named after id(): {stale}"
+    # The relayed interrupt-OUT endpoint is the one instance of its own class,
+    # so it too is named after the class and nothing else.
+    out_modules = set(re.findall(r"(?m)^module \\(top\.dut\.device\.\w*OutEndpoint\w*)$", first_il))
+    assert out_modules == {"top.dut.device._RelayOutEndpoint"}, out_modules
     assert first_il == second_il, "elaboration is not reproducible"
+
+
+def test_the_out_endpoint_is_one_instance_of_a_distinct_class():
+    """A second instance of any endpoint class would be named after id()."""
+    from luna.gateware.usb.usb2.endpoints.stream import USBStreamOutEndpoint
+
+    from hurra_cynthion.device import _RELAY_ENDPOINT_CLASSES, _RelayOutEndpoint
+
+    assert issubclass(_RelayOutEndpoint, USBStreamOutEndpoint)
+    assert _RelayOutEndpoint not in _RELAY_ENDPOINT_CLASSES
+    names = [cls.__name__ for cls in _RELAY_ENDPOINT_CLASSES]
+    assert _RelayOutEndpoint.__name__ not in names
+
+
+def test_one_in_endpoint_class_per_relay_slot():
+    """Slots, not numbers, now: a slot's number is bound at runtime."""
+    from hurra_cynthion.descriptors import MAX_ENDPOINTS
+    from hurra_cynthion.device import _RELAY_ENDPOINT_CLASSES
+
+    names = [cls.__name__ for cls in _RELAY_ENDPOINT_CLASSES]
+    assert names == [f"USBStreamInEndpointSlot{k}" for k in range(MAX_ENDPOINTS)]

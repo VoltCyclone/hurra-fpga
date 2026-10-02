@@ -555,6 +555,45 @@ def report_injection_register_map() -> RegisterMap:
         [("aux_force_full_speed", 1), ("target_force_full_speed", 1)],
         "force Full Speed on AUX / TARGET; 0 = negotiate (default)",
     )
+    # The relayed HID interrupt-OUT endpoint, appended after speed_policy:
+    # _alloc is declaration-ordered, so inserting above would shift every
+    # later address. Counters saturate. A STALL or an exhausted transport-error
+    # budget drops the packet rather than failing anything, so out_dropped is
+    # the only evidence an OUT never reached the device.
+    m.status(
+        "out_relay_traffic",
+        [("out_written", 16), ("out_naks", 16)],
+        "OUT packets the real device ACKed / NAKed (a NAK is retried, not dropped)",
+    )
+    m.status(
+        "out_relay_drops",
+        [("out_stalls", 8), ("out_timeouts", 8), ("out_dropped", 16)],
+        "OUT packets STALLed / out of transport retries; all dropped OUT packets",
+    )
+    m.status(
+        "out_relay_status",
+        [
+            ("out_present", 1),
+            ("out_number", 4),
+            ("out_toggle", 1),
+            ("out_active", 1),
+            ("out_last_status", 3),
+            ("out_ignored", 1),
+        ],
+        "captured OUT endpoint, next DATA toggle, write in flight, last status, "
+        "a declared OUT endpoint was not captured",
+    )
+    m.status(
+        "boot_protocol",
+        [("boot_mask", 16), ("resync_active", 1)],
+        "bit n: endpoint n's interface is in boot protocol (injection stands aside); "
+        "a SET_PROTOCOL(report) replay is in flight",
+    )
+    m.status(
+        "boot_resync",
+        [("resync_ok", 16), ("resync_failed", 16)],
+        "SET_PROTOCOL(report) replays after a PC reset of the clone: accepted / refused",
+    )
     return m
 
 

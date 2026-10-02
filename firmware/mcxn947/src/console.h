@@ -33,10 +33,18 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "fault.h"
+
 // Longest command line accepted. Anything longer is truncated at the limit
 // and the line is still dispatched -- an overlong line is a typo or line
 // noise, and silently discarding it would look like the console had hung.
 #define CONSOLE_LINE_MAX 63u
+
+// Portable spelling of the CPU1 fault publication bits. usb_console.c sees
+// this contract and shared_window.h together and holds the two spellings equal.
+#define CONSOLE_CPU1_FAULT_KIND_SHIFT 28u
+#define CONSOLE_CPU1_FAULT_KIND_MASK  0x30000000u
+#define CONSOLE_CPU1_FAULT_VALID      0x80000000u
 
 // Everything `stats` reports. Flat, by value, and a copy: the provider takes
 // the snapshot with the retirement interrupt masked, so the console never
@@ -66,6 +74,7 @@ typedef struct {
     uint32_t recoveries;
     uint32_t framing_recoveries;
     uint32_t gap_wait_timeouts;
+    uint32_t debug_tx_drop;
 
     uint32_t uptime_ms;
     uint32_t cpu1_boot_count;
@@ -82,6 +91,14 @@ typedef struct {
     uint32_t cpu1_display_flags;
     uint32_t cpu1_blits;
     uint32_t cpu1_blit_rejects;
+    uint32_t reset_srs;
+    uint32_t cpu1_fault_flags;
+    uint32_t cpu1_fault_cfsr;
+    uint32_t cpu1_fault_hfsr;
+    uint32_t cpu1_fault_mmfar;
+    uint32_t cpu1_fault_bfar;
+    uint32_t cpu1_fault_pc;
+    uint32_t cpu1_fault_lr;
 } console_stats_t;
 
 typedef struct {
@@ -99,6 +116,11 @@ typedef struct {
     // instrument section 9 step 5 configuration (c) is measured with.
     void (*cpu1_halt)(void *ctx);
     void (*cpu1_start)(void *ctx);
+
+    // Intentionally destructive diagnostic. A supported action does not
+    // return on target; host tests return true after recording the route.
+    // False makes an unsupported or unexpectedly non-faulting action visible.
+    bool (*fault_inject)(void *ctx, fault_injection_t injection);
     void *ctx;
 } console_ops_t;
 

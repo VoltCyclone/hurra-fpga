@@ -3,7 +3,12 @@
 #include <stddef.h>
 
 #include "console.h"
+#include "fault.h"
 #include "kmcmd.h"
+#include "reset_cause.h"
+
+_Static_assert(FAULT_CAUSE_TEXT_MAX >= RESET_CAUSE_TEXT_MAX,
+               "stats detail buffer must fit reset-cause text");
 
 static console_ops_t s_ops;
 
@@ -102,7 +107,7 @@ static bool console_equal(const char *a, const char *b)
 
 // `name` matched, and the rest of the line is either empty or begins with a
 // space. Returns the first argument character (possibly the terminator) or NULL
-// when `name` is not the command on this line. Only `kmmode` takes an argument;
+// when `name` is not the command on this line. `kmmode` and `fault` use this;
 // every other command is an exact match.
 static const char *console_argument(const char *line, const char *name)
 {
@@ -131,7 +136,8 @@ static void cmd_help(void)
                 "  flood    saturate this pipe until a key is pressed\r\n"
                 "  cpu1halt hold CPU1 in reset (the link must not notice)\r\n"
                 "  cpu1start release CPU1 again\r\n"
-                "  kmmode   KMBox/MAKCU command input: off|makcu|kmbox\r\n");
+                "  kmmode   KMBox/MAKCU command input: off|makcu|kmbox\r\n"
+                "  fault    DANGER: HALTS MCU; usage|bus|hard|stack|fp\r\n");
 }
 
 static const char *km_mode_name(kmcmd_mode_t mode)
@@ -221,11 +227,18 @@ static void cmd_stats(void)
     console_put("\r\n  ");
     console_field("flood", s_flood_bytes);
     console_field("txdrop", s_dropped);
+    console_field("dbgtxdrop", s.debug_tx_drop);
     console_field("up_ms", s.uptime_ms);
     console_put("\r\n  snapshot ");
     console_field("snapshot_seq", s.snapshot_seq);
     console_field("snapshot_slots", s.snapshot_slot_counter);
     console_field("snapshot_fail", s.snapshot_read_failures);
+    char detail[FAULT_CAUSE_TEXT_MAX];
+    (void)reset_cause_format(s.reset_srs, detail, sizeof(detail));
+    console_put("\r\n  reset ");
+    console_put(detail);
+    console_put(" ");
+    console_field("srs", s.reset_srs);
     console_put("\r\n  cpu1 ");
     if (s.cpu1_held_in_reset) {
         console_put("HELD-IN-RESET ");
@@ -248,6 +261,27 @@ static void cmd_stats(void)
     }
     console_put(" ");
     console_field("seen_slots", s.cpu1_seen_slot_counter);
+    if ((s.cpu1_fault_flags & CONSOLE_CPU1_FAULT_VALID) != 0u) {
+        const fault_kind_t kind = (fault_kind_t)(
+            (s.cpu1_fault_flags & CONSOLE_CPU1_FAULT_KIND_MASK) >>
+            CONSOLE_CPU1_FAULT_KIND_SHIFT);
+        (void)fault_format_causes(s.cpu1_fault_cfsr, detail, sizeof(detail));
+        console_put("\r\n  cpu1 FAULT ");
+        console_put(fault_kind_name(kind));
+        console_put(" ");
+        console_put(detail);
+        console_put(" ");
+        console_field("pc", s.cpu1_fault_pc);
+        console_field("lr", s.cpu1_fault_lr);
+        console_field("cfsr", s.cpu1_fault_cfsr);
+        console_field("hfsr", s.cpu1_fault_hfsr);
+        if ((s.cpu1_fault_cfsr & FAULT_CFSR_MMARVALID) != 0u) {
+            console_field("mmfar", s.cpu1_fault_mmfar);
+        }
+        if ((s.cpu1_fault_cfsr & FAULT_CFSR_BFARVALID) != 0u) {
+            console_field("bfar", s.cpu1_fault_bfar);
+        }
+    }
     // Appended, not inserted: the eleven counters above are compared field for
     // field against the FPGA's own registers, and these three are neither
     // visible to nor meaningful for it. km_no counts commands this device
@@ -289,13 +323,57 @@ static void cmd_cpu1(bool start)
     console_put(start ? "cpu1 release requested\r\n" : "cpu1 held in reset\r\n");
 }
 
+static void fault_usage(void)
+{
+    console_put("usage: fault usage|bus|hard|stack|fp (DANGER: HALTS MCU)\r\n");
+}
+
+static void cmd_fault(const char *argument)
+{
+    fault_injection_t injection;
+    const char *intent;
+
+    if (console_equal(argument, "usage")) {
+        injection = FAULT_INJECTION_USAGE;
+        intent = "UsageFault (UDF)";
+    } else if (console_equal(argument, "bus")) {
+        injection = FAULT_INJECTION_BUS;
+        intent = "BusFault (reserved-address read)";
+    } else if (console_equal(argument, "hard")) {
+        injection = FAULT_INJECTION_HARD;
+        intent = "HardFault (forced BusFault escalation)";
+    } else if (console_equal(argument, "stack")) {
+        injection = FAULT_INJECTION_STACK;
+        intent = "stack overflow (MSPLIM)";
+    } else if (console_equal(argument, "fp")) {
+        injection = FAULT_INJECTION_FP;
+        intent = "FP extended frame plus UsageFault";
+    } else {
+        fault_usage();
+        return;
+    }
+
+    if (s_ops.fault_inject == NULL) {
+        console_put("fault injection unavailable on this build\r\n");
+        return;
+    }
+
+    console_put("WARNING: fault injection WILL HALT MCU; provoking ");
+    console_put(intent);
+    console_put("\r\n");
+    if (!s_ops.fault_inject(s_ops.ctx, injection)) {
+        console_put("fault injection did not trap or is unsupported on this core\r\n");
+    }
+}
+
 static void console_dispatch(void)
 {
     s_line[s_length] = '\0';
 
-    // `kmmode` is the only command that takes an argument, so its match is
-    // resolved once here rather than inside the chain below.
+    // Argument-taking built-ins are resolved once here rather than inside the
+    // exact-match chain below.
     const char *const km_argument = console_argument(s_line, "kmmode");
+    const char *const fault_argument = console_argument(s_line, "fault");
 
     if (s_overflowed) {
         // Say so rather than acting on a truncated line: acting would run
@@ -315,6 +393,8 @@ static void console_dispatch(void)
         cmd_cpu1(false);
     } else if (console_equal(s_line, "cpu1start")) {
         cmd_cpu1(true);
+    } else if (fault_argument != NULL) {
+        cmd_fault(fault_argument);
     } else if (km_argument != NULL) {
         cmd_kmmode(km_argument);
     } else {

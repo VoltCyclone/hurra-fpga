@@ -380,14 +380,30 @@ async def assert_reattach_and_reset(ctx, host, mouse, timing) -> None:
         await ctx.tick("usb")
 
 
+async def _issue_lookup(ctx, host, *, limit: int = 8) -> None:
+    """Hold lookup_request until the store takes it, as every real client does.
+
+    The store refuses requests while it is being cleared, and a TARGET detach
+    clears it -- so a one-cycle strobe that happened to land on that cycle was
+    silently dropped.
+    """
+    ctx.set(host.lookup_request, 1)
+    for _ in range(limit):
+        accepted = ctx.get(host.lookup_ready)
+        await ctx.tick("usb")
+        if accepted:
+            break
+    else:
+        raise AssertionError("host descriptor store never took the lookup")
+    ctx.set(host.lookup_request, 0)
+
+
 async def lookup(ctx, host, descriptor_type: int, offset: int = 0) -> tuple[int, int, int]:
     ctx.set(host.lookup_type, descriptor_type)
     ctx.set(host.lookup_index, 0)
     ctx.set(host.lookup_w_index, 0)
     ctx.set(host.lookup_offset, offset)
-    ctx.set(host.lookup_request, 1)
-    await ctx.tick("usb")
-    ctx.set(host.lookup_request, 0)
+    await _issue_lookup(ctx, host)
     for _ in range(24):
         if ctx.get(host.lookup_response):
             break
@@ -582,9 +598,7 @@ async def lookup_report(ctx, host, interface: int) -> tuple[int, int]:
     ctx.set(host.lookup_index, 0)
     ctx.set(host.lookup_w_index, interface)
     ctx.set(host.lookup_offset, 0)
-    ctx.set(host.lookup_request, 1)
-    await ctx.tick("usb")
-    ctx.set(host.lookup_request, 0)
+    await _issue_lookup(ctx, host)
     for _ in range(24):
         if ctx.get(host.lookup_response):
             break

@@ -66,7 +66,24 @@ typedef struct {
     uint8_t verdict;
     uint8_t suspect_count;
     uint8_t suspect[SHARED_FAULT_MAX_SUSPECTS];
+
+    // CPU1's one-shot architectural fault record shares this existing fault
+    // block rather than creating a second cross-core mechanism. CPU0's link
+    // classifier owns the fields above; CPU1 owns these appended words. It
+    // writes fault_flags last with SHARED_CPU1_FAULT_VALID as publication.
+    uint32_t fault_flags;
+    uint32_t cfsr;
+    uint32_t hfsr;
+    uint32_t mmfar;
+    uint32_t bfar;
+    uint32_t pc;
+    uint32_t lr;
 } shared_link_fault_t;
+
+#define SHARED_CPU1_FAULT_CAUSE_MASK 0x03FFFFFFu
+#define SHARED_CPU1_FAULT_KIND_SHIFT 28u
+#define SHARED_CPU1_FAULT_KIND_MASK  0x30000000u
+#define SHARED_CPU1_FAULT_VALID      0x80000000u
 
 typedef struct {
     uint32_t magic;
@@ -126,10 +143,10 @@ typedef struct {
 // constant and that one cannot drift apart without the build saying so.
 _Static_assert(sizeof(shared_descriptor_t) == 2060u,
                "descriptor block must be 2060 bytes");
-_Static_assert(sizeof(shared_link_fault_t) == 8u,
-               "link fault block must be 8 bytes");
-_Static_assert(sizeof(shared_window_t) == 2132u,
-               "shared window must be 2132 bytes (64 + 2060 + 8)");
+_Static_assert(sizeof(shared_link_fault_t) == 36u,
+               "shared fault block must be 36 bytes");
+_Static_assert(sizeof(shared_window_t) == 2160u,
+               "shared window must be 2160 bytes (64 + 2060 + 36)");
 
 extern volatile shared_window_t g_shared_window;
 

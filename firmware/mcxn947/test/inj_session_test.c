@@ -1,16 +1,20 @@
 // Host test for src/inj_session.c -- the injection session state machine.
 //
 // It drives the FSM through the whole mandated lifecycle with fabricated
-// telemetry and checks: the map-upload frames come out in order (BEGIN, two
-// ENTRYs, COMMIT) with a monotonic link-level frame sequence; MAP_BEGIN/COMMIT
-// carry an entries_crc32 that matches the actual entries emitted; RELATIVE
-// motion only flows after a COMMIT_ACCEPTED and cites the active generation;
-// pacing, rejection retry, re-enumeration and link-drop all behave.
+// telemetry and REAL compiled layouts (hid_mouse_layout.c over the fixtures in
+// hid_fixtures.h), and checks: nothing is uploaded until a mouse layout is
+// offered and one of its reports is seen; the map-upload frames come out in
+// order (BEGIN, one ENTRY per field, COMMIT) with a monotonic link-level frame
+// sequence and the golden entries CRC; RELATIVE motion only flows after a
+// COMMIT_ACCEPTED and cites the active generation; keyboards and pads end in
+// NO_MOUSE; pacing, rejection retry, re-enumeration and link-drop all behave.
 
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
 
+#include "hid_fixtures.h"
+#include "hid_mouse_layout.h"
 #include "inj_command.h"
 #include "inj_session.h"
 #include "injection_wire.h"
@@ -38,6 +42,7 @@ static void assert_idle(inj_session_t *s)
     assert(!inj_session_fill_tx(s, slot));
 }
 
+// A boot-mouse report's first fragment: [buttons, X, Y], generation 3.
 static inj_report_fragment_payload_t boot_fragment(void)
 {
     inj_report_fragment_payload_t frag;
@@ -45,10 +50,40 @@ static inj_report_fragment_payload_t boot_fragment(void)
     frag.descriptor_generation = 3u;
     frag.interface_number = 0u;
     frag.endpoint_number = 1u;
-    frag.report_id = 0u;
+    frag.report_id = 0u;  // the FPGA reports 0 for every report until a map commits
     frag.offset = 0u;
-    frag.total = 4u;  // [buttons, X, Y, wheel]
+    frag.total = 3u;
     return frag;
+}
+
+static hid_mouse_layout_t compiled(const uint8_t *descriptor, size_t length)
+{
+    hid_mouse_layout_t layout;
+    assert(hid_mouse_compile(descriptor, length, &layout) == HID_MOUSE_OK);
+    return layout;
+}
+
+// What link.c does when descriptor-set slot `slot`, holding interface `iface`
+// of generation `gen`, completes and the foreground compiles it: one
+// completion edge, then the verdict.
+static void deliver_in_slot(inj_session_t *s, uint16_t gen, uint8_t slot, uint8_t iface,
+                            const hid_mouse_layout_t *l)
+{
+    inj_session_observe_descriptor(s, gen, slot, true);
+    inj_session_offer_layout(s, gen, slot, iface, l);
+}
+
+// The common case: interfaces numbered from 0 claim the slot of the same index.
+static void deliver(inj_session_t *s, uint16_t gen, uint8_t iface, const hid_mouse_layout_t *l)
+{
+    deliver_in_slot(s, gen, iface, iface, l);
+}
+
+static void offer_boot_mouse(inj_session_t *s)
+{
+    const hid_mouse_layout_t layout =
+        compiled(HID_FIXTURE_BOOT_MOUSE, sizeof(HID_FIXTURE_BOOT_MOUSE));
+    deliver(s, 3u, 0u, &layout);
 }
 
 static inj_map_status_payload_t commit_status(uint16_t map_generation, uint8_t status)
@@ -63,48 +98,56 @@ static inj_map_status_payload_t commit_status(uint16_t map_generation, uint8_t s
     return st;
 }
 
-// Run the BEGIN/ENTRY/ENTRY/COMMIT upload and assert every frame it emits.
-static void run_upload(inj_session_t *s)
+// Run the boot-mouse upload -- BEGIN, three ENTRYs (X, Y, buttons), COMMIT --
+// and assert every frame. Sequences start at `first_seq`.
+static void run_upload_from(inj_session_t *s, uint8_t first_seq)
 {
     uint8_t type = 0u;
     uint8_t p[INJ_FRAME_PAYLOAD_SIZE];
 
-    assert(next_frame(s, &type, p) == 1u);
+    assert(next_frame(s, &type, p) == first_seq);
     assert(type == INJ_TYPE_MAP_BEGIN);
     inj_map_begin_payload_t begin;
     memcpy(&begin, p, sizeof(begin));
-    assert(begin.entry_count == INJ_SESSION_MAP_ENTRIES);
+    assert(begin.entry_count == 3u);
     assert(begin.layout_count == 1u);
     assert(begin.descriptor_generation == 3u);
 
-    uint8_t entry_blob[INJ_SESSION_MAP_ENTRIES * INJ_FRAME_PAYLOAD_SIZE];
-    for (uint8_t i = 0u; i < INJ_SESSION_MAP_ENTRIES; ++i) {
-        uint8_t seq = next_frame(s, &type, p);
-        assert(seq == (uint8_t)(2u + i));
+    inj_map_entry_payload_t entries[3];
+    for (uint8_t i = 0u; i < 3u; ++i) {
+        const uint8_t seq = next_frame(s, &type, p);
+        assert(seq == (uint8_t)(first_seq + 1u + i));
         assert(type == INJ_TYPE_MAP_ENTRY);
-        inj_map_entry_payload_t entry;
-        memcpy(&entry, p, sizeof(entry));
-        assert(entry.entry_index == i);
-        assert(entry.report_length == 4u);
-        memcpy(&entry_blob[i * INJ_FRAME_PAYLOAD_SIZE], p, INJ_FRAME_PAYLOAD_SIZE);
+        memcpy(&entries[i], p, sizeof(entries[i]));
+        assert(entries[i].entry_index == i);
+        assert(entries[i].report_length == 3u);
+        assert(entries[i].endpoint_number == 1u);
     }
-    // Byte 1 is X (offset 8), byte 2 is Y (offset 16).
-    inj_map_entry_payload_t x_entry;
-    inj_map_entry_payload_t y_entry;
-    memcpy(&x_entry, &entry_blob[0], sizeof(x_entry));
-    memcpy(&y_entry, &entry_blob[INJ_FRAME_PAYLOAD_SIZE], sizeof(y_entry));
-    assert(x_entry.bit_offset == 8u && x_entry.usage == 0x30u);
-    assert(y_entry.bit_offset == 16u && y_entry.usage == 0x31u);
+    // Byte 1 is X (offset 8), byte 2 is Y (offset 16), buttons 1-3 at bit 0.
+    assert(entries[0].bit_offset == 8u && entries[0].usage == 0x30u);
+    assert(entries[1].bit_offset == 16u && entries[1].usage == 0x31u);
+    assert(entries[2].bit_offset == 0u && entries[2].usage == 1u && entries[2].bit_width == 3u);
 
-    // MAP_BEGIN's crc32 must match the entries actually sent.
-    assert(begin.entries_crc32 == inj_crc32(entry_blob, sizeof(entry_blob)));
+    // MAP_BEGIN's crc32 must match the entries actually sent. For the first
+    // map (generation 1) that is the golden value zlib.crc32 gives for exactly
+    // these payloads -- see inj_map_build_test.c.
+    assert(begin.entries_crc32 == inj_crc32((const uint8_t *)entries, sizeof(entries)));
+    if (begin.map_generation == 1u) {
+        assert(begin.entries_crc32 == 0xDD9D11D2u);
+    }
 
-    assert(next_frame(s, &type, p) == 4u);
+    assert(next_frame(s, &type, p) == (uint8_t)(first_seq + 4u));
     assert(type == INJ_TYPE_MAP_COMMIT);
     inj_map_commit_payload_t commit;
     memcpy(&commit, p, sizeof(commit));
     assert(commit.entries_crc32 == begin.entries_crc32);
     assert(commit.map_generation == begin.map_generation);
+    assert(commit.entry_count == 3u);
+}
+
+static void run_upload(inj_session_t *s)
+{
+    run_upload_from(s, 1u);
 }
 
 static void test_full_lifecycle(void)
@@ -115,10 +158,19 @@ static void test_full_lifecycle(void)
     assert_idle(&s);
 
     inj_session_set_link(&s, true);
+    assert(inj_session_phase(&s) == INJ_PHASE_WAIT_DESCRIPTOR);
+    assert_idle(&s);
+
+    // A report before any verdict teaches nothing: the session cannot know
+    // which bytes of it are a mouse's.
+    inj_report_fragment_payload_t frag = boot_fragment();
+    inj_session_observe_report(&s, &frag);
+    assert(inj_session_phase(&s) == INJ_PHASE_WAIT_DESCRIPTOR);
+
+    offer_boot_mouse(&s);
     assert(inj_session_phase(&s) == INJ_PHASE_WAIT_REPORT);
     assert_idle(&s);
 
-    inj_report_fragment_payload_t frag = boot_fragment();
     inj_session_observe_report(&s, &frag);
     assert(inj_session_phase(&s) == INJ_PHASE_SEND_BEGIN);
 
@@ -140,7 +192,7 @@ static void test_full_lifecycle(void)
     uint8_t p[INJ_FRAME_PAYLOAD_SIZE];
     uint8_t seq = next_frame(&s, &type, p);
     assert(type == INJ_TYPE_RELATIVE);
-    assert(seq == 5u);  // BEGIN..COMMIT used 1..4
+    assert(seq == 6u);  // BEGIN, three ENTRYs, COMMIT used 1..5
     inj_relative_payload_t rel;
     memcpy(&rel, p, sizeof(rel));
     assert(rel.map_generation == 1u);
@@ -156,7 +208,7 @@ static void test_full_lifecycle(void)
         assert_idle(&s);
     }
     seq = next_frame(&s, &type, p);
-    assert(type == INJ_TYPE_RELATIVE && seq == 6u);
+    assert(type == INJ_TYPE_RELATIVE && seq == 7u);
     memcpy(&rel, p, sizeof(rel));
     assert(rel.command_sequence == 2u);
     assert(s.relatives_sent == 2u);
@@ -167,6 +219,7 @@ static void test_rejection_retries_with_new_generation(void)
     inj_session_t s;
     inj_session_init(&s);
     inj_session_set_link(&s, true);
+    offer_boot_mouse(&s);
     inj_report_fragment_payload_t frag = boot_fragment();
     inj_session_observe_report(&s, &frag);
     run_upload(&s);  // map_generation == 1
@@ -188,26 +241,16 @@ static void test_rejection_retries_with_new_generation(void)
     assert(begin.map_generation == 2u);
 }
 
-static void test_link_drop_resets_and_non_boot_is_ignored(void)
+// A link drop voids the FPGA-side session but not what was learned about the
+// device: the FPGA re-exports the SAME generation's descriptors on link-up,
+// and those are not new completions, so nothing would ever re-offer a layout.
+static void test_link_drop_resumes_with_the_cached_layout(void)
 {
     inj_session_t s;
     inj_session_init(&s);
     inj_session_set_link(&s, true);
-
-    // Report-ID-prefixed device: not a boot layout, ignored.
+    offer_boot_mouse(&s);
     inj_report_fragment_payload_t frag = boot_fragment();
-    frag.report_id = 2u;
-    inj_session_observe_report(&s, &frag);
-    assert(inj_session_phase(&s) == INJ_PHASE_WAIT_REPORT);
-
-    // A report too short to hold Y is also ignored.
-    frag = boot_fragment();
-    frag.total = 2u;
-    inj_session_observe_report(&s, &frag);
-    assert(inj_session_phase(&s) == INJ_PHASE_WAIT_REPORT);
-
-    // Get to INJECTING, then drop the link: everything resets.
-    frag = boot_fragment();
     inj_session_observe_report(&s, &frag);
     run_upload(&s);
     inj_map_status_payload_t ok = commit_status(1u, INJ_MAP_STATUS_STATUS_COMMIT_ACCEPTED);
@@ -216,9 +259,20 @@ static void test_link_drop_resets_and_non_boot_is_ignored(void)
 
     inj_session_set_link(&s, false);
     assert(inj_session_phase(&s) == INJ_PHASE_WAIT_LINK);
+    assert(s.active_map_generation == 0u);
     assert_idle(&s);
     inj_session_set_link(&s, true);
     assert(inj_session_phase(&s) == INJ_PHASE_WAIT_REPORT);
+
+    // A live report re-uploads, with a fresh map generation.
+    inj_session_observe_report(&s, &frag);
+    assert(inj_session_phase(&s) == INJ_PHASE_SEND_BEGIN);
+    uint8_t type = 0u;
+    uint8_t p[INJ_FRAME_PAYLOAD_SIZE];
+    (void)next_frame(&s, &type, p);
+    inj_map_begin_payload_t begin;
+    memcpy(&begin, p, sizeof(begin));
+    assert(type == INJ_TYPE_MAP_BEGIN && begin.map_generation == 2u);
 }
 
 // Drive a fresh session all the way to INJECTING with a committed boot map.
@@ -226,9 +280,49 @@ static void reach_injecting(inj_session_t *s)
 {
     inj_session_init(s);
     inj_session_set_link(s, true);
+    offer_boot_mouse(s);
     inj_report_fragment_payload_t frag = boot_fragment();
     inj_session_observe_report(s, &frag);
     run_upload(s);
+    inj_map_status_payload_t ok = commit_status(1u, INJ_MAP_STATUS_STATUS_COMMIT_ACCEPTED);
+    inj_session_observe_map_status(s, &ok);
+    assert(inj_session_phase(s) == INJ_PHASE_INJECTING);
+}
+
+// The report-ID gaming mouse (ID 2, 16-bit X/Y, wheel, AC Pan, 5 buttons) on
+// interface 1, endpoint 2, driven to INJECTING.
+static inj_report_fragment_payload_t id_mouse_fragment(uint8_t first_byte)
+{
+    inj_report_fragment_payload_t frag;
+    memset(&frag, 0, sizeof(frag));
+    frag.descriptor_generation = 3u;
+    frag.interface_number = 1u;
+    frag.endpoint_number = 2u;
+    frag.total = 8u;
+    frag.data[0] = first_byte;  // the report ID, as the device sends it
+    return frag;
+}
+
+static void drain_upload(inj_session_t *s)
+{
+    uint8_t type = 0u;
+    uint8_t p[INJ_FRAME_PAYLOAD_SIZE];
+    do {
+        (void)next_frame(s, &type, p);
+    } while (type != INJ_TYPE_MAP_COMMIT);
+}
+
+static void reach_injecting_id_mouse(inj_session_t *s)
+{
+    inj_session_init(s);
+    inj_session_set_link(s, true);
+    const hid_mouse_layout_t layout =
+        compiled(HID_FIXTURE_ID_MOUSE_16BIT, sizeof(HID_FIXTURE_ID_MOUSE_16BIT));
+    deliver(s, 3u, 1u, &layout);
+    inj_report_fragment_payload_t frag = id_mouse_fragment(2u);
+    inj_session_observe_report(s, &frag);
+    assert(inj_session_phase(s) == INJ_PHASE_SEND_BEGIN);
+    drain_upload(s);
     inj_map_status_payload_t ok = commit_status(1u, INJ_MAP_STATUS_STATUS_COMMIT_ACCEPTED);
     inj_session_observe_map_status(s, &ok);
     assert(inj_session_phase(s) == INJ_PHASE_INJECTING);
@@ -266,7 +360,7 @@ static void test_requested_relative_preempts_the_paced_drift(void)
 static void test_requested_wheel_sets_only_the_wheel_flag(void)
 {
     inj_session_t s;
-    reach_injecting(&s);
+    reach_injecting_id_mouse(&s);
 
     assert(inj_session_request_relative(&s, 0, 0, -1, 0));
 
@@ -310,6 +404,8 @@ static void test_request_is_refused_before_injecting(void)
     assert(!inj_session_request_relative(&s, 1, 1, 0, 0));
 
     inj_session_set_link(&s, true);
+    assert(!inj_session_request_relative(&s, 1, 1, 0, 0));
+    offer_boot_mouse(&s);
     assert(inj_session_phase(&s) == INJ_PHASE_WAIT_REPORT);
     assert(!inj_session_request_relative(&s, 1, 1, 0, 0));
 }
@@ -441,11 +537,433 @@ static void test_zero_button_mask_is_still_emitted(void)
     assert(st.buttons == 0u);
 }
 
+// --- descriptor-compiled targeting --------------------------------------------
+
+static void tick(inj_session_t *s, uint32_t slots)
+{
+    for (uint32_t i = 0u; i < slots; ++i) {
+        assert_idle(s);
+    }
+}
+
+// A keyboard alone: its descriptor completes, is judged not-a-mouse, and once
+// descriptor traffic has been quiet for the settle window the session says so.
+// Its reports never start an upload -- which is the bug this exists to fix: a
+// boot map over a keyboard report put injected Y in the first key slot.
+static void test_keyboard_only_device_becomes_no_mouse(void)
+{
+    inj_session_t s;
+    inj_session_init(&s);
+    inj_session_set_link(&s, true);
+    deliver(&s, 3u, 0u, NULL);
+
+    inj_report_fragment_payload_t key = boot_fragment();
+    key.total = 8u;
+    inj_session_observe_report(&s, &key);
+    assert(inj_session_phase(&s) == INJ_PHASE_WAIT_DESCRIPTOR);
+
+    tick(&s, INJ_SESSION_SETTLE_SLOTS - 1u);
+    assert(!inj_session_no_mouse(&s));
+    tick(&s, 1u);
+    assert(inj_session_no_mouse(&s));
+    assert(!inj_session_request_relative(&s, 5, 0, 0, 0));
+    inj_session_observe_report(&s, &key);
+    assert(inj_session_no_mouse(&s));
+}
+
+// No verdict while a completed descriptor is still being compiled: the
+// foreground may lag the timer, and the unjudged one may be the mouse.
+static void test_no_verdict_while_a_completed_descriptor_is_unjudged(void)
+{
+    inj_session_t s;
+    inj_session_init(&s);
+    inj_session_set_link(&s, true);
+    deliver(&s, 3u, 0u, NULL);
+    inj_session_observe_descriptor(&s, 3u, 1u, true);  // completed, not yet offered
+    tick(&s, INJ_SESSION_SETTLE_SLOTS * 4u);
+    assert(inj_session_phase(&s) == INJ_PHASE_WAIT_DESCRIPTOR);
+}
+
+// Any descriptor fragment restarts the quiet window: an export still in flight
+// is not "done".
+static void test_descriptor_traffic_restarts_the_settle_window(void)
+{
+    inj_session_t s;
+    inj_session_init(&s);
+    inj_session_set_link(&s, true);
+    deliver(&s, 3u, 0u, NULL);
+    tick(&s, INJ_SESSION_SETTLE_SLOTS - 1u);
+    inj_session_observe_descriptor(&s, 3u, 1u, false);  // interface 1 still arriving
+    tick(&s, INJ_SESSION_SETTLE_SLOTS - 1u);
+    assert(inj_session_phase(&s) == INJ_PHASE_WAIT_DESCRIPTOR);
+    tick(&s, 1u);
+    assert(inj_session_no_mouse(&s));
+}
+
+// Composite device: a keyboard on interface 0, the mouse on interface 1. The
+// map targets interface 1 and the endpoint seen on ITS reports; the keyboard's
+// reports teach nothing.
+static void test_composite_device_targets_the_mouse_interface(void)
+{
+    inj_session_t s;
+    inj_session_init(&s);
+    inj_session_set_link(&s, true);
+    deliver(&s, 3u, 0u, NULL);
+    const hid_mouse_layout_t mouse =
+        compiled(HID_FIXTURE_BOOT_MOUSE, sizeof(HID_FIXTURE_BOOT_MOUSE));
+    deliver(&s, 3u, 1u, &mouse);
+    assert(inj_session_phase(&s) == INJ_PHASE_WAIT_REPORT);
+
+    inj_report_fragment_payload_t key = boot_fragment();
+    key.total = 8u;
+    inj_session_observe_report(&s, &key);
+    assert(inj_session_phase(&s) == INJ_PHASE_WAIT_REPORT);
+
+    inj_report_fragment_payload_t move = boot_fragment();
+    move.interface_number = 1u;
+    move.endpoint_number = 2u;
+    inj_session_observe_report(&s, &move);
+    assert(inj_session_phase(&s) == INJ_PHASE_SEND_BEGIN);
+
+    uint8_t type = 0u;
+    uint8_t p[INJ_FRAME_PAYLOAD_SIZE];
+    (void)next_frame(&s, &type, p);
+    (void)next_frame(&s, &type, p);
+    inj_map_entry_payload_t entry;
+    memcpy(&entry, p, sizeof(entry));
+    assert(type == INJ_TYPE_MAP_ENTRY);
+    assert(entry.interface_number == 1u && entry.endpoint_number == 2u);
+}
+
+// Interface numbers are not slot indices: a keyboard numbered 2 claimed slot 0
+// and the mouse numbered 5 slot 1. Maps and the report match carry the real
+// number, 5.
+static void test_a_mouse_numbered_beyond_the_slot_count_is_targeted(void)
+{
+    inj_session_t s;
+    inj_session_init(&s);
+    inj_session_set_link(&s, true);
+    deliver_in_slot(&s, 3u, 0u, 2u, NULL);
+    const hid_mouse_layout_t mouse =
+        compiled(HID_FIXTURE_BOOT_MOUSE, sizeof(HID_FIXTURE_BOOT_MOUSE));
+    deliver_in_slot(&s, 3u, 1u, 5u, &mouse);
+    assert(inj_session_phase(&s) == INJ_PHASE_WAIT_REPORT);
+
+    inj_report_fragment_payload_t move = boot_fragment();
+    move.interface_number = 5u;
+    move.endpoint_number = 6u;
+    inj_session_observe_report(&s, &move);
+    assert(inj_session_phase(&s) == INJ_PHASE_SEND_BEGIN);
+
+    uint8_t type = 0u;
+    uint8_t p[INJ_FRAME_PAYLOAD_SIZE];
+    (void)next_frame(&s, &type, p);
+    (void)next_frame(&s, &type, p);
+    inj_map_entry_payload_t entry;
+    memcpy(&entry, p, sizeof(entry));
+    assert(type == INJ_TYPE_MAP_ENTRY);
+    assert(entry.interface_number == 5u && entry.endpoint_number == 6u);
+}
+
+// A mouse whose descriptor completes after the settle window (a slow composite
+// export) still gets its map: NO_MOUSE is a verdict on what has arrived.
+static void test_a_late_mouse_overturns_no_mouse(void)
+{
+    inj_session_t s;
+    inj_session_init(&s);
+    inj_session_set_link(&s, true);
+    deliver(&s, 3u, 0u, NULL);
+    tick(&s, INJ_SESSION_SETTLE_SLOTS);
+    assert(inj_session_no_mouse(&s));
+
+    const hid_mouse_layout_t mouse =
+        compiled(HID_FIXTURE_BOOT_MOUSE, sizeof(HID_FIXTURE_BOOT_MOUSE));
+    deliver(&s, 3u, 1u, &mouse);
+    assert(inj_session_phase(&s) == INJ_PHASE_WAIT_REPORT);
+}
+
+// Re-enumeration (a new descriptor generation on a DESCRIPTOR_FRAGMENT) drops
+// the layout, the committed map and any queued request; a verdict still in
+// flight for the OLD generation is ignored when it lands.
+static void test_new_generation_drops_everything(void)
+{
+    inj_session_t s;
+    reach_injecting(&s);
+    assert(inj_session_request_relative(&s, 4, 4, 0, 0));
+
+    inj_session_observe_descriptor(&s, 4u, 0u, false);
+    assert(inj_session_phase(&s) == INJ_PHASE_WAIT_DESCRIPTOR);
+    assert(s.active_map_generation == 0u);
+    assert(!inj_session_pending_request(&s));
+    assert(!s.have_layout);
+
+    const hid_mouse_layout_t mouse =
+        compiled(HID_FIXTURE_BOOT_MOUSE, sizeof(HID_FIXTURE_BOOT_MOUSE));
+    inj_session_offer_layout(&s, 3u, 0u, 0u, &mouse);  // stale: generation 3
+    assert(inj_session_phase(&s) == INJ_PHASE_WAIT_DESCRIPTOR);
+    deliver(&s, 4u, 0u, &mouse);
+    assert(inj_session_phase(&s) == INJ_PHASE_WAIT_REPORT);
+}
+
+// A report-ID mouse: only reports carrying ITS ID start the upload, and every
+// command cites that ID.
+static void test_report_id_mouse_is_addressed_by_its_id(void)
+{
+    inj_session_t s;
+    inj_session_init(&s);
+    inj_session_set_link(&s, true);
+    const hid_mouse_layout_t layout =
+        compiled(HID_FIXTURE_ID_MOUSE_16BIT, sizeof(HID_FIXTURE_ID_MOUSE_16BIT));
+    deliver(&s, 3u, 1u, &layout);
+
+    inj_report_fragment_payload_t other = id_mouse_fragment(1u);  // another report ID
+    inj_session_observe_report(&s, &other);
+    assert(inj_session_phase(&s) == INJ_PHASE_WAIT_REPORT);
+
+    inj_report_fragment_payload_t mine = id_mouse_fragment(2u);
+    inj_session_observe_report(&s, &mine);
+    assert(inj_session_phase(&s) == INJ_PHASE_SEND_BEGIN);
+
+    uint8_t type = 0u;
+    uint8_t p[INJ_FRAME_PAYLOAD_SIZE];
+    (void)next_frame(&s, &type, p);
+    inj_map_begin_payload_t begin;
+    memcpy(&begin, p, sizeof(begin));
+    assert(begin.entry_count == 5u);
+    for (uint8_t i = 0u; i < 5u; ++i) {
+        (void)next_frame(&s, &type, p);
+        inj_map_entry_payload_t entry;
+        memcpy(&entry, p, sizeof(entry));
+        assert(entry.report_id == 2u && entry.report_length == 8u);
+    }
+    (void)next_frame(&s, &type, p);
+    assert(type == INJ_TYPE_MAP_COMMIT);
+    inj_map_status_payload_t ok = commit_status(1u, INJ_MAP_STATUS_STATUS_COMMIT_ACCEPTED);
+    inj_session_observe_map_status(&s, &ok);
+
+    assert(inj_session_request_relative(&s, 3, 0, 0, 0));
+    (void)next_frame(&s, &type, p);
+    inj_relative_payload_t rel;
+    memcpy(&rel, p, sizeof(rel));
+    assert(rel.report_id == 2u && rel.interface_number == 1u && rel.endpoint_number == 2u);
+}
+
+// The FPGA binds a layout only on an exact report length. A device sending more
+// than its descriptor declares still reaches every mapped field, so its real
+// length is adopted and counted; one sending too little to reach them is not
+// mapped at all.
+static void test_report_length_override_and_conflict(void)
+{
+    inj_session_t s;
+    inj_session_init(&s);
+    inj_session_set_link(&s, true);
+    offer_boot_mouse(&s);
+    inj_report_fragment_payload_t longer = boot_fragment();
+    longer.total = 4u;
+    inj_session_observe_report(&s, &longer);
+    assert(inj_session_phase(&s) == INJ_PHASE_SEND_BEGIN);
+    assert(s.length_overrides == 1u);
+    uint8_t type = 0u;
+    uint8_t p[INJ_FRAME_PAYLOAD_SIZE];
+    (void)next_frame(&s, &type, p);
+    (void)next_frame(&s, &type, p);
+    inj_map_entry_payload_t entry;
+    memcpy(&entry, p, sizeof(entry));
+    assert(entry.report_length == 4u);
+
+    inj_session_init(&s);
+    inj_session_set_link(&s, true);
+    offer_boot_mouse(&s);
+    inj_report_fragment_payload_t shorter = boot_fragment();
+    shorter.total = 2u;
+    inj_session_observe_report(&s, &shorter);
+    assert(inj_session_phase(&s) == INJ_PHASE_WAIT_REPORT);
+    assert(s.length_conflicts == 1u);
+}
+
+// A wheel request against a mouse with no wheel cannot be honoured; the wheel
+// part is dropped (and counted) rather than sent as a command the map does
+// not cover, while any X/Y in the same request still goes out.
+static void test_wheel_on_a_wheelless_mouse_is_dropped(void)
+{
+    inj_session_t s;
+    reach_injecting(&s);  // boot mouse: X, Y, buttons
+    inj_session_set_drift(&s, 0, 0);
+
+    assert(inj_session_request_relative(&s, 0, 0, 1, 0));
+    assert_idle(&s);
+    assert(s.axis_drops == 1u);
+
+    assert(inj_session_request_relative(&s, 5, 0, 1, 0));
+    uint8_t type = 0u;
+    uint8_t p[INJ_FRAME_PAYLOAD_SIZE];
+    (void)next_frame(&s, &type, p);
+    inj_relative_payload_t rel;
+    memcpy(&rel, p, sizeof(rel));
+    assert(rel.flags == INJ_RELATIVE_FLAG_X && rel.x == 5);
+    assert(s.axis_drops == 2u);
+}
+
+// NO_MOUSE survives a link bounce: the re-exported descriptors are the same
+// generation and are never re-judged, so the verdict must be kept.
+static void test_no_mouse_survives_a_link_bounce(void)
+{
+    inj_session_t s;
+    inj_session_init(&s);
+    inj_session_set_link(&s, true);
+    deliver(&s, 3u, 0u, NULL);
+    tick(&s, INJ_SESSION_SETTLE_SLOTS);
+    assert(inj_session_no_mouse(&s));
+    inj_session_set_link(&s, false);
+    assert(!inj_session_no_mouse(&s));
+    inj_session_set_link(&s, true);
+    assert(inj_session_no_mouse(&s));
+}
+
+// A NO_MOUSE verdict belongs to one device. Replace the keyboard with a mouse
+// (a new generation) and bounce the link before its descriptor arrives: the
+// session must be waiting for that descriptor, not repeating the old verdict.
+static void test_no_mouse_verdict_dies_with_its_generation(void)
+{
+    inj_session_t s;
+    inj_session_init(&s);
+    inj_session_set_link(&s, true);
+    deliver(&s, 3u, 0u, NULL);
+    tick(&s, INJ_SESSION_SETTLE_SLOTS);
+    assert(inj_session_no_mouse(&s));
+
+    inj_session_observe_descriptor(&s, 4u, 0u, false);
+    assert(inj_session_phase(&s) == INJ_PHASE_WAIT_DESCRIPTOR);
+    inj_session_set_link(&s, false);
+    inj_session_set_link(&s, true);
+    assert(inj_session_phase(&s) == INJ_PHASE_WAIT_DESCRIPTOR);
+}
+
+// Reports never move the session's generation; descriptors do. A stale report
+// of the previous device must not throw away the current layout -- nothing
+// would ever re-offer it, because the descriptor set already holds those
+// descriptors complete and the FPGA exports them once. And a new device's
+// reports arriving ahead of its descriptors change nothing until they do.
+static void test_reports_of_another_generation_are_ignored(void)
+{
+    inj_session_t s;
+    reach_injecting(&s);  // generation 3
+
+    inj_report_fragment_payload_t stale = boot_fragment();
+    stale.descriptor_generation = 2u;
+    inj_session_observe_report(&s, &stale);
+    assert(inj_session_phase(&s) == INJ_PHASE_INJECTING && s.have_layout);
+
+    inj_report_fragment_payload_t early = boot_fragment();
+    early.descriptor_generation = 4u;
+    inj_session_observe_report(&s, &early);
+    assert(inj_session_phase(&s) == INJ_PHASE_INJECTING && s.have_layout);
+
+    // Before any descriptor at all, a report teaches nothing either.
+    inj_session_init(&s);
+    inj_session_set_link(&s, true);
+    inj_session_observe_report(&s, &early);
+    assert(!s.have_generation);
+}
+
+// The set can lose a completed descriptor (a discard) without the FPGA ever
+// resending it. link.c reconciles the session with what the set actually holds;
+// a withdrawn, never-judged interface must not hold the verdict back forever.
+static void test_a_withdrawn_descriptor_does_not_block_the_verdict(void)
+{
+    inj_session_t s;
+    inj_session_init(&s);
+    inj_session_set_link(&s, true);
+    deliver(&s, 3u, 0u, NULL);
+    inj_session_observe_descriptor(&s, 3u, 1u, true);  // complete, never judged
+    tick(&s, INJ_SESSION_SETTLE_SLOTS * 2u);
+    assert(inj_session_phase(&s) == INJ_PHASE_WAIT_DESCRIPTOR);
+
+    inj_session_sync_descriptors(&s, 3u, 0x01u);  // interface 1 no longer complete
+    tick(&s, INJ_SESSION_SETTLE_SLOTS);
+    assert(inj_session_no_mouse(&s));
+
+    // A sync for another generation is not about this device.
+    inj_session_t t;
+    inj_session_init(&t);
+    inj_session_set_link(&t, true);
+    deliver(&t, 3u, 0u, NULL);
+    inj_session_observe_descriptor(&t, 3u, 1u, true);
+    inj_session_sync_descriptors(&t, 9u, 0x01u);
+    tick(&t, INJ_SESSION_SETTLE_SLOTS * 2u);
+    assert(inj_session_phase(&t) == INJ_PHASE_WAIT_DESCRIPTOR);
+}
+
+// A lost MAP_STATUS must not park the session forever: after the commit
+// timeout it retries with a fresh map generation, and the late answer for the
+// abandoned one is ignored.
+static void test_commit_timeout_retries_with_a_new_generation(void)
+{
+    inj_session_t s;
+    inj_session_init(&s);
+    inj_session_set_link(&s, true);
+    offer_boot_mouse(&s);
+    inj_report_fragment_payload_t frag = boot_fragment();
+    inj_session_observe_report(&s, &frag);
+    run_upload(&s);
+    assert(inj_session_phase(&s) == INJ_PHASE_WAIT_COMMIT);
+
+    tick(&s, INJ_SESSION_COMMIT_TIMEOUT_SLOTS - 1u);
+    assert(inj_session_phase(&s) == INJ_PHASE_WAIT_COMMIT);
+    tick(&s, 1u);
+    assert(inj_session_phase(&s) == INJ_PHASE_WAIT_REPORT);
+    assert(s.commit_timeouts == 1u);
+
+    inj_map_status_payload_t late = commit_status(1u, INJ_MAP_STATUS_STATUS_COMMIT_ACCEPTED);
+    inj_session_observe_map_status(&s, &late);
+    assert(inj_session_phase(&s) == INJ_PHASE_WAIT_REPORT);
+
+    inj_session_observe_report(&s, &frag);
+    uint8_t type = 0u;
+    uint8_t p[INJ_FRAME_PAYLOAD_SIZE];
+    (void)next_frame(&s, &type, p);
+    inj_map_begin_payload_t begin;
+    memcpy(&begin, p, sizeof(begin));
+    assert(type == INJ_TYPE_MAP_BEGIN && begin.map_generation == 2u);
+}
+
+// A mouse whose layout maps no buttons has nothing a BUTTON_STATE or
+// PHYSICAL_MASK could act on. Such a request is dropped at emission and
+// counted, like an unsupported axis -- not refused, because kmcmd treats a
+// refusal as "not now" and would retry it forever.
+static void test_button_requests_on_a_buttonless_mouse_are_dropped(void)
+{
+    static const uint8_t axes_only[] = {
+        0x05, 0x01, 0x09, 0x02, 0xA1, 0x01,
+        0x09, 0x30, 0x09, 0x31, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x02, 0x81, 0x06,
+        0xC0,
+    };
+    inj_session_t s;
+    inj_session_init(&s);
+    inj_session_set_link(&s, true);
+    const hid_mouse_layout_t layout = compiled(axes_only, sizeof(axes_only));
+    deliver(&s, 3u, 0u, &layout);
+    inj_report_fragment_payload_t frag = boot_fragment();
+    frag.total = 2u;
+    inj_session_observe_report(&s, &frag);
+    drain_upload(&s);
+    inj_map_status_payload_t ok = commit_status(1u, INJ_MAP_STATUS_STATUS_COMMIT_ACCEPTED);
+    inj_session_observe_map_status(&s, &ok);
+    assert(inj_session_phase(&s) == INJ_PHASE_INJECTING);
+    inj_session_set_drift(&s, 0, 0);
+
+    assert(inj_session_request_buttons(&s, 0x1u, 0u));
+    assert_idle(&s);
+    assert(inj_session_request_physical_mask(&s, 0x1u));
+    assert_idle(&s);
+    assert(s.button_drops == 2u);
+}
+
 int main(void)
 {
     test_full_lifecycle();
     test_rejection_retries_with_new_generation();
-    test_link_drop_resets_and_non_boot_is_ignored();
+    test_link_drop_resumes_with_the_cached_layout();
     test_requested_relative_preempts_the_paced_drift();
     test_requested_wheel_sets_only_the_wheel_flag();
     test_second_request_is_refused_while_one_is_pending();
@@ -456,6 +974,22 @@ int main(void)
     test_requested_physical_mask_emits_physical_mask();
     test_one_request_slot_is_shared_across_kinds();
     test_zero_button_mask_is_still_emitted();
+    test_keyboard_only_device_becomes_no_mouse();
+    test_no_verdict_while_a_completed_descriptor_is_unjudged();
+    test_descriptor_traffic_restarts_the_settle_window();
+    test_composite_device_targets_the_mouse_interface();
+    test_a_mouse_numbered_beyond_the_slot_count_is_targeted();
+    test_a_late_mouse_overturns_no_mouse();
+    test_new_generation_drops_everything();
+    test_report_id_mouse_is_addressed_by_its_id();
+    test_report_length_override_and_conflict();
+    test_wheel_on_a_wheelless_mouse_is_dropped();
+    test_no_mouse_survives_a_link_bounce();
+    test_no_mouse_verdict_dies_with_its_generation();
+    test_reports_of_another_generation_are_ignored();
+    test_a_withdrawn_descriptor_does_not_block_the_verdict();
+    test_commit_timeout_retries_with_a_new_generation();
+    test_button_requests_on_a_buttonless_mouse_are_dropped();
 
     printf("inj_session_test: ok\n");
     return 0;

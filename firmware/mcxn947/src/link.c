@@ -5,12 +5,24 @@
 #include "link.h"
 #include "dbg_uart.h"
 
+static uint8_t s_idle_slot[INJ_FRAME_SIZE] __attribute__((aligned(4)));
+
 void link_build_idle_slot(uint8_t slot[INJ_FRAME_SIZE])
 {
     // spi_frame_pack() checks type and length before writing a byte, and IDLE
     // with length 0 never dereferences the payload pointer, so NULL is correct
     // rather than merely tolerated. The return can only be SPI_FRAME_OK.
     (void)spi_frame_pack(slot, INJ_TYPE_IDLE, 0u, NULL, 0u);
+}
+
+void link_idle_slot_cache_init(void)
+{
+    link_build_idle_slot(s_idle_slot);
+}
+
+void link_copy_cached_idle_slot(uint8_t slot[INJ_FRAME_SIZE])
+{
+    __builtin_memcpy(slot, s_idle_slot, INJ_FRAME_SIZE);
 }
 
 bool link_slot_is_inert_idle(const uint8_t slot[INJ_FRAME_SIZE])
@@ -36,6 +48,7 @@ uint8_t link_next_bank(uint8_t bank)
 #include "fsl_port.h"
 
 #include "shared_window.h"
+#include "reset_cause.h"
 
 // shared_window.h spells its descriptor capacity as a literal so that neither
 // it nor its host test has to know the wire contract exists. This file includes
@@ -48,7 +61,8 @@ _Static_assert(SHARED_DESCRIPTOR_CAPACITY == INJ_MAX_DESCRIPTOR_BYTES_PER_INTERF
 // The step-3 portable halves. Both are MMIO-free and host-tested in their own
 // right; they are included inside the guard so that a host build of this file
 // still links against nothing but spi_frame.c, as test/link_test.c does.
-#include "hid_descriptor_reassembly.h"
+#include "hid_descriptor_set.h"
+#include "hid_mouse_layout.h"
 #include "link_fault_classify.h"
 #include "link_recovery.h"
 #include "link_retire.h"
@@ -225,19 +239,30 @@ static void link_dma_rings_install(void);
 // one function that drives it to remember what it drove.
 static bool s_ready;
 
-// The injection session: MCU-side policy that learns the target report, uploads
-// a boot-mouse field map and then emits RELATIVE motion. Fed from retired RX
-// telemetry and drained into the TX ring by link_drain_rx(); see inj_session.h.
+// The injection session: MCU-side policy that compiles the attached device's
+// descriptors into a field map, uploads it and then emits RELATIVE motion. Fed
+// from retired RX telemetry and drained into the TX ring by link_drain_rx();
+// see inj_session.h.
 static inj_session_t s_inj;
 
-// Reassembly of the captured device's HID report descriptor, for CPU1 to decode
-// onto the panel. Written only by the retirement interrupt; copied into the
-// shared window by link_poll() with that interrupt masked. One instance, and
-// one interface: the FPGA's whole descriptor store is 4 KB for all interfaces
-// combined and enumeration only ever commits a HID boot mouse, so four of these
-// could never fill. See hid_descriptor_reassembly.h.
-static hid_descriptor_reassembly_t s_desc;
-static volatile bool s_desc_publish_pending;
+// Every captured interface's HID report descriptor, in up to INJ_MAX_INTERFACES
+// slots, each claimed by and tagged with an interface number (hid_descriptor_set.h).
+// Written only by the retirement interrupt. The foreground compiles each newly
+// completed one for the session (link_descriptor_service()) and copies one
+// into the shared window for CPU1 to decode onto the panel. All of them, not
+// just the first: the FPGA exports each descriptor once per trigger, and on a
+// composite device the mouse is often not the first interface.
+static hid_descriptor_set_t s_descset;
+
+// Which descriptor the panel is showing, so a mouse interface can displace a
+// non-mouse one that completed first. Foreground only.
+static uint16_t s_panel_generation;
+static bool s_panel_valid;
+static bool s_panel_is_mouse;
+
+// Compile workspace. Static rather than on the stack: core0's whole stack is
+// 2 KiB. Foreground only.
+static hid_mouse_layout_t s_compiled;
 
 // Masks the retirement interrupt for a foreground critical section; defined
 // with the injection wrappers further down, declared here because
@@ -664,63 +689,102 @@ static void link_inject_consume(void)
         } else if (frame.type == INJ_TYPE_DESCRIPTOR_FRAGMENT) {
             inj_descriptor_fragment_payload_t fragment;
             memcpy(&fragment, frame.payload, sizeof(fragment));
-            if (hid_descriptor_reassembly_push(&s_desc, &fragment) ==
-                HID_DESCRIPTOR_FRAGMENT_COMPLETE) {
-                // Only a flag here. Publishing means copying up to 2 KB into
-                // the shared window, and this runs in the 8 kHz retirement
-                // interrupt -- a word-copy of 2 KB is thousands of cycles, and
-                // a device cycling descriptor generations could make a
-                // completion land every few slots. link_poll() does the copy.
-                s_desc_publish_pending = true;
+            // Only bookkeeping here. Compiling a descriptor can take ~1 ms and
+            // publishing one is a copy of up to 2 KB, against a 125 us slot:
+            // both belong to link_poll(), which finds the work through the
+            // set's dirty mask.
+            const hid_descriptor_set_push_t pushed = hid_descriptor_set_push(&s_descset, &fragment);
+            if (pushed.result != HID_DESCRIPTOR_FRAGMENT_IGNORED_INTERFACE) {
+                inj_session_observe_descriptor(&s_inj, fragment.descriptor_generation,
+                                               pushed.slot, pushed.newly_complete);
             }
         }
     }
 }
 
-// Copy a completed descriptor into the shared window for CPU1 to decode.
+// Copy a snapshot's descriptor into the shared window for CPU1 to decode.
 //
-// Foreground only, and the retirement interrupt is masked for the copy: the
-// reassembly buffer is written exclusively by that ISR, so an unmasked copy
-// racing a generation change would publish a splice of two devices'
-// descriptors -- bytes that decode cleanly into something no device ever sent.
-// The mask lasts as long as the copy (a few microseconds against a 125 us slot
-// with a two-deep DMA ring), which delays retirement and cannot lose a slot.
+// Called with the retirement interrupt masked and the snapshot just validated,
+// so the bytes cannot change under the copy: the set is written exclusively by
+// that ISR, and an unmasked copy racing a generation change would publish a
+// splice of two devices' descriptors -- bytes that decode cleanly into
+// something no device ever sent. The mask lasts as long as the copy (a few
+// microseconds against a 125 us slot with a two-deep DMA ring), which delays
+// retirement and cannot lose a slot.
 //
 // `sequence` is the seqlock: odd while writing, even when stable, with the
 // stores ordered around it so a reader on the other core cannot see new bytes
-// under an old length. Published once per enumeration, so the cost is
-// irrelevant and only the correctness of the handshake matters.
-static void link_descriptor_publish(void)
+// under an old length. Published at most a few times per enumeration, so the
+// cost is irrelevant and only the correctness of the handshake matters.
+static void link_descriptor_publish(const hid_descriptor_snapshot_t *snap)
 {
-    const uint32_t was_enabled = link_retire_irq_mask();
+    const size_t length =
+        snap->length > SHARED_DESCRIPTOR_CAPACITY ? SHARED_DESCRIPTOR_CAPACITY : snap->length;
+    g_shared_window.descriptor.sequence++;  // -> odd: publish in progress
+    __DMB();
+    for (size_t i = 0u; i < length; i++) {
+        g_shared_window.descriptor.data[i] = snap->bytes[i];
+    }
+    g_shared_window.descriptor.generation = snap->generation;
+    g_shared_window.descriptor.interface_number = snap->interface_number;
+    g_shared_window.descriptor.length = (uint16_t)length;
+    __DMB();
+    g_shared_window.descriptor.sequence++;  // -> even: stable
+}
 
-    if (!hid_descriptor_reassembly_complete(&s_desc)) {
-        // A generation change between the ISR setting the flag and this copy
-        // discarded the buffer. Nothing to publish, and the next completion
-        // will set the flag again.
-        s_desc_publish_pending = false;
-        link_retire_irq_restore(was_enabled);
+// Compile one newly completed descriptor and hand the verdict to the session.
+//
+// One slot per call, so a pass of link_poll() spends at most one compile
+// (~1 ms for a pathological 2 KB descriptor, tens of microseconds for a mouse).
+// The compile itself runs with the retirement ISR LIVE, reading the set's
+// buffer directly: masking it for a millisecond would overrun the two-deep DMA
+// ring. That is safe by snapshot-and-validate (hid_descriptor_set.h): if the
+// slot was discarded or re-generationed meanwhile, the result is dropped, and
+// the slot's next completion marks it dirty again -- or, if the FPGA never
+// resends it, the reconcile below asks again.
+static void link_descriptor_service(void)
+{
+    uint32_t was_enabled = link_retire_irq_mask();
+    // Reconcile the session with what the set actually holds, every pass. A
+    // completed slot that lost its verdict to a stale snapshot is asked for
+    // again rather than holding the NO_MOUSE verdict back forever; one that was
+    // discarded stops counting as a descriptor the verdict must wait for. Both
+    // follow the set's generation, which descriptor fragments alone move, as
+    // they alone move the session's.
+    if (s_descset.have_generation) {
+        const uint8_t complete = hid_descriptor_set_complete_mask(&s_descset);
+        inj_session_sync_descriptors(&s_inj, s_descset.generation, complete);
+        if (s_inj.have_generation && s_inj.descriptor_generation == s_descset.generation) {
+            hid_descriptor_set_redirty(&s_descset, (uint8_t)(complete & ~s_inj.judged_mask));
+        }
+    }
+    uint8_t slot = 0u;
+    hid_descriptor_snapshot_t snap;
+    const bool have = hid_descriptor_set_take_dirty(&s_descset, &slot) &&
+                      hid_descriptor_set_snapshot(&s_descset, slot, &snap);
+    link_retire_irq_restore(was_enabled);
+    if (!have) {
         return;
     }
 
-    const uint8_t *const bytes = hid_descriptor_reassembly_data(&s_desc);
-    const size_t length = hid_descriptor_reassembly_length(&s_desc);
-    const uint16_t generation = hid_descriptor_reassembly_generation(&s_desc);
-    const uint8_t interface_number = hid_descriptor_reassembly_target_interface(&s_desc);
+    const hid_mouse_status_t verdict = hid_mouse_compile(snap.bytes, snap.length, &s_compiled);
 
-    g_shared_window.descriptor.sequence++;  // -> odd: publish in progress
-    __DMB();
-    for (size_t i = 0u; i < length && i < SHARED_DESCRIPTOR_CAPACITY; i++) {
-        g_shared_window.descriptor.data[i] = bytes[i];
+    was_enabled = link_retire_irq_mask();
+    if (hid_descriptor_set_snapshot_valid(&s_descset, &snap)) {
+        const bool is_mouse = verdict == HID_MOUSE_OK;
+        inj_session_offer_layout(&s_inj, snap.generation, snap.slot, snap.interface_number,
+                                 is_mouse ? &s_compiled : NULL);
+
+        // The panel shows the first descriptor of a generation, unless a mouse
+        // turns up later -- that is the one injection is working against.
+        if (!s_panel_valid || s_panel_generation != snap.generation ||
+            (is_mouse && !s_panel_is_mouse)) {
+            link_descriptor_publish(&snap);
+            s_panel_valid = true;
+            s_panel_generation = snap.generation;
+            s_panel_is_mouse = is_mouse;
+        }
     }
-    g_shared_window.descriptor.generation = generation;
-    g_shared_window.descriptor.interface_number = interface_number;
-    g_shared_window.descriptor.length =
-        (uint16_t)((length > SHARED_DESCRIPTOR_CAPACITY) ? SHARED_DESCRIPTOR_CAPACITY : length);
-    __DMB();
-    g_shared_window.descriptor.sequence++;  // -> even: stable
-
-    s_desc_publish_pending = false;
     link_retire_irq_restore(was_enabled);
 }
 
@@ -740,7 +804,7 @@ static void link_inject_refill_tx(void)
     }
     uint8_t target = link_next_bank(active);
     if (!inj_session_fill_tx(&s_inj, s_tx_bank[target])) {
-        link_build_idle_slot(s_tx_bank[target]);
+        __builtin_memcpy(s_tx_bank[target], s_idle_slot, INJ_FRAME_SIZE);
     }
 }
 
@@ -798,19 +862,23 @@ static void link_drain_rx(void)
         // snapshot publication at the MCU's own ~8 kHz retirement cadence.
         if (g_shared_window.magic == SHARED_WINDOW_MAGIC) {
             const link_retire_counters_t *counters = link_retire_counters();
-            link_snapshot_t snapshot = {0};
-            snapshot.slot_counter = counters->slots;
             // Descriptor and map generations now have a real source: what the
             // session last learned from REPORT_FRAGMENT / MAP_STATUS. Each reads
             // zero until the session learns it -- honest rather than invented.
-            snapshot.descriptor_generation = s_inj.descriptor_generation;
-            snapshot.map_generation = s_inj.active_map_generation;
-            snapshot.link_flags = (uint16_t)(
+            const uint16_t link_flags = (uint16_t)(
                 (s_ready ? INJ_LINK_STATUS_FLAG_RELAY_READY : 0u) |
                 (s_inj.active_map_generation != 0u ? INJ_LINK_STATUS_FLAG_MAP_ACTIVE : 0u) |
                 (inj_session_phase(&s_inj) == INJ_PHASE_INJECTING
                      ? INJ_LINK_STATUS_FLAG_INJECTION_ENABLED
                      : 0u));
+            link_snapshot_t snapshot;
+            link_snapshot_assign(&snapshot,
+                                 counters->slots,
+                                 0u, 0u, 0u,
+                                 link_flags,
+                                 s_inj.descriptor_generation,
+                                 s_inj.active_map_generation,
+                                 0u, 0u);
             link_snapshot_publish(&g_shared_window.snapshot, &snapshot);
         }
         s_rx_cursor = link_next_bank(s_rx_cursor);
@@ -1060,6 +1128,10 @@ static void link_recovery_apply(void *ctx, link_recovery_op_t op)
         // the steady-state invariant is that the buffer the DMA will next read
         // is never empty and never half written, and the moment the descriptor
         // is installed is the moment that becomes true again.
+        //
+        // Pack afresh here rather than trusting the steady-state cache. This is
+        // the path taken after something has gone wrong; it must be able to
+        // recover from corruption of that static RAM image as well.
         for (uint8_t bank = 0u; bank < LINK_SLOT_BANKS; ++bank) {
             link_build_idle_slot(s_tx_bank[bank]);
         }
@@ -1122,6 +1194,8 @@ static void link_recover(const link_fault_t *fault)
     }
     s_last_fault_sr = LINK_SPI->SR;
 
+    (void)link_recovery_run(link_recovery_apply, NULL);
+
     dbg_puts("!! ERR051588 recovery #");
     dbg_dec32(s_recoveries);
     dbg_puts("  SR=");
@@ -1132,8 +1206,6 @@ static void link_recover(const link_fault_t *fault)
     dbg_puts(fault->dma_controller_halted ? " HALT" : "");
     dbg_puts(fault->receive_framing_lost ? " FRAMING" : "");
     dbg_puts("\n");
-
-    (void)link_recovery_run(link_recovery_apply, NULL);
 
     dbg_puts("   recovered, SR=");
     dbg_hex32(LINK_SPI->SR);
@@ -1506,6 +1578,13 @@ bool link_inject_request_physical_mask(uint64_t button_mask)
     return queued;
 }
 
+bool link_inject_no_mouse(void)
+{
+    // One aligned read of ISR-owned state, like link_inject_ready(): a stale
+    // answer costs one wrongly worded refusal, which the next command corrects.
+    return s_ready && inj_session_no_mouse(&s_inj);
+}
+
 bool link_inject_ready(void)
 {
     // Two aligned single-word reads of state the ISR owns. Masking would not
@@ -1600,6 +1679,11 @@ static void link_report(void)
 
 void link_poll(void)
 {
+    // Normal diagnostics become queued at the end of link_init(). Drain only
+    // what the UART can accept now, with a fixed per-pass ceiling, so neither
+    // reports nor recovery messages can stall the fault monitor.
+    dbg_uart_poll();
+
     const uint32_t slots = link_retire_counters()->slots;
 
     // Sampled unconditionally, acted on only when armed. Sampling inside the
@@ -1610,10 +1694,8 @@ void link_poll(void)
 
     link_demo_step(slots);
 
-    // Once per enumeration, not per pass: the ISR only raises the flag.
-    if (s_desc_publish_pending) {
-        link_descriptor_publish();
-    }
+    // At most one descriptor compile per pass; the ISR only marks them dirty.
+    link_descriptor_service();
 
     if (link_fault_monitor_armed()) {
         link_fault_t fault;
@@ -1644,7 +1726,7 @@ void link_poll(void)
 
 void link_init(void)
 {
-    dbg_uart_init();
+    reset_cause_report_debug();
     link_wire_probe();
 
     link_pins_init();
@@ -1655,15 +1737,14 @@ void link_init(void)
 
     // The injection session, before the RX ISR that feeds and drains it is armed.
     inj_session_init(&s_inj);
-    // Interface 0: enumeration only commits a HID boot mouse and that is the
-    // interface its report descriptor arrives on. A DESCRIPTOR_FRAGMENT for any
-    // other interface is ignored rather than spliced in -- see
-    // hid_descriptor_reassembly.h on why splicing is the failure that matters.
-    hid_descriptor_reassembly_init(&s_desc, 0u);
-    s_desc_publish_pending = false;
+    // One slot per interface; the retirement ISR that fills it is not armed yet.
+    hid_descriptor_set_init(&s_descset);
+    s_panel_valid = false;
+    s_panel_is_mouse = false;
 
+    link_idle_slot_cache_init();
     for (uint8_t bank = 0u; bank < LINK_SLOT_BANKS; ++bank) {
-        link_build_idle_slot(s_tx_bank[bank]);
+        link_copy_cached_idle_slot(s_tx_bank[bank]);
         for (uint32_t index = 0u; index < INJ_FRAME_SIZE; ++index) {
             s_rx_bank[bank][index] = 0u;
         }
@@ -1767,6 +1848,12 @@ void link_init(void)
     // The report cadence starts from whatever the boot dump cost, so the first
     // periodic line is one full interval away rather than immediate.
     s_report_ms = platform_ticks();
+
+    // Boot diagnostics above are intentionally blocking because no foreground
+    // drain exists yet. This is the mode boundary: every later ordinary
+    // dbg_* call (the 1 Hz reports and ERR051588 recovery included) queues and
+    // returns; only the architectural-fault emergency API remains blocking.
+    dbg_uart_async_enable();
 }
 
 #endif  // MCXN947

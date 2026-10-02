@@ -1,8 +1,9 @@
 """Bounded interrupt-IN polling for an enumerated USB mouse."""
 
-from amaranth import Const, Elaboratable, Module, Mux, Signal
+from amaranth import Elaboratable, Module, Signal
 from amaranth.lib.memory import Memory
 
+from .intervals import IntervalPacer
 from .timing import HostTiming
 from .transaction import USBHostTransactionEngine
 from .types import TransactionStatus
@@ -63,8 +64,14 @@ class InterruptInPoller(Elaboratable):
         report_read = report_memory.read_port(domain="comb")
         report_write = report_memory.write_port(domain="usb")
 
-        interval_counter = Signal(16)
-        poll_due = Signal()
+        # The two bInterval encodings are documented in intervals.decode_interval.
+        pacer = IntervalPacer(
+            interval=self.interval,
+            high_speed=self.high_speed,
+            sof_tick=self.sof_tick,
+            due_name="poll_due",
+        )
+        poll_due = pacer.due
         poll_active = Signal()
         expected_toggle = Signal()
         copy_active = Signal()
@@ -73,29 +80,8 @@ class InterruptInPoller(Elaboratable):
         buffer_full = Signal()
         stream_index = Signal(6)
 
-        # bInterval means different things at the two speeds.
-        #
-        # Full Speed: a direct count of 1 ms frames, 1-255.
-        # High Speed: an *exponent*. The period is 2**(bInterval-1) microframes,
-        #   so bInterval=4 is 8 microframes = 1 ms, not 4 ms.
-        #
-        # Reading a High Speed value as a direct count polls a device that asked
-        # for 1 ms at 500 us -- twice as fast as it asked for. The device still
-        # works, so nothing looks broken; it is just out of spec.
-        #
-        # High Speed bInterval is only legal in 1-16. Clamp upward to 16, which
-        # yields the slowest legal period rather than letting the shift overflow
-        # and flood the bus on a malformed descriptor. Zero is malformed at both
-        # speeds and falls back to polling every tick.
-        hs_clamped = Mux(self.interval == 0, 1, Mux(self.interval > 16, 16, self.interval))
-        # Width 1 << 15 fits the 16-bit counter: exponent 0-15 gives 1-32768.
-        hs_interval = Const(1, 1) << (hs_clamped - 1)[:4]
-        effective_interval = Signal(16)
-        m.d.comb += effective_interval.eq(
-            Mux(self.high_speed, hs_interval, Mux(self.interval == 0, 1, self.interval))
-        )
+        pacer.decode(m)
         transaction_start_ready = getattr(transaction, "start_ready", ~transaction.busy)
-        interval_elapsed = self.sof_tick & (interval_counter == effective_interval - 1)
         issue_poll = (
             self.enable
             & self.connected
@@ -163,9 +149,8 @@ class InterruptInPoller(Elaboratable):
                 m.d.usb += self.transport_error_count.eq(self.transport_error_count + 1)
 
         with m.If(~self.enable):
+            pacer.clear(m)
             m.d.usb += [
-                interval_counter.eq(0),
-                poll_due.eq(0),
                 poll_active.eq(0),
                 expected_toggle.eq(0),
                 self.failed.eq(0),
@@ -176,22 +161,11 @@ class InterruptInPoller(Elaboratable):
         with m.Elif(~self.connected):
             fail(TransactionStatus.DISCONNECTED)
         with m.Elif(~self.failed):
-            with m.If(self.sof_tick):
-                with m.If(interval_elapsed):
-                    m.d.usb += [
-                        interval_counter.eq(0),
-                        poll_due.eq(1),
-                    ]
-                with m.Else():
-                    m.d.usb += interval_counter.eq(interval_counter + 1)
+            pacer.advance(m)
 
             with m.If(issue_poll):
-                m.d.usb += [
-                    poll_active.eq(1),
-                    poll_due.eq(0),
-                ]
-                with m.If(interval_elapsed):
-                    m.d.usb += poll_due.eq(1)
+                m.d.usb += poll_active.eq(1)
+                pacer.consume(m)
 
             with m.If(poll_active & transaction.done):
                 m.d.usb += [

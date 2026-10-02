@@ -64,6 +64,31 @@ static link_snapshot_t sample(uint32_t slots)
     };
 }
 
+static void test_assign_writes_every_field(void)
+{
+    link_snapshot_t snapshot;
+    memset(&snapshot, 0xA5, sizeof(snapshot));
+
+    link_snapshot_assign(&snapshot,
+                         0x01020304u, 0x11121314u,
+                         0x2122u, 0x3132u, 0x4142u,
+                         0x5152u, 0x6162u, 0x7172u, 0x81u);
+
+    assert(snapshot.seq == 0u);
+    assert(snapshot.slot_counter == 0x01020304u);
+    assert(snapshot.native_report_count == 0x11121314u);
+    assert(snapshot.usb_frame == 0x2122u);
+    assert(snapshot.usb_subframe == 0x3132u);
+    assert(snapshot.link_flags == 0x4142u);
+    assert(snapshot.descriptor_generation == 0x5152u);
+    assert(snapshot.map_generation == 0x6162u);
+    assert(snapshot.fault_flags == 0x7172u);
+    assert(snapshot.last_rx_sequence == 0x81u);
+    for (uint32_t i = 0u; i < sizeof(snapshot._pad); ++i) {
+        assert(snapshot._pad[i] == 0u);
+    }
+}
+
 static void test_stable_read_copies_one_complete_generation(void)
 {
     volatile link_snapshot_t shared = sample(0x01020304u);
@@ -141,6 +166,7 @@ static void test_publish_interleaves_reader_after_every_store(void)
 int main(void)
 {
     assert(sizeof(link_snapshot_t) == 32u);
+    test_assign_writes_every_field();
     test_stable_read_copies_one_complete_generation();
     test_odd_sequence_is_bounded_and_preserves_last_good_copy();
     test_publish_interleaves_reader_after_every_store();

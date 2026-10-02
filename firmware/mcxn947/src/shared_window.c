@@ -34,14 +34,21 @@ void shared_window_reset(void)
     g_shared_window.descriptor.interface_number = 0u;
 
     // sequence = 0 is "nothing classified yet", which CPU1 renders as neither
-    // a fault nor a clean bill of health. Cleared in full because the block is
-    // eight bytes, unlike the descriptor's 2 KB of data beside it.
+    // a fault nor a clean bill of health. The appended CPU1 architectural
+    // fault record is also cleared before CPU1 is released.
     g_shared_window.fault.sequence = 0u;
     g_shared_window.fault.verdict = 0u;
     g_shared_window.fault.suspect_count = 0u;
     for (uint32_t index = 0u; index < SHARED_FAULT_MAX_SUSPECTS; ++index) {
         g_shared_window.fault.suspect[index] = 0u;
     }
+    g_shared_window.fault.fault_flags = 0u;
+    g_shared_window.fault.cfsr = 0u;
+    g_shared_window.fault.hfsr = 0u;
+    g_shared_window.fault.mmfar = 0u;
+    g_shared_window.fault.bfar = 0u;
+    g_shared_window.fault.pc = 0u;
+    g_shared_window.fault.lr = 0u;
 
     // Magic is the publication store: readers never observe a valid window
     // whose prefix or snapshot still contains NOLOAD residue.

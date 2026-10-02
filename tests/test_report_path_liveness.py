@@ -31,7 +31,8 @@ class LivenessHarness(Elaboratable):
     def __init__(self) -> None:
         self.store = DescriptorStore()
         self.plane = ReportInjectionDataPlane(self.store, max_fields=8)
-        self.relay = ReportRelay()
+        # Slots bound as the clone binds them for a device on endpoints 1, 2, 3, 4.
+        self.relay = ReportRelay(initial_slot_numbers=(1, 2, 3, 4))
 
     def elaborate(self, platform) -> Module:
         del platform
@@ -256,7 +257,7 @@ def test_relay_report_ready_is_unconditionally_high() -> None:
     If a future change reintroduces backpressure at this seam, this fails
     before any deadlock can be observed on hardware.
     """
-    relay = ReportRelay(endpoint_numbers=(1, 2), fifo_depth=8, max_report_bytes=4)
+    relay = ReportRelay(initial_slot_numbers=(1, 2), fifo_depth=8, max_report_bytes=4)
     sim = Simulator(relay)
     sim.add_clock(1e-6, domain="usb")
 

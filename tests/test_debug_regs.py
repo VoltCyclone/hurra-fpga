@@ -259,11 +259,43 @@ def test_report_injection_register_map_appends_bounded_diagnostics() -> None:
         (28, "usb_speed"),
         (29, "polls_issued"),
         (30, "poll_naks"),
+        # Appended after speed_policy (31) for the interrupt-OUT relay.
+        (32, "out_relay_traffic"),
+        (33, "out_relay_drops"),
+        (34, "out_relay_status"),
+        # Appended for boot protocol (SET_PROTOCOL forwarding and its replay).
+        (35, "boot_protocol"),
+        (36, "boot_resync"),
     ]
     # speed_policy is the first control register in this map; it shares the
     # address space with the status registers, so it must land after them.
     assert [(reg.address, reg.name) for reg in m.registers() if reg.kind == "control"] == [
         (31, "speed_policy"),
+    ]
+    assert [(field.name, field.width) for field in m["out_relay_traffic"].fields] == [
+        ("out_written", 16),
+        ("out_naks", 16),
+    ]
+    assert [(field.name, field.width) for field in m["out_relay_drops"].fields] == [
+        ("out_stalls", 8),
+        ("out_timeouts", 8),
+        ("out_dropped", 16),
+    ]
+    assert [(field.name, field.width) for field in m["out_relay_status"].fields] == [
+        ("out_present", 1),
+        ("out_number", 4),
+        ("out_toggle", 1),
+        ("out_active", 1),
+        ("out_last_status", 3),
+        ("out_ignored", 1),
+    ]
+    assert [(field.name, field.width) for field in m["boot_protocol"].fields] == [
+        ("boot_mask", 16),
+        ("resync_active", 1),
+    ]
+    assert [(field.name, field.width) for field in m["boot_resync"].fields] == [
+        ("resync_ok", 16),
+        ("resync_failed", 16),
     ]
     assert [(field.name, field.width) for field in m["usb_speed"].fields] == [
         ("aux_speed", 2),
@@ -653,3 +685,59 @@ def test_no_status_register_source_is_sync_domain() -> None:
         f"{len(offenders)} signal(s) read by the debug register file are driven in the "
         f"sync domain: {offenders[:8]}"
     )
+
+
+def test_production_top_exposes_the_out_relay_registers_from_the_writer() -> None:
+    """Every OUT relay register is read, and each counter counts its writer pulse."""
+    import warnings
+
+    from cynthion.gateware.platform import CynthionPlatformRev1D4
+
+    from hurra_cynthion.gateware import CynthionMouseHostTop
+
+    top = CynthionMouseHostTop()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        top.elaborate(CynthionPlatformRev1D4())
+    regmap = top.debug.regmap
+    for name in ("out_relay_traffic", "out_relay_drops", "out_relay_status"):
+        assert regmap[name].address in top.debug.regs.registers, name
+
+    writer = top.host.out_writer
+    events = {target.name: (target, event) for target, event, _ in top.debug._retained.specs}
+    for counter, pulse, width in (
+        ("count_out_written", writer.pulse_written, 16),
+        ("count_out_naks", writer.pulse_nak, 16),
+        ("count_out_stalls", writer.pulse_stall, 8),
+        ("count_out_timeouts", writer.pulse_timeout, 8),
+        ("count_out_dropped", writer.pulse_dropped, 16),
+    ):
+        target, event = events[counter]
+        assert len(target) == width, counter
+        assert pulse in event._rhs_signals(), f"{counter} does not count {pulse}"
+
+
+def test_production_top_exposes_the_boot_protocol_registers_from_the_tracker() -> None:
+    import warnings
+
+    from cynthion.gateware.platform import CynthionPlatformRev1D4
+
+    from hurra_cynthion.gateware import CynthionMouseHostTop
+
+    top = CynthionMouseHostTop()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        top.elaborate(CynthionPlatformRev1D4())
+    regmap = top.debug.regmap
+    for name in ("boot_protocol", "boot_resync"):
+        assert regmap[name].address in top.debug.regs.registers, name
+
+    tracker = top.host.boot_protocol_tracker
+    events = {target.name: (target, event) for target, event, _ in top.debug._retained.specs}
+    for counter, pulse in (
+        ("count_resync_ok", tracker.resync_ok),
+        ("count_resync_failed", tracker.resync_fail),
+    ):
+        target, event = events[counter]
+        assert len(target) == 16, counter
+        assert pulse in event._rhs_signals(), f"{counter} does not count {pulse}"

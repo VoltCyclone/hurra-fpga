@@ -43,10 +43,17 @@ int main(void)
     assert(g_shared_window.fault.suspect_count == 0u);
     assert(g_shared_window.fault.suspect[0] == 0u);
     assert(g_shared_window.fault.suspect[1] == 0u);
+    assert(g_shared_window.fault.fault_flags == 0u);
+    assert(g_shared_window.fault.cfsr == 0u);
+    assert(g_shared_window.fault.hfsr == 0u);
+    assert(g_shared_window.fault.mmfar == 0u);
+    assert(g_shared_window.fault.bfar == 0u);
+    assert(g_shared_window.fault.pc == 0u);
+    assert(g_shared_window.fault.lr == 0u);
 
     assert(sizeof(shared_descriptor_t) == 2060u);
-    assert(sizeof(shared_link_fault_t) == 8u);
-    assert(sizeof(shared_window_t) == 2132u);
+    assert(sizeof(shared_link_fault_t) == 36u);
+    assert(sizeof(shared_window_t) == 2160u);
     assert(SHARED_DESCRIPTOR_CAPACITY == 2048u);
     printf("shared_window_test: ok\n");
     return 0;

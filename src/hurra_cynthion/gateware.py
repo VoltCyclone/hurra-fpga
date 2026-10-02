@@ -17,6 +17,7 @@ from .build_env import apply_build_environment
 from .debug_block import DebugRegisterBlock
 from .debug_regs import report_injection_register_map
 from .descriptor_export import DescriptorExportEngine
+from .descriptors import MAX_ENDPOINT_NUMBER, MAX_ENDPOINTS
 from .device import MouseCloneDevice
 from .host import BoundedMouseHost
 from .injection import ReportInjectionEngine
@@ -67,6 +68,9 @@ class ReportInjectionDataPlane(Elaboratable):
         self.sof_tick = Signal()
         self.session_active = Signal()
         self.link_ready = Signal()
+        #: Bit n: endpoint number n is sending boot-protocol reports. Its
+        #: reports pass through unmapped, and commands aimed at it are dropped.
+        self.boot_protocol = Signal(MAX_ENDPOINT_NUMBER + 1)
 
         # Decoded fixed-slot receive interface.
         self.rx_valid = Signal()
@@ -252,11 +256,22 @@ class ReportInjectionDataPlane(Elaboratable):
         is_mask = rx_staged_type == INJ_TYPE_PHYSICAL_MASK
         is_clear = rx_staged_type == INJ_TYPE_CLEAR
         is_command = is_relative | is_button | is_mask | is_clear
+        # The engine passes a boot-protocol endpoint's reports through and never
+        # acks a command for it, so such a command is dropped as stale rather
+        # than left blocking the one-deep RX queue for every later one. CLEAR
+        # names no endpoint. (relative/button/mask share the endpoint offset.)
+        command_endpoint = rx_staged_payload[72:80]
+        targets_boot = (
+            (is_relative | is_button | is_mask)
+            & (self.boot_protocol >> command_endpoint[:4])[0]
+            & (command_endpoint[4:] == 0)
+        )
         command_fresh = (
             self.link_ready
             & self.session_active
             & map_store.active_valid
             & (rx_map_generation == map_store.active_generation)
+            & ~targets_boot
         )
 
         command_ready = Mux(
@@ -295,9 +310,18 @@ class ReportInjectionDataPlane(Elaboratable):
             )
         )
         rx_accept = rx_staged_valid & decoded_ready & ~invalidate
-        begin_accept = rx_accept & self.sequence_class_allowed & is_map_begin & ~map_store.busy
-        entry_accept = rx_accept & self.sequence_class_allowed & is_map_entry & map_receiving
-        commit_accept = rx_accept & self.sequence_class_allowed & is_map_commit & map_receiving
+        # rx_accept restated for map frames. For a non-command frame
+        # decoded_ready reduces to sequence_class_valid once ~invalidate holds,
+        # so this is the same predicate -- but it leaves command_ready out of
+        # the cone. Through rx_accept, the engine's report handshake
+        # (output_ready, snapshot_matches) reached every clock enable in the
+        # map store, and was the critical path on 5 of 12 seeds.
+        map_accept = (
+            rx_staged_valid & ~invalidate & self.sequence_class_valid & self.sequence_class_allowed
+        )
+        begin_accept = map_accept & is_map_begin & ~map_store.busy
+        entry_accept = map_accept & is_map_entry & map_receiving
+        commit_accept = map_accept & is_map_commit & map_receiving
         # Every in-window frame advances the window, whether or not its *content*
         # is acted on. Advancing only on accepted content freezes last_rx_sequence
         # while the sender keeps incrementing, so after 127 content-rejected frames
@@ -404,6 +428,7 @@ class ReportInjectionDataPlane(Elaboratable):
             engine.report_endpoint.eq(self.report_endpoint),
             self.report_ready.eq(engine.report_ready),
             engine.sof_tick.eq(self.sof_tick),
+            engine.boot_protocol.eq(self.boot_protocol),
             engine.accepted_report_count.eq(self.accepted_report_count),
             monitor.report_valid.eq(engine.output_valid),
             monitor.report_data.eq(engine.output_data),
@@ -457,6 +482,13 @@ class ReportInjectionDataPlane(Elaboratable):
         with m.If(self.sequence_class_stale & rx_accept):
             with m.If(self.stale_rx_count != 0xFFFF_FFFF):
                 m.d.usb += self.stale_rx_count.eq(self.stale_rx_count + 1)
+        # Counted a cycle after the gap was consumed: a diagnostic, whose
+        # 32-bit clock enable sat at the end of sequence_consumed's cone (the
+        # RX decode, and through command_fresh the map store's bank select).
+        gap_consumed = Signal()
+        m.d.usb += gap_consumed.eq(~invalidate & sequence_consumed & self.sequence_class_gap)
+        with m.If(gap_consumed & (self.sequence_gap_count != 0xFFFF_FFFF)):
+            m.d.usb += self.sequence_gap_count.eq(self.sequence_gap_count + 1)
         with m.If(invalidate):
             m.d.usb += self.rx_sequence_valid.eq(0)
         with m.Elif(sequence_consumed):
@@ -464,8 +496,6 @@ class ReportInjectionDataPlane(Elaboratable):
                 self.rx_sequence_valid.eq(1),
                 self.last_rx_sequence.eq(rx_staged_sequence),
             ]
-            with m.If(self.sequence_class_gap & (self.sequence_gap_count != 0xFFFF_FFFF)):
-                m.d.usb += self.sequence_gap_count.eq(self.sequence_gap_count + 1)
         with m.If(rx_accept):
             m.d.usb += [
                 rx_staged_valid.eq(0),
@@ -724,6 +754,39 @@ def injection_link_directions() -> dict[str, str]:
     return {sub.name: sub.ios[0].dir for sub in _INJECTION_LINK_PMOD_A.ios}
 
 
+def connect_clone_to_host(m: Module, *, host: BoundedMouseHost, device: MouseCloneDevice) -> None:
+    """Wire the clone-to-host paths that bypass the injection plane.
+
+    A function rather than inline wiring so the end-to-end tests drive exactly
+    the production connection. Nothing here may enter the report path's ready
+    chain, and nothing on it is ever mutated.
+
+    - The one HID interrupt-OUT endpoint, PC -> clone -> real device: a direct
+      stream. OUT reports (rumble, LEDs, a console's output reports) are
+      relayed verbatim. The clone registers the endpoint number; the writer
+      already holds a packet behind its own ``out_ready``.
+    - The clone's ``session_reset``, a PC bus reset or SET_CONFIGURATION. It is
+      the OUT endpoint's own registered reset, so the writer drops the old
+      session's bytes on the same edge the FIFO does; and the real device never
+      sees either event, so it also triggers the boot-protocol replay.
+    """
+    m.d.comb += [
+        # The relay IN endpoints serve the captured IN endpoints' numbers.
+        device.in_endpoint_count.eq(host.ep_count),
+        *[device.in_endpoint_number[k].eq(host.ep_number[k]) for k in range(MAX_ENDPOINTS)],
+        host.boot_resync_trigger.eq(device.session_reset),
+        # With nothing to relay the clone parks its OUT endpoint, which then
+        # answers no OUT token at all, exactly as before the relay existed.
+        device.out_present.eq(host.out_present),
+        device.out_endpoint_number.eq(host.out_number),
+        host.out_flush.eq(device.session_reset),
+        host.out_valid.eq(device.out_valid),
+        host.out_data.eq(device.out_data),
+        host.out_last.eq(device.out_last),
+        device.out_ready.eq(host.out_ready),
+    ]
+
+
 class CynthionMouseHostTop(Elaboratable):
     """Connect the mouse host and PC-facing clone on Cynthion r1.4.
 
@@ -755,7 +818,14 @@ class CynthionMouseHostTop(Elaboratable):
         # silently overrides the speed policy register. This port measured
         # "Up to 12 Mb/s" on the host until the translator was removed here.
         aux_phy = platform.request("aux_phy")
-        m.submodules.device = device = MouseCloneDevice(bus=aux_phy, store=host.descriptor_store)
+        m.submodules.device = device = MouseCloneDevice(
+            bus=aux_phy,
+            store=host.descriptor_store,
+            # Forward the PC's HID class control requests to the real device.
+            # Same `usb` domain as the host -- the descriptor store above
+            # already crosses this boundary with no CDC.
+            control_relay=host.control_relay,
+        )
         self.device = device
 
         m.submodules.injection_plane = injection_plane = ReportInjectionDataPlane(
@@ -781,12 +851,51 @@ class CynthionMouseHostTop(Elaboratable):
             pmod_a["mcu_ready"].i, mcu_ready, o_domain="usb", stages=2
         )
 
+        # Registered at the plane's edge, not at their owners. Both feed the
+        # plane's ``invalidate``, which is a clock enable across most of the map
+        # store; combinationally, host.enumerated carried every poller's
+        # ``failed`` latch there from across the die, and was the head of the
+        # critical path on 5 of 12 seeds. Registering host.enumerated inside
+        # the host instead delays device.connect too, and broke the disconnect
+        # tests. One cycle is nothing to either: link_ready is already an async
+        # pin two synchroniser stages old, and a lost session invalidates the
+        # plane a cycle later than it otherwise would.
+        plane_session_active = Signal()
+        plane_link_ready = Signal()
+        # Registered again at the plane edge for the same reason: the tracker
+        # sits beside the control relay, and this reaches the engine's report
+        # capture and the plane's command decode.
+        plane_boot_protocol = Signal.like(host.boot_protocol)
+        m.d.usb += [
+            plane_session_active.eq(host.enumerated),
+            plane_link_ready.eq(mcu_ready),
+            plane_boot_protocol.eq(host.boot_protocol),
+        ]
+
+        # The plane's output stream reaches the clone's report relay one cycle
+        # late. Exact, not a pipeline that needs a skid buffer: the relay never
+        # backpressures (``report_ready`` is a constant 1), so every byte the
+        # engine offers is taken the cycle it is offered either way. It cuts
+        # map_store.active_bank -> engine output handshake -> the relay's
+        # admit and queue-write enables, a critical-path family since G3.
+        m.d.usb += [
+            device.report_valid.eq(injection_plane.output_valid),
+            device.report_data.eq(injection_plane.output_data),
+            device.report_first.eq(injection_plane.output_first),
+            device.report_last.eq(injection_plane.output_last),
+            device.report_endpoint.eq(injection_plane.output_endpoint),
+        ]
+
         m.d.comb += [
             # AUX vbus_valid stays low in the CONTROL-powered topology even
             # while the PC enumerates the clone. Connect only after the host has
             # enumerated the mouse and its shared descriptor store is stable.
             device.copy_enable.eq(host.enumerated),
             device.connect.eq(host.enumerated & device.copy_done),
+            # The clone serves the captured bMaxPacketSize0, so it must also
+            # packetise EP0 at it. Validated by the enumerator, stable while
+            # enumerated, and in the same usb domain -- no synchroniser.
+            device.ep0_max_packet.eq(host.enumerator.ep0_max_packet),
             injection_plane.report_valid.eq(host.report_valid),
             injection_plane.report_data.eq(host.report_data),
             injection_plane.report_first.eq(host.report_first),
@@ -795,14 +904,10 @@ class CynthionMouseHostTop(Elaboratable):
             injection_plane.report_endpoint.eq(host.report_endpoint),
             host.report_ready.eq(injection_plane.report_ready),
             injection_plane.output_ready.eq(device.report_ready),
-            device.report_valid.eq(injection_plane.output_valid),
-            device.report_data.eq(injection_plane.output_data),
-            device.report_first.eq(injection_plane.output_first),
-            device.report_last.eq(injection_plane.output_last),
-            device.report_endpoint.eq(injection_plane.output_endpoint),
             injection_plane.sof_tick.eq(host.scheduler.frame_tick),
-            injection_plane.session_active.eq(host.enumerated),
-            injection_plane.link_ready.eq(mcu_ready),
+            injection_plane.session_active.eq(plane_session_active),
+            injection_plane.link_ready.eq(plane_link_ready),
+            injection_plane.boot_protocol.eq(plane_boot_protocol),
             spi_link.mcu_ready.eq(mcu_ready),
             spi_link.sof_tick.eq(host.scheduler.frame_tick),
             # Never assign ``oe``: ``io.Buffer("o", ...)`` declares ``oe: Out(1, init=1)``
@@ -829,6 +934,9 @@ class CynthionMouseHostTop(Elaboratable):
             spi_link.tx_payload_data.eq(injection_plane.tx_payload_data),
             injection_plane.tx_ready.eq(spi_link.tx_ready),
         ]
+
+        # The relayed HID interrupt-OUT endpoint and the boot-protocol replay.
+        connect_clone_to_host(m, host=host, device=device)
 
         regmap = report_injection_register_map()
         debug = DebugRegisterBlock(
@@ -961,6 +1069,43 @@ class CynthionMouseHostTop(Elaboratable):
             target_host_disconnect_seen=host.host_disconnect_seen,
             target_device_unresponsive=host.device_unresponsive,
         )
+        # The relayed interrupt-OUT endpoint. Every source is a register: the
+        # writer's pulses, toggle, active and last_status are all registered,
+        # as are the enumerator's out_* captures.
+        writer = host.out_writer
+        debug.status(
+            "out_relay_traffic",
+            out_written=debug.counter(writer.pulse_written, name="out_written", width=16),
+            out_naks=debug.counter(writer.pulse_nak, name="out_naks", width=16),
+        )
+        debug.status(
+            "out_relay_drops",
+            out_stalls=debug.counter(writer.pulse_stall, name="out_stalls", width=8),
+            out_timeouts=debug.counter(writer.pulse_timeout, name="out_timeouts", width=8),
+            out_dropped=debug.counter(writer.pulse_dropped, name="out_dropped", width=16),
+        )
+        debug.status(
+            "out_relay_status",
+            out_present=host.out_present,
+            out_number=host.out_number,
+            out_toggle=writer.toggle,
+            out_active=writer.active,
+            out_last_status=writer.last_status,
+            out_ignored=host.enumerator.out_ignored,
+        )
+        # Boot protocol. Every source is a register: the tracker's mask and
+        # pulses, and the relay's resync_active.
+        tracker = host.boot_protocol_tracker
+        debug.status(
+            "boot_protocol",
+            boot_mask=host.boot_protocol,
+            resync_active=host.control_relay.resync_active,
+        )
+        debug.status(
+            "boot_resync",
+            resync_ok=debug.counter(tracker.resync_ok, name="resync_ok", width=16),
+            resync_failed=debug.counter(tracker.resync_fail, name="resync_failed", width=16),
+        )
         debug.set_led(0, host.connected)
         debug.set_led(1, host.enumerating)
         debug.set_led(2, host.enumerated)
@@ -1006,6 +1151,15 @@ def emit_host_rtlil(filename: str) -> None:
         host.report_last,
         host.report_interface,
         host.report_endpoint,
+        host.out_flush,
+        host.out_valid,
+        host.out_ready,
+        host.out_data,
+        host.out_last,
+        host.out_present,
+        host.out_number,
+        host.boot_resync_trigger,
+        host.boot_protocol,
         host.ep_count,
         *host.ep_interface,
         *host.ep_number,

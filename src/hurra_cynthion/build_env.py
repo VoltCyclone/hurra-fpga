@@ -135,7 +135,165 @@ REQUIRED_NEXTPNR_FLAG = "--placer-heap-timingweight"
 #: its --textcfg output: nextpnr writes the textcfg even when timing fails, so
 #: "the file exists" is not a pass signal. (In the full LUNA flow no *bitstream*
 #: appears, because ecppack never runs -- that one is a real signal.)
-DEFAULT_PLACER_SEED = 7
+#:
+#: **Re-swept 2026-09-23 after the control relay landed: 8 of 12 pass.** Netlist
+#: sha 05a170f1eca3e53a, built natively from ``~/hurra-work`` on the build
+#: server (so not comparable with the container sha above -- see the
+#: path-sensitivity note), same yosys 0.68+136 / nextpnr 0.11.1-19:
+#:
+#:     2: 63.83   1: 63.67   3: 63.57   10: 62.79  9: 62.13   8: 61.64
+#:     6: 61.63   12: 60.08  |  7: 59.23  11: 58.75  4: 58.21   5: 54.85
+#:
+#: The pin moved 7 -> 2: seed 7 is now the third-worst and FAILS. This is a
+#: real loss of margin, not only a redraw, and it is worth reading carefully:
+#:
+#: - The relay itself is not on any critical path. It adds about 1% logic
+#:   (+221 LUTs, 79% -> 80% of the device; +16 distributed-RAM slices; no
+#:   BRAM), and every failing seed's path runs through pre-existing
+#:   injection-plane logic on 1.5 ns cross-die routes.
+#: - Registering ``host.enumerated`` -- the head of the worst path -- moved
+#:   the critical path to ``injection_plane.active_bank`` / ``link_ready``
+#:   and swept 7 of 12, no better. There is a *family* of near-critical
+#:   paths in the injection plane, and at 80% utilisation any added logic
+#:   perturbs placement enough to surface one. It was reverted.
+#: - So a single-signal fix will not recover 12/12. Doing so needs a
+#:   timing pass over the injection plane's cross-die control signals.
+#:
+#: Note this is the -8 speed grade every build assumes. The BOM part is -6,
+#: which closed 0 of 12 even before this change.
+#:
+#: **Re-swept 2026-09-23 after the relay's correctness fixes: 5 of 12 pass.**
+#: Netlist sha 2ddb88fa23288f6a (native, ``~/hurra-work``):
+#:
+#:     4: 62.29   5: 61.72   1: 61.12   11: 60.38  9: 60.36  |  8: 59.96
+#:     6: 59.60   3: 59.48   12: 58.51  7: 57.79   2: 57.73  10: 55.09
+#:
+#: The pin moved 2 -> 4: seed 2 now fails. Two review waves fixed real
+#: defects in the relay's AUX handler (a permanent poller starvation, stale
+#: replies, a STANDARD request forwarded to the real device) and added about
+#: 550 LUTs doing it -- 19,448 -> 19,998, 80% -> 82% of the device. Seed 2
+#: was already failing on the intermediate netlist (10/12, sha 69356e96),
+#: which is the point: every netlist edit redraws this lottery.
+#:
+#: The critical path is still entirely pre-existing logic -- 26 hops in
+#: injection_plane.engine plus copy_enable -- on every failing seed; no
+#: relay or handler logic is on it. Placement pressure, not new slow logic.
+#: Margin at the pin is +3.82%; the next netlist change should expect to
+#: re-pin, and recovering a comfortable distribution needs the injection-plane
+#: timing pass described above, or area back.
+#:
+#: **Re-swept 2026-09-23 after the /code-review fixes: 2 of 12 pass.** Netlist
+#: sha 1d28ff1e6c316110 (native), 20,261 LUTs = 83% of the device:
+#:
+#:     8: 63.70   5: 62.68  |  12: 59.73  4: 59.22  10: 59.19  9: 59.02
+#:     6: 58.52   11: 58.21  7: 57.72   2: 57.64   1: 56.88   3: 55.10
+#:
+#: The pin moved 4 -> 8: seed 4 now fails. The critical path is STILL entirely
+#: pre-existing injection-plane logic (injection_plane.engine, map_receiving,
+#: map_store) on every failing seed -- the arbiter, relay and handler appear
+#: on none. But the trend across this branch is 12 -> 8 -> 10 -> 5 -> 2 of 12
+#: as utilisation rose 79% -> 83%, and at 2/12 the next netlist edit is more
+#: likely than not to leave the pin failing. The injection-plane timing pass
+#: is no longer optional background work; it gates further RTL changes.
+#:
+#: **Re-swept 2026-09-24 after the injection-plane timing pass: 12 of 12
+#: pass.** Netlist sha ad125c63565eb8de (native), 19,407 LUTs = 79%:
+#:
+#:     1: 70.16   10: 68.38  12: 67.65  4: 67.52   7: 67.21   9: 66.73
+#:     11: 65.81  6: 65.59   2: 65.21   5: 64.45   3: 63.27   8: 63.20
+#:
+#: Median 66.2 MHz, worst +5.3%. Every failing path of the 2/12 netlist was
+#: one of two 15-22 LUT combinational cones ending on map-store clock
+#: enables, both ~80% routing delay:
+#:
+#: - ``poller.failed -> host.enumerated -> session_active -> invalidate``,
+#:   cut by registering ``session_active`` / ``link_ready`` at the plane's
+#:   edge (gateware.py). Registering it inside the host, as tried above, also
+#:   delayed device.connect and broke the disconnect tests.
+#: - ``map_store.active_bank -> engine output handshake -> *_ready ->
+#:   command_ready -> rx_accept -> begin/entry/commit_accept``, cut by
+#:   giving map frames their own accept term without ``command_ready`` --
+#:   logically identical for them, since a map frame is never a command.
+#:
+#: Fixing only the first is the 7/12 attempt above: the second surfaced.
+#: The new limiters are ``map_store`` bank state -> ``engine.working_*`` (the
+#: snapshot path) and, on 3 seeds, ``control_relay.response_length`` ->
+#: descriptor memory. The pin moved 8 -> 1; seed 8 is now the worst.
+#:
+#: **Re-swept 2026-09-24 after the zero-length-IN status fix: 12 of 12.**
+#: Netlist sha 3227b06bb4985a69 (native), 19,370 LUTs = 79%:
+#:
+#:     6: 72.91   10: 71.64  4: 70.20   9: 69.81   2: 69.27   3: 69.18
+#:     8: 69.06   1: 68.92   5: 68.75   11: 68.14  7: 66.02   12: 65.01
+#:
+#: A one-term handler change redrew placement and the whole distribution
+#: moved up (median 66.2 -> 69.1, worst +5.3% -> +8.4%) -- noise, not an
+#: improvement, but noise now well clear of the constraint. Pin 1 -> 6.
+#:
+#: EP0 packetisation (device-class gaps G2) then cost margin without being on
+#: any failing path: netlist 9d2a5243 swept 12/12 but median 66.5, worst
+#: +1.3%, every path in the injection plane. Three families were cut in turn,
+#: each surfacing as the last one went: plane_link_ready -> map_store
+#: active_valid (``invalidate`` taken out of its cone); rx_staged_type and
+#: map_store active_bank -> engine working_* (the engine registers its
+#: command decisions one state early, in BASE_CAPTURE); active_bank ->
+#: the clock enables of two diagnostic counters (counted a cycle late).
+#: Netlist sha 4209e4773f42b74e (native), 18,610 LUTs = 76%:
+#:
+#:     3: 74.91   9: 74.59   1: 74.24   8: 72.79   5: 72.57   11: 70.95
+#:     12: 70.94  4: 70.14   2: 69.45   6: 68.45   7: 68.33   10: 68.32
+#:
+#: Median 70.9, worst 68.32 (+13.9%). Pin 6 -> 3.
+#:
+#: The interrupt-OUT relay (G3: an OUT writer on the shared engine, a runtime
+#: OUT endpoint on the clone) added about 800 LUTs and stayed 12/12. Netlist
+#: sha bb129738439180a6 (native), 19,410 LUTs = 79%:
+#:
+#:     8: 73.31   7: 72.07   6: 71.58   1: 71.43   10: 71.07  12: 70.38
+#:     2: 70.23   11: 70.11  4: 69.95   5: 69.04   3: 68.15   9: 67.23
+#:
+#: Median 70.3, worst 67.23 (+12.1%). Pin 3 -> 8.
+#:
+#: Boot-protocol forwarding (G4: SET_IDLE/SET_PROTOCOL forwarded, a tracker and
+#: replay beside the control relay, engine/plane stand-down gates) added about
+#: 250 LUTs and stayed 12/12, but drew a worse placement. Netlist sha
+#: b621337b76cf612d (native), 19,656 LUTs = 80%:
+#:
+#:     10: 69.50  7: 68.12   6: 67.82   5: 67.54   9: 67.11   3: 66.57
+#:     4: 64.25   12: 64.18  2: 63.70   11: 63.66  1: 62.81   8: 62.59
+#:
+#: Median 65.4, worst 62.59 (+4.3%). No G4 logic is on any critical path: 10
+#: of 12 seeds end in a newly surfaced family, ``host.enumerator`` capture
+#: counters (report_cursor, descriptor_position) -> descriptor_store capture /
+#: admin scanner -> the clone's GET_DESCRIPTOR streamer clock enables; the
+#: other two are the known map_store.active_bank -> engine / report relay
+#: family. Pin 8 -> 10.
+#:
+#: Both families cut together: the enumerator registers its store control
+#: strobes (start/commit/abort/clear shift together, so their order holds),
+#: and the top registers the plane-to-clone report stream (exact, since the
+#: report relay never backpressures). Netlist sha 24744ceea70a6d98 (native),
+#: 19,820 LUTs = 81%:
+#:
+#:     7: 76.28   6: 75.82   9: 74.77   1: 74.26   8: 74.01   12: 73.83
+#:     10: 73.28  5: 72.71   2: 72.22   11: 71.93  3: 71.56   4: 70.75
+#:
+#: Median 73.6, worst 70.75 (+17.9%) -- the best distribution recorded. The
+#: next family, on 8 of 12 seeds: the clone's token_detector timer -> its
+#: GET_DESCRIPTOR streamer -> descriptor_memory's read address. Pin 10 -> 7.
+#:
+#: Endpoint numbers 1..15 (G5: the clone's relay IN endpoints and the report
+#: relay's queues bound to runtime numbers, a duplicate-number refusal, a
+#: 16-bit boot mask) added about 100 LUTs. Netlist sha 8da526b3afff261c
+#: (native), 19,920 LUTs = 82%:
+#:
+#:     6: 74.32   12: 73.55  8: 71.96   9: 71.46   7: 71.45   4: 71.44
+#:     2: 71.24   11: 71.17  1: 70.05   10: 69.80  3: 67.62   5: 67.35
+#:
+#: Median 71.3, worst 67.35 (+12.3%). The leading family, on 11 of 12 seeds,
+#: is G5's own: the clone's token timer -> a relay IN endpoint's runtime
+#: number compare -> its tx_manager data enables. Pin 7 -> 6.
+DEFAULT_PLACER_SEED = 6
 
 #: The full option, including the weight and seed that were actually measured.
 #: A caller-supplied ``--seed`` is composed after this one and wins, because

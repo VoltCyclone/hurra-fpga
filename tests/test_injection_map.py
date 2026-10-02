@@ -2,6 +2,7 @@ import random
 import zlib
 from dataclasses import dataclass
 
+import pytest
 from amaranth import Elaboratable, Module, Signal
 from amaranth.back import rtlil
 from amaranth.sim import Simulator
@@ -723,13 +724,30 @@ def test_bank_flip_cancels_old_bank_lookup_response() -> None:
     simulated_store(bench)
 
 
+@pytest.mark.parametrize("interface_number", [4, 5, 255])
+def test_any_interface_number_is_accepted(interface_number: int) -> None:
+    """A legal four-interface device may number them 0, 1, 2, 5.
+
+    The interface number is a key compared for equality and indexes nothing,
+    so bounding it by the interface COUNT only made such a device impossible
+    to inject on its high-numbered interface.
+    """
+
+    async def bench(ctx, store) -> None:
+        result = await commit_candidate(
+            ctx,
+            store,
+            generation=1,
+            entries=[field("x", 0, 8, interface_number=interface_number)],
+        )
+        assert result.error == MapError.NONE
+
+    simulated_store(bench)
+
+
 def test_rejects_invalid_layouts_crc_generations_and_unsupported_fields() -> None:
     async def bench(ctx, store) -> None:
         invalid_cases = [
-            (
-                {"entries": [field("x", 0, 8, interface_number=4)]},
-                MapError.INTERFACE,
-            ),
             (
                 {"entries": [field("x", 0, 8, endpoint_number=0)]},
                 MapError.ENDPOINT,

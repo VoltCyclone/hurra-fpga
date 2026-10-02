@@ -1,5 +1,6 @@
+import pytest
 from _descriptor_store_helpers import seed_descriptor
-from amaranth import Elaboratable, Module
+from amaranth import Elaboratable, Module, Signal
 from amaranth.sim import Simulator
 from usb_protocol.types import USBRequestType, USBStandardRequests
 
@@ -11,6 +12,7 @@ from hurra_cynthion.device_control import (
 )
 
 HID_SET_IDLE = 0x0A
+HID_SET_PROTOCOL = 0x0B
 
 
 class _StreamerHarness(Elaboratable):
@@ -488,7 +490,11 @@ def test_set_address_pulses_address_changed():
         # handshake detector once the host ACKs our status-phase ZLP -- it's an
         # input to this handler (RequestHandlerInterface.handshakes_in, see
         # luna/gateware/usb/usb2/request.py), not something the handler
-        # generates itself, so the isolated-handler test must supply it.
+        # generates itself, so the isolated-handler test must supply it --
+        # along with the IN token to EP0 that the ACK answers, since an ACK
+        # after any other token belongs to another endpoint.
+        ctx.set(iface.tokenizer.is_in, 1)
+        ctx.set(iface.tokenizer.endpoint, 0)
         ctx.set(iface.status_requested, 1)
         ctx.set(iface.handshakes_in.ack, 1)
         seen = False
@@ -551,7 +557,11 @@ def test_get_descriptor_routes_through_handler_to_streamer():
     sim.run()
 
 
-def test_hid_set_idle_is_acked():
+def test_hid_set_idle_status_stage_sends_a_zlp():
+    # Renamed from test_hid_set_idle_is_acked, which asserted a bare ACK
+    # handshake -- not a valid reply to the IN token that SET_IDLE's status
+    # stage carries. tests/test_device_clone_e2e.py checks the same thing on
+    # the wire.
     handler = HIDClassRequestHandler()
     m = Module()
     m.submodules.handler = handler
@@ -571,13 +581,14 @@ def test_hid_set_idle_is_acked():
         await ctx.tick("usb")
         ctx.set(iface.setup.received, 0)
         ctx.set(iface.status_requested, 1)
-        acked = False
+        zlp = False
         for _ in range(10):
-            if ctx.get(iface.handshakes_out.ack):
-                acked = True
+            if ctx.get(iface.tx.valid) and ctx.get(iface.tx.last) and not ctx.get(iface.tx.first):
+                zlp = True
                 break
             await ctx.tick("usb")
-        assert acked
+        assert zlp, "SET_IDLE status stage must be a zero-length packet"
+        assert not ctx.get(iface.handshakes_out.ack), "a handshake is not a reply to IN"
 
     sim.add_testbench(bench)
     sim.run()
@@ -712,3 +723,780 @@ def test_start_coincident_first_packet_of_multipacket_descriptor():
 
     sim.add_testbench(bench)
     sim.run()
+
+
+HID_GET_REPORT = 0x01
+HID_SET_REPORT = 0x09
+
+
+class _RelayStub(Elaboratable):
+    """Stands in for ControlRelay so the handler can be tested alone."""
+
+    def __init__(self):
+        self.request_valid = Signal()
+        self.request_ready = Signal(init=1)
+        self.request_type = Signal(8)
+        self.request = Signal(8)
+        self.value = Signal(16)
+        self.index = Signal(16)
+        self.length = Signal(16)
+        self.out_valid = Signal()
+        self.out_data = Signal(8)
+        self.response_valid = Signal()
+        self.response_error = Signal()
+        self.response_length = Signal(16)
+        self.response_ack = Signal()
+        self.read_addr = Signal(6)
+        self.read_data = Signal(8)
+        self.abort = Signal()
+        self.request_pending = Signal()
+
+    def elaborate(self, platform):
+        del platform
+        return Module()
+
+
+class _DeferHarness(Elaboratable):
+    def __init__(self, timeout_cycles: int = 64, max_packet_size=None):
+        self.relay = _RelayStub()
+        kwargs = {} if max_packet_size is None else {"max_packet_size": max_packet_size}
+        self.dut = HIDClassRequestHandler(relay=self.relay, timeout_cycles=timeout_cycles, **kwargs)
+
+    def elaborate(self, platform):
+        del platform
+        m = Module()
+        m.submodules.relay = self.relay
+        m.submodules.dut = self.dut
+        return m
+
+
+def _simulate_handler(bench, *, timeout_cycles: int = 64, max_packet_size=None) -> None:
+    harness = _DeferHarness(timeout_cycles=timeout_cycles, max_packet_size=max_packet_size)
+    simulation = Simulator(harness)
+    simulation.add_clock(1e-6, domain="usb")
+
+    async def wrapped(ctx) -> None:
+        await ctx.tick("usb")
+        await bench(ctx, harness.dut, harness.relay)
+
+    simulation.add_testbench(wrapped)
+    simulation.run()
+
+
+async def _send_setup(ctx, dut, *, request_type, request, value, index, length):
+    setup = dut.interface.setup
+    ctx.set(setup.recipient, request_type & 0x1F)
+    ctx.set(setup.type, (request_type >> 5) & 0x03)
+    ctx.set(setup.is_in_request, (request_type >> 7) & 1)
+    ctx.set(setup.request, request)
+    ctx.set(setup.value, value)
+    ctx.set(setup.index, index)
+    ctx.set(setup.length, length)
+    ctx.set(setup.received, 1)
+    await ctx.tick("usb")
+    ctx.set(setup.received, 0)
+    await ctx.tick("usb")
+
+
+def test_deferring_handler_naks_rather_than_going_silent() -> None:
+    """The single most important property in this design.
+
+    LUNA emits nothing unless a handler drives a handshake. Silence is a
+    transaction timeout, not flow control -- the host retries about three
+    times and then marks the device unresponsive. So while waiting on the
+    relay, every data_requested/status_requested strobe MUST produce a NAK.
+    """
+
+    async def bench(ctx, dut, relay) -> None:
+        await _send_setup(
+            ctx,
+            dut,
+            request_type=0xA1,
+            request=HID_GET_REPORT,
+            value=0x03F1,
+            index=3,
+            length=64,
+        )
+        assert ctx.get(relay.response_valid) == 0
+
+        for strobe in range(3):
+            ctx.set(dut.interface.data_requested, 1)
+            await ctx.delay(1e-9)
+            assert (
+                ctx.get(dut.interface.handshakes_out.nak) == 1
+            ), f"strobe {strobe}: handler went silent instead of NAKing"
+            assert ctx.get(dut.interface.tx.valid) == 0, "must not drive tx while deferring"
+            ctx.set(dut.interface.data_requested, 0)
+            await ctx.tick("usb")
+
+    _simulate_handler(bench)
+
+
+def test_claim_is_held_across_the_entire_deferral() -> None:
+    """A dropped claim routes outputs to the STALL fallback.
+
+    USBRequestHandlerMultiplexer selects with a one-hot Encoder, whose .n
+    asserts when none OR multiple inputs are set -- so losing claim mid
+    transfer silently stalls the endpoint rather than failing loudly.
+    """
+
+    async def bench(ctx, dut, relay) -> None:
+        await _send_setup(
+            ctx,
+            dut,
+            request_type=0xA1,
+            request=HID_GET_REPORT,
+            value=0x03F1,
+            index=3,
+            length=64,
+        )
+        for _ in range(20):
+            await ctx.tick("usb")
+            assert ctx.get(dut.interface.claim) == 1, "claim dropped mid-deferral"
+
+    _simulate_handler(bench, timeout_cycles=1000)
+
+
+def _assert_forwarded(ctx, relay, *, request, value, index) -> None:
+    assert ctx.get(relay.request_valid) == 1
+    assert ctx.get(relay.request_type) == 0x21
+    assert ctx.get(relay.request) == request
+    assert ctx.get(relay.value) == value
+    assert ctx.get(relay.index) == index
+    assert ctx.get(relay.length) == 0
+
+
+async def _offer_class_out(ctx, dut, *, request, value, index) -> None:
+    """Latch a no-data class OUT SETUP and leave ``received`` high for one cycle."""
+    setup = dut.interface.setup
+    ctx.set(setup.recipient, 0x01)
+    ctx.set(setup.type, 1)
+    ctx.set(setup.is_in_request, 0)
+    ctx.set(setup.request, request)
+    ctx.set(setup.value, value)
+    ctx.set(setup.index, index)
+    ctx.set(setup.length, 0)
+    ctx.set(setup.received, 1)
+    await ctx.delay(1e-9)
+
+
+async def _status_in(ctx, dut) -> dict[str, int]:
+    """One status-stage IN strobe; returns what the handler answered with."""
+    ctx.set(dut.interface.status_requested, 1)
+    await ctx.delay(1e-9)
+    answer = {
+        "nak": ctx.get(dut.interface.handshakes_out.nak),
+        "stall": ctx.get(dut.interface.handshakes_out.stall),
+        "ack": ctx.get(dut.interface.handshakes_out.ack),
+        # A ZLP: valid and last without first (LUNA's send_zlp idiom).
+        "zlp": ctx.get(dut.interface.tx.valid) & ctx.get(dut.interface.tx.last),
+    }
+    await ctx.tick("usb")
+    ctx.set(dut.interface.status_requested, 0)
+    return answer
+
+
+#: (request, wValue, wIndex): SET_IDLE(duration 4 ms, all reports) to interface
+#: 3, and SET_PROTOCOL(boot) to interface 2 -- what a BIOS sends while binding.
+_FORWARDED_NO_DATA_REQUESTS = [(HID_SET_IDLE, 0x0100, 3), (HID_SET_PROTOCOL, 0x0000, 2)]
+
+
+@pytest.mark.parametrize(("request_code", "value", "index"), _FORWARDED_NO_DATA_REQUESTS)
+def test_set_idle_and_set_protocol_are_forwarded_verbatim(request_code, value, index) -> None:
+    """The real device must see them: a BIOS's SET_PROTOCOL(boot) changes its reports."""
+
+    async def bench(ctx, dut, relay) -> None:
+        await _offer_class_out(ctx, dut, request=request_code, value=value, index=index)
+        _assert_forwarded(ctx, relay, request=request_code, value=value, index=index)
+        await ctx.tick("usb")
+        ctx.set(dut.interface.setup.received, 0)
+        ctx.set(relay.request_pending, 1)
+
+        # Until the real device answers, the status stage is held off.
+        assert await _status_in(ctx, dut) == {"nak": 1, "stall": 0, "ack": 0, "zlp": 0}
+
+        ctx.set(relay.response_valid, 1)
+        await ctx.tick("usb")
+        ctx.set(dut.interface.status_requested, 1)
+        await ctx.delay(1e-9)
+        assert ctx.get(dut.interface.tx.valid) == 1
+        assert ctx.get(dut.interface.tx.last) == 1
+        assert ctx.get(dut.interface.handshakes_out.ack) == 0
+        assert ctx.get(relay.response_ack) == 1
+
+    _simulate_handler(bench)
+
+
+@pytest.mark.parametrize(("request_code", "value", "index"), _FORWARDED_NO_DATA_REQUESTS)
+def test_a_target_that_refuses_set_idle_or_set_protocol_stalls_the_pc(
+    request_code, value, index
+) -> None:
+    async def bench(ctx, dut, relay) -> None:
+        await _offer_class_out(ctx, dut, request=request_code, value=value, index=index)
+        await ctx.tick("usb")
+        ctx.set(dut.interface.setup.received, 0)
+        ctx.set(relay.response_valid, 1)
+        ctx.set(relay.response_error, 1)
+        await ctx.delay(1e-9)
+        assert ctx.get(relay.response_ack) == 1
+        await ctx.tick("usb")
+        ctx.set(relay.response_valid, 0)
+        assert (await _status_in(ctx, dut))["stall"] == 1
+
+    _simulate_handler(bench)
+
+
+@pytest.mark.parametrize(("request_code", "value", "index"), _FORWARDED_NO_DATA_REQUESTS)
+def test_a_busy_relay_holds_set_idle_and_set_protocol_with_naks_until_it_frees(
+    request_code, value, index
+) -> None:
+    """A STALLed SET_PROTOCOL reads to a BIOS as "boot protocol unsupported", for good.
+
+    So a busy relay -- e.g. still draining the previous transfer -- NAKs these
+    two until it can take them, holding the request steady meanwhile: the relay
+    accepts only on a cycle it sees request_valid with request_ready.
+    """
+
+    async def bench(ctx, dut, relay) -> None:
+        ctx.set(relay.request_ready, 0)
+        await _offer_class_out(ctx, dut, request=request_code, value=value, index=index)
+        await ctx.tick("usb")
+        ctx.set(dut.interface.setup.received, 0)
+        for _ in range(5):
+            await ctx.delay(1e-9)
+            _assert_forwarded(ctx, relay, request=request_code, value=value, index=index)
+            assert await _status_in(ctx, dut) == {"nak": 1, "stall": 0, "ack": 0, "zlp": 0}
+
+        ctx.set(relay.request_ready, 1)
+        await ctx.delay(1e-9)
+        _assert_forwarded(ctx, relay, request=request_code, value=value, index=index)
+        await ctx.tick("usb")
+        ctx.set(relay.request_pending, 1)
+        await ctx.delay(1e-9)
+        assert ctx.get(relay.request_valid) == 0, "accepted once, so offered once"
+        assert (await _status_in(ctx, dut))["nak"] == 1
+
+        ctx.set(relay.response_valid, 1)
+        await ctx.tick("usb")
+        assert (await _status_in(ctx, dut))["zlp"] == 1
+        await ctx.delay(1e-9)
+
+    _simulate_handler(bench)
+
+
+def test_a_relay_that_never_frees_stalls_set_protocol_at_the_handler_timeout() -> None:
+    async def bench(ctx, dut, relay) -> None:
+        ctx.set(relay.request_ready, 0)
+        await _offer_class_out(ctx, dut, request=HID_SET_PROTOCOL, value=0, index=0)
+        await ctx.tick("usb")
+        ctx.set(dut.interface.setup.received, 0)
+        for _ in range(80):
+            await ctx.tick("usb")
+        await ctx.delay(1e-9)
+        assert ctx.get(relay.request_valid) == 0, "gave up, so stopped offering"
+        assert (await _status_in(ctx, dut))["stall"] == 1
+        # The relay never took it, so there is nothing to drain: the handler
+        # is straight back in IDLE and takes the next request at once.
+        ctx.set(relay.request_ready, 1)
+        await _offer_class_out(ctx, dut, request=HID_SET_PROTOCOL, value=1, index=0)
+        _assert_forwarded(ctx, relay, request=HID_SET_PROTOCOL, value=1, index=0)
+
+    _simulate_handler(bench, timeout_cycles=64)
+
+
+def test_a_setup_replacing_a_waiting_request_is_not_offered_on_its_own_cycle() -> None:
+    """setup.* holds the NEW request on its received cycle.
+
+    Offering then would let a relay that frees up on that very cycle accept a
+    request the handler has not dispatched -- a STANDARD SET_ADDRESS forwarded
+    to the real device would make it unreachable.
+    """
+
+    async def bench(ctx, dut, relay) -> None:
+        ctx.set(relay.request_ready, 0)
+        await _offer_class_out(ctx, dut, request=HID_SET_PROTOCOL, value=0, index=0)
+        await ctx.tick("usb")
+        ctx.set(dut.interface.setup.received, 0)
+        for _ in range(3):
+            await ctx.tick("usb")
+
+        setup = dut.interface.setup
+        ctx.set(setup.recipient, 0)
+        ctx.set(setup.type, 0)
+        ctx.set(setup.request, USBStandardRequests.SET_ADDRESS)
+        ctx.set(setup.value, 7)
+        ctx.set(relay.request_ready, 1)
+        ctx.set(setup.received, 1)
+        await ctx.delay(1e-9)
+        assert ctx.get(relay.request_valid) == 0
+
+    _simulate_handler(bench)
+
+
+def test_a_setup_landing_on_the_dispatch_cycle_is_forwarded_once() -> None:
+    """DISPATCH runs a request that arrived during a drain.
+
+    A newer SETUP on DISPATCH's own cycle used to be both offered to the relay
+    there and re-dispatched after the drain that abandoning sends it through:
+    forwarded to the real device twice.
+    """
+
+    async def bench(ctx, dut, relay) -> None:
+        await _send_setup(
+            ctx, dut, request_type=0xA1, request=HID_GET_REPORT, value=1, index=0, length=8
+        )
+        ctx.set(relay.request_pending, 1)
+        # A second SETUP abandons the first: drain, then DISPATCH it.
+        await _send_setup(
+            ctx, dut, request_type=0xA1, request=HID_GET_REPORT, value=2, index=0, length=8
+        )
+        ctx.set(relay.request_pending, 0)
+        await ctx.tick("usb")
+
+        # Now in DISPATCH; a third SETUP lands on this very cycle. From here
+        # the stub plays a relay that takes a request, answers it a few cycles
+        # later, and is free again once the handler acks.
+        await _offer_class_out(ctx, dut, request=HID_SET_IDLE, value=0x0300, index=0)
+        offers = []
+        busy = 0
+        for _ in range(40):
+            # Sample the handler's combinational outputs before the edge.
+            await ctx.delay(1e-9)
+            accepted = ctx.get(relay.request_valid) and ctx.get(relay.request_ready)
+            acked = ctx.get(relay.response_valid) and ctx.get(relay.response_ack)
+            if accepted:
+                offers.append(ctx.get(relay.value))
+            await ctx.tick("usb")
+            ctx.set(dut.interface.setup.received, 0)
+            if accepted:
+                ctx.set(relay.request_ready, 0)
+                ctx.set(relay.request_pending, 1)
+                busy = 4
+            elif busy:
+                busy -= 1
+                ctx.set(relay.response_valid, busy == 0)
+            elif acked:
+                ctx.set(relay.response_valid, 0)
+                ctx.set(relay.request_pending, 0)
+                ctx.set(relay.request_ready, 1)
+        assert offers == [0x0300]
+
+    _simulate_handler(bench)
+
+
+def test_a_busy_relay_still_stalls_other_class_requests_at_once() -> None:
+    """Only SET_IDLE/SET_PROTOCOL wait: a GET_REPORT the host can simply retry."""
+
+    async def bench(ctx, dut, relay) -> None:
+        ctx.set(relay.request_ready, 0)
+        await _send_setup(
+            ctx,
+            dut,
+            request_type=0xA1,
+            request=HID_GET_REPORT,
+            value=0x0101,
+            index=0,
+            length=8,
+        )
+        assert ctx.get(relay.request_valid) == 0
+        ctx.set(dut.interface.data_requested, 1)
+        await ctx.delay(1e-9)
+        assert ctx.get(dut.interface.handshakes_out.stall) == 1
+
+    _simulate_handler(bench)
+
+
+def test_wedged_target_stalls_instead_of_naking_forever() -> None:
+    """LUNA has no timeout in its control path; the bound must be ours.
+
+    USB 2.0 s9.2.6.4 allows only 50 ms for a no-data-stage status phase, so
+    a relay that never answers has to become a STALL, not an endless NAK.
+    """
+
+    async def bench(ctx, dut, relay) -> None:
+        await _send_setup(
+            ctx,
+            dut,
+            request_type=0xA1,
+            request=HID_GET_REPORT,
+            value=0x03F1,
+            index=3,
+            length=64,
+        )
+        # relay.response_valid is never asserted: the target is wedged.
+        for _ in range(80):
+            await ctx.tick("usb")
+        ctx.set(dut.interface.data_requested, 1)
+        await ctx.delay(1e-9)
+        assert ctx.get(dut.interface.handshakes_out.stall) == 1
+        assert ctx.get(dut.interface.handshakes_out.nak) == 0
+
+    _simulate_handler(bench, timeout_cycles=64)
+
+
+def test_timeout_still_releases_the_relay_or_pollers_starve_forever() -> None:
+    """Regression: a timed-out forward must still ack the relay.
+
+    ``request_pending`` stays high from request until ack, and it gates the
+    arbiter's control phase -- so a forward that is abandoned without an ack
+    starves every interrupt poller permanently, and the relay's eventual
+    ``response_valid`` would be served as a stale answer to whatever request
+    came next.
+
+    The handler cannot ack at the moment it gives up, because the relay only
+    consumes ``response_ack`` once it reaches its own COMPLETE state. It has
+    to stall the host promptly and drain the relay separately.
+    """
+
+    async def bench(ctx, dut, relay) -> None:
+        await _send_setup(
+            ctx,
+            dut,
+            request_type=0xA1,
+            request=HID_GET_REPORT,
+            value=0x03F1,
+            index=3,
+            length=64,
+        )
+        # A real relay holds request_pending for the whole forward; the stub
+        # must too, or the drain's "nothing pending" exit fires immediately.
+        ctx.set(relay.request_pending, 1)
+        # Run past the handler's deadline with the relay still working.
+        for _ in range(80):
+            await ctx.tick("usb")
+
+        # The host must not be left hanging.
+        ctx.set(dut.interface.data_requested, 1)
+        await ctx.delay(1e-9)
+        assert ctx.get(dut.interface.handshakes_out.stall) == 1
+        ctx.set(dut.interface.data_requested, 0)
+        await ctx.tick("usb")
+
+        # Now the relay finishes, late. The handler must consume it.
+        ctx.set(relay.response_valid, 1)
+        await ctx.delay(1e-9)
+        assert ctx.get(relay.response_ack) == 1, (
+            "late relay completion was never acked: request_pending sticks "
+            "high and the interrupt pollers starve forever"
+        )
+
+    _simulate_handler(bench, timeout_cycles=64)
+
+
+def test_oversized_relay_response_cannot_wrap_the_read_address() -> None:
+    """Regression: the response cursor must be bounded by the relay buffer.
+
+    ``relay.read_addr`` is only as wide as the relay's 64-byte buffer, and
+    Amaranth's ``.eq()`` truncates silently. A cursor sized to anything
+    larger would wrap back through zero on a response longer than the
+    buffer and hand the host corrupted bytes with no error signal -- which
+    would silently break exactly the crypto-auth responses this path exists
+    to carry.
+    """
+
+    async def bench(ctx, dut, relay) -> None:
+        await _send_setup(
+            ctx,
+            dut,
+            request_type=0xA1,
+            request=HID_GET_REPORT,
+            value=0x03F1,
+            index=3,
+            length=64,
+        )
+        # A misbehaving target claims to have returned far more than fits.
+        ctx.set(relay.response_length, 4096)
+        ctx.set(relay.response_valid, 1)
+        ctx.set(relay.response_error, 0)
+        await ctx.tick("usb")
+        # RESPOND NAKs its first cycle while the registered packet
+        # bounds settle; this test is about the cursor, not that window.
+        for _ in range(3):
+            await ctx.tick("usb")
+
+        # Drain more packets than the buffer holds; the address must never
+        # wrap back to a byte it already served.
+        # data_requested is a ONE-cycle strobe per IN token in LUNA; holding it
+        # high would restart the packet every cycle. Pulse it once, then let
+        # the handler stream the packet from its own latch.
+        seen = []
+        last_at = None
+        ctx.set(dut.interface.tx.ready, 1)
+        ctx.set(dut.interface.data_requested, 1)
+        await ctx.tick("usb")
+        ctx.set(dut.interface.data_requested, 0)
+        for _ in range(80):
+            await ctx.delay(1e-9)
+            if ctx.get(dut.interface.tx.valid):
+                if ctx.get(dut.interface.tx.last) and last_at is None:
+                    last_at = len(seen)
+                seen.append(ctx.get(relay.read_addr))
+            await ctx.tick("usb")
+
+        # The data phase must walk the buffer exactly once, in order, and
+        # END there. read_addr alone cannot prove this -- it reads 0 both
+        # when the cursor wraps and when the transfer is legitimately over --
+        # so the discriminator is tx.last: bounded, it lands on the 64th
+        # byte; unbounded, the handler would keep streaming toward the
+        # target's claimed 4096 and never assert it inside this window.
+        assert seen[:64] == list(range(64)), f"data phase did not walk 0..63: {seen[:70]}"
+        assert all(addr < 64 for addr in seen), f"read_addr left the buffer: {seen}"
+        assert last_at == 63, (
+            f"tx.last landed at {last_at}, not on the 64th byte -- the cursor "
+            f"is not bounded by the relay buffer and is wrapping"
+        )
+
+    _simulate_handler(bench, timeout_cycles=100000)
+
+
+def test_a_standard_setup_racing_the_drain_is_never_forwarded() -> None:
+    """Re-review N1: DISPATCH must only ever dispatch CLASS requests.
+
+    During DRAIN a class request is pending. If a STANDARD setup lands on the
+    very cycle the relay releases, the handler reached DISPATCH on the stale
+    pending flag and dispatched the latched STANDARD request -- forwarding
+    e.g. SET_ADDRESS to the REAL controller and making it unreachable. No
+    claim gate prevents that: the damage happens on the other bus.
+    """
+
+    async def bench(ctx, dut, relay) -> None:
+        setup = dut.interface.setup
+        await _send_setup(
+            ctx, dut, request_type=0xA1, request=HID_GET_REPORT, value=0x03F1, index=3, length=16
+        )
+        ctx.set(relay.request_pending, 1)
+        # A newer CLASS setup abandons it: DRAIN, with a class request pending.
+        await _send_setup(
+            ctx, dut, request_type=0xA1, request=HID_GET_REPORT, value=0x03F2, index=3, length=16
+        )
+        # On the relay's release cycle, a STANDARD SET_ADDRESS replaces it.
+        ctx.set(setup.recipient, 0)
+        ctx.set(setup.type, 0)  # STANDARD
+        ctx.set(setup.is_in_request, 0)
+        ctx.set(setup.request, 0x05)  # SET_ADDRESS
+        ctx.set(setup.value, 9)
+        ctx.set(setup.length, 0)
+        ctx.set(setup.received, 1)
+        ctx.set(relay.response_valid, 1)
+        await ctx.tick("usb")
+        ctx.set(setup.received, 0)
+        ctx.set(relay.response_valid, 0)
+        ctx.set(relay.request_pending, 0)
+        for _ in range(8):
+            await ctx.delay(1e-9)
+            assert not (
+                ctx.get(relay.request_valid) and ctx.get(relay.request) == 0x05
+            ), "a STANDARD SET_ADDRESS was forwarded to the real controller"
+            await ctx.tick("usb")
+
+    _simulate_handler(bench, timeout_cycles=1000)
+
+
+def test_time_spent_collecting_out_data_is_not_charged_to_the_target() -> None:
+    """Review: defer_timer ran on from CAPTURE_OUT into AWAITING_TARGET.
+
+    So time the AUX host spent delivering its OUT data -- at Full Speed a
+    64-byte SET_REPORT over an 8-byte EP0 spans several frames -- came out
+    of the budget for the TARGET's answer. The handler then gave up on a
+    transfer the engine was still legitimately completing, and the host got
+    a STALL for a request that would have succeeded.
+    """
+
+    async def bench(ctx, dut, relay) -> None:
+        iface = dut.interface
+        await _send_setup(
+            ctx, dut, request_type=0x21, request=HID_SET_REPORT, value=0x03F0, index=3, length=4
+        )
+        ctx.set(relay.request_pending, 1)
+        # The host is slow to send its data: 50 of the 64-cycle budget.
+        for _ in range(50):
+            await ctx.tick("usb")
+        # One OUT packet of 4 bytes, then its handshake point.
+        ctx.set(iface.rx.valid, 1)
+        await ctx.tick("usb")
+        for byte in (0xF0, 1, 2, 3):
+            ctx.set(iface.rx.payload, byte)
+            ctx.set(iface.rx.next, 1)
+            await ctx.tick("usb")
+        ctx.set(iface.rx.next, 0)
+        ctx.set(iface.rx.valid, 0)
+        await ctx.tick("usb")
+        ctx.set(iface.rx_ready_for_response, 1)
+        await ctx.delay(1e-9)
+        assert ctx.get(iface.handshakes_out.ack), "the OUT packet was not ACKed"
+        await ctx.tick("usb")
+        ctx.set(iface.rx_ready_for_response, 0)
+
+        # The target takes 40 cycles -- well inside its own budget of 64.
+        for _ in range(40):
+            await ctx.tick("usb")
+        ctx.set(iface.status_requested, 1)
+        await ctx.delay(1e-9)
+        assert not ctx.get(
+            iface.handshakes_out.stall
+        ), "gave up on the target after 40 cycles: the host's slow OUT stage was charged to it"
+        assert ctx.get(iface.handshakes_out.nak)
+
+    _simulate_handler(bench, timeout_cycles=64)
+
+
+async def _enter_respond(ctx, dut, relay, *, length: int, response_length: int) -> None:
+    """Forward a GET_REPORT and complete it; returns on RESPOND's first cycle."""
+    await _send_setup(
+        ctx, dut, request_type=0xA1, request=HID_GET_REPORT, value=0x03F1, index=3, length=length
+    )
+    ctx.set(relay.response_length, response_length)
+    ctx.set(relay.response_valid, 1)
+    ctx.set(relay.response_error, 0)
+    # AWAITING_TARGET sees response_valid on this edge.
+    await ctx.tick("usb")
+
+
+async def _in_packet(ctx, dut, relay) -> tuple[int, list[int] | None]:
+    """Answer one IN token. Returns (data PID, read addresses), None for a ZLP."""
+    iface = dut.interface
+    ctx.set(iface.tx.ready, 1)
+    ctx.set(iface.data_requested, 1)
+    await ctx.delay(1e-9)
+    assert not ctx.get(iface.handshakes_out.nak), "IN was NAKed outside the settle window"
+    if ctx.get(iface.tx.valid):
+        # send_zlp(): valid and last without first, on the strobe itself.
+        assert ctx.get(iface.tx.last) and not ctx.get(iface.tx.first)
+        pid = ctx.get(iface.tx_data_pid)
+        await ctx.tick("usb")
+        ctx.set(iface.data_requested, 0)
+        return pid, None
+    await ctx.tick("usb")
+    ctx.set(iface.data_requested, 0)
+    pid = None
+    addrs: list[int] = []
+    for _ in range(80):
+        await ctx.delay(1e-9)
+        if ctx.get(iface.tx.valid):
+            assert bool(ctx.get(iface.tx.first)) == (not addrs), f"tx.first wrong at {addrs}"
+            if pid is None:
+                # LUNA's transmitter latches the PID as the packet starts.
+                pid = ctx.get(iface.tx_data_pid)
+            addrs.append(ctx.get(relay.read_addr))
+            if ctx.get(iface.tx.last):
+                await ctx.tick("usb")
+                return pid, addrs
+        await ctx.tick("usb")
+    raise AssertionError(f"packet never ended: {addrs}")
+
+
+async def _host_ack(ctx, dut, *, endpoint: int = 0, after_in: bool = True) -> None:
+    """A host ACK, answering the last token the device saw.
+
+    LUNA gives every endpoint every ACK; the token before it says whose it is.
+    ``after_in=False`` models a last token that was not an IN to this device.
+    """
+    tokenizer = dut.interface.tokenizer
+    ctx.set(tokenizer.is_in, int(after_in))
+    ctx.set(tokenizer.endpoint, endpoint)
+    ctx.set(dut.interface.handshakes_in.ack, 1)
+    await ctx.tick("usb")
+    ctx.set(dut.interface.handshakes_in.ack, 0)
+    # A real host's next IN token is dozens of cycles away.
+    for _ in range(4):
+        await ctx.tick("usb")
+
+
+def test_in_on_entry_to_respond_is_naked_until_packet_bounds_settle() -> None:
+    """RESPOND's packet bounds are registered, so its first cycle sees stale ones.
+
+    Registering them keeps comparators off the response_length -> read address
+    cone. The cost is that on entry pkt_empty still reflects the previous
+    (zero) length: an IN answered then would get a ZLP -- an empty report the
+    host would accept as final. It must be NAKed.
+
+    One cycle is enough, and no more is spent: limit_r is already valid on
+    entry, so the bounds derived from it are valid on the second cycle, and
+    an IN there gets the real first packet.
+    """
+
+    async def bench(ctx, dut, relay) -> None:
+        iface = dut.interface
+        await _enter_respond(ctx, dut, relay, length=20, response_length=20)
+        ctx.set(iface.tx.ready, 1)
+        ctx.set(iface.data_requested, 1)
+        await ctx.delay(1e-9)
+        assert ctx.get(iface.handshakes_out.nak), "IN on RESPOND's first cycle was not NAKed"
+        assert not ctx.get(iface.tx.valid), "IN on RESPOND's first cycle was answered with data"
+        await ctx.tick("usb")
+        ctx.set(iface.data_requested, 0)
+
+        # The very next cycle.
+        assert await _in_packet(ctx, dut, relay) == (1, list(range(8)))
+
+    _simulate_handler(bench, timeout_cycles=100000, max_packet_size=Signal(7, init=8))
+
+
+def test_response_is_tiled_into_packets_and_only_an_ack_toggles_the_pid() -> None:
+    async def bench(ctx, dut, relay) -> None:
+        await _enter_respond(ctx, dut, relay, length=64, response_length=20)
+        for _ in range(3):
+            await ctx.tick("usb")
+
+        assert await _in_packet(ctx, dut, relay) == (1, list(range(0, 8)))
+        # No ACK: the retry is the same packet on the same PID.
+        assert await _in_packet(ctx, dut, relay) == (1, list(range(0, 8)))
+        await _host_ack(ctx, dut)
+        assert await _in_packet(ctx, dut, relay) == (0, list(range(8, 16)))
+        await _host_ack(ctx, dut)
+        assert await _in_packet(ctx, dut, relay) == (1, list(range(16, 20)))
+        await _host_ack(ctx, dut)
+
+        # Status OUT: ACKed, the relay released, and the PID back at DATA1
+        # for whatever request comes next.
+        ctx.set(dut.interface.status_requested, 1)
+        await ctx.delay(1e-9)
+        assert ctx.get(dut.interface.handshakes_out.ack)
+        assert ctx.get(relay.response_ack)
+        await ctx.tick("usb")
+        ctx.set(dut.interface.status_requested, 0)
+        ctx.set(relay.response_valid, 0)
+        await ctx.tick("usb")
+        assert ctx.get(dut.interface.tx_data_pid) == 1
+
+    _simulate_handler(bench, timeout_cycles=100000, max_packet_size=Signal(7, init=8))
+
+
+def test_response_ending_on_a_packet_boundary_is_followed_by_a_zlp() -> None:
+    async def bench(ctx, dut, relay) -> None:
+        await _enter_respond(ctx, dut, relay, length=64, response_length=16)
+        for _ in range(3):
+            await ctx.tick("usb")
+
+        assert await _in_packet(ctx, dut, relay) == (1, list(range(0, 8)))
+        await _host_ack(ctx, dut)
+        assert await _in_packet(ctx, dut, relay) == (0, list(range(8, 16)))
+        await _host_ack(ctx, dut)
+        assert await _in_packet(ctx, dut, relay) == (1, None)
+
+    _simulate_handler(bench, timeout_cycles=100000, max_packet_size=Signal(7, init=8))
+
+
+def test_only_an_ack_after_an_ep0_in_token_advances_the_response() -> None:
+    """LUNA hands every endpoint every ACK the host sends.
+
+    Between EP0 packet k and its retry the host may poll an interrupt endpoint
+    and ACK that report -- or, behind a hub, ACK another device entirely, when
+    the token detector has cleared the PID for a foreign address. Neither may
+    advance EP0: the retry must be packet k again, on the same PID.
+    """
+
+    async def bench(ctx, dut, relay) -> None:
+        await _enter_respond(ctx, dut, relay, length=64, response_length=20)
+        for _ in range(3):
+            await ctx.tick("usb")
+
+        assert await _in_packet(ctx, dut, relay) == (1, list(range(0, 8)))
+        await _host_ack(ctx, dut, endpoint=1)
+        assert await _in_packet(ctx, dut, relay) == (1, list(range(0, 8)))
+        await _host_ack(ctx, dut, after_in=False)
+        assert await _in_packet(ctx, dut, relay) == (1, list(range(0, 8)))
+        await _host_ack(ctx, dut)
+        assert await _in_packet(ctx, dut, relay) == (0, list(range(8, 16)))
+
+    _simulate_handler(bench, timeout_cycles=100000, max_packet_size=Signal(7, init=8))

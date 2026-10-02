@@ -266,6 +266,33 @@ static void test_null_arguments_are_total_functions(void)
     hid_descriptor_reassembly_retarget(NULL, 0u);
 }
 
+// The revision is what lets a reader of a COMPLETE descriptor know its bytes
+// did not change underneath it (see hid_descriptor_set.h): every discard bumps
+// it, while completing, duplicates and rejected conflicts leave it alone.
+static void test_revision_counts_discards_only(void)
+{
+    hid_descriptor_reassembly_t reassembly;
+    hid_descriptor_reassembly_init(&reassembly, 0u);
+    const uint16_t start = reassembly.revision;
+    const inj_descriptor_fragment_payload_t first = fragment(1u, 0u, 0u, 20u, 0u);
+    const inj_descriptor_fragment_payload_t last = fragment(1u, 0u, 18u, 20u, 18u);
+    const inj_descriptor_fragment_payload_t conflict = fragment(1u, 0u, 0u, 20u, 0x80u);
+
+    (void)hid_descriptor_reassembly_push(&reassembly, &first);
+    (void)hid_descriptor_reassembly_push(&reassembly, &last);
+    (void)hid_descriptor_reassembly_push(&reassembly, &first);
+    assert(hid_descriptor_reassembly_push(&reassembly, &conflict) ==
+           HID_DESCRIPTOR_FRAGMENT_ERR_CONFLICT);
+    assert(reassembly.revision == start);
+
+    const inj_descriptor_fragment_payload_t next = fragment(2u, 0u, 0u, 20u, 0u);
+    (void)hid_descriptor_reassembly_push(&reassembly, &next);  // generation change
+    assert(reassembly.revision != start);
+    const uint16_t after_generation = reassembly.revision;
+    hid_descriptor_reassembly_retarget(&reassembly, 0u);
+    assert(reassembly.revision != after_generation);
+}
+
 int main(void)
 {
     test_out_of_order_fragments_complete_without_splicing_gaps();
@@ -282,6 +309,7 @@ int main(void)
     test_conflicting_duplicate_is_rejected_without_overwrite();
     test_same_generation_total_change_discards_partial_data();
     test_null_arguments_are_total_functions();
+    test_revision_counts_discards_only();
     puts("hid_descriptor_reassembly_test: all passed");
     return 0;
 }

@@ -2,8 +2,8 @@ import pytest
 from amaranth.back import rtlil
 from amaranth.sim import Simulator
 
-from hurra_cynthion.descriptors import MAX_RELAY_ENDPOINT_NUMBER, RELAY_ENDPOINT_NUMBERS
-from hurra_cynthion.relay import ReportRelay
+from hurra_cynthion.descriptors import MAX_ENDPOINTS, UNMATCHABLE_ENDPOINT_NUMBER
+from hurra_cynthion.relay import PARKED_SLOT_NUMBERS, ReportRelay
 
 
 def _relay_ports(dut):
@@ -87,7 +87,7 @@ def test_relay_uses_exactly_four_independent_9x128_memories():
     (ceil(9/4) x ceil(128/16)), which is far under the break-even where a
     block is worth spending. See docs/BRAM_BUDGET.md.
     """
-    dut = ReportRelay(endpoint_numbers=(1, 2, 3, 4), fifo_depth=128)
+    dut = ReportRelay(initial_slot_numbers=(1, 2, 3, 4), fifo_depth=128)
     converted = rtlil.convert(dut, ports=_relay_ports(dut))
 
     assert converted.count("memory width 9 size 128") == 4
@@ -99,7 +99,7 @@ def test_relay_uses_exactly_four_independent_9x128_memories():
 
 
 def test_report_routed_to_matching_endpoint_stream_with_last():
-    dut = ReportRelay(endpoint_numbers=(1, 2, 3, 4))
+    dut = ReportRelay(initial_slot_numbers=(1, 2, 3, 4))
     sim = Simulator(dut)
     sim.add_clock(1e-6, domain="usb")
     payload = [0x01, 0x10, 0x20, 0x00]
@@ -118,7 +118,7 @@ def test_report_routed_to_matching_endpoint_stream_with_last():
 
 
 def test_empty_enqueue_has_at_most_one_synchronous_read_cycle_delay():
-    dut = ReportRelay(endpoint_numbers=(1,), fifo_depth=128)
+    dut = ReportRelay(initial_slot_numbers=(1,), fifo_depth=128)
     sim = Simulator(dut)
     sim.add_clock(1e-6, domain="usb")
 
@@ -146,7 +146,7 @@ def test_full_128_byte_capacity_wraps_without_losing_order():
     # max_report_bytes=1: this test drives raw bytes rather than whole reports,
     # and the production 64-byte reservation would refuse admission above
     # level 64, which is not the property under test here.
-    dut = ReportRelay(endpoint_numbers=(1,), fifo_depth=128, max_report_bytes=1)
+    dut = ReportRelay(initial_slot_numbers=(1,), fifo_depth=128, max_report_bytes=1)
     sim = Simulator(dut)
     sim.add_clock(1e-6, domain="usb")
 
@@ -186,7 +186,7 @@ def test_full_queue_refuses_a_new_report_even_while_the_same_endpoint_dequeues()
     # which cannot be reconciled with whole-report admission: admission is
     # decided at the report boundary against the level, and a level that is
     # about to fall by one says nothing about whether the whole report fits.
-    dut = ReportRelay(endpoint_numbers=(1,), fifo_depth=4, max_report_bytes=1)
+    dut = ReportRelay(initial_slot_numbers=(1,), fifo_depth=4, max_report_bytes=1)
     sim = Simulator(dut)
     sim.add_clock(1e-6, domain="usb")
 
@@ -231,7 +231,7 @@ def test_full_queue_refuses_a_new_report_even_while_the_same_endpoint_dequeues()
 
 
 def test_continuous_primed_drain_produces_one_byte_per_clock():
-    dut = ReportRelay(endpoint_numbers=(1,), fifo_depth=128)
+    dut = ReportRelay(initial_slot_numbers=(1,), fifo_depth=128)
     sim = Simulator(dut)
     sim.add_clock(1e-6, domain="usb")
     payload = list(range(32))
@@ -261,7 +261,7 @@ def test_continuous_primed_drain_produces_one_byte_per_clock():
 
 
 def test_stalled_head_payload_and_last_are_stable():
-    dut = ReportRelay(endpoint_numbers=(1,), fifo_depth=128)
+    dut = ReportRelay(initial_slot_numbers=(1,), fifo_depth=128)
     sim = Simulator(dut)
     sim.add_clock(1e-6, domain="usb")
 
@@ -286,7 +286,7 @@ def test_stalled_head_payload_and_last_are_stable():
 
 
 def test_two_endpoint_streams_drain_independently_on_the_same_clocks():
-    dut = ReportRelay(endpoint_numbers=(1, 2), fifo_depth=128)
+    dut = ReportRelay(initial_slot_numbers=(1, 2), fifo_depth=128)
     sim = Simulator(dut)
     sim.add_clock(1e-6, domain="usb")
 
@@ -316,7 +316,7 @@ def test_two_endpoint_streams_drain_independently_on_the_same_clocks():
 
 
 def test_full_endpoint_a_does_not_block_endpoint_b_enqueue():
-    dut = ReportRelay(endpoint_numbers=(1, 2), fifo_depth=4, max_report_bytes=1)
+    dut = ReportRelay(initial_slot_numbers=(1, 2), fifo_depth=4, max_report_bytes=1)
     sim = Simulator(dut)
     sim.add_clock(1e-6, domain="usb")
 
@@ -348,7 +348,7 @@ def test_full_endpoint_a_does_not_block_endpoint_b_enqueue():
 
 
 def test_interleaved_endpoints_preserve_per_endpoint_order_and_last():
-    dut = ReportRelay(endpoint_numbers=(1, 2), fifo_depth=128)
+    dut = ReportRelay(initial_slot_numbers=(1, 2), fifo_depth=128)
     sim = Simulator(dut)
     sim.add_clock(1e-6, domain="usb")
 
@@ -376,7 +376,7 @@ def test_unmatched_endpoint_is_absorbed_without_backpressure():
     # Was ``test_unmatched_endpoint_never_asserts_ready``, whose name asserted
     # the defect: deasserting ready for an endpoint number the relay cannot
     # serve wedges the shared injection engine in OUTPUT forever.
-    dut = ReportRelay(endpoint_numbers=(1, 2, 3, 4), fifo_depth=128)
+    dut = ReportRelay(initial_slot_numbers=(1, 2, 3, 4), fifo_depth=128)
     sim = Simulator(dut)
     sim.add_clock(1e-6, domain="usb")
 
@@ -408,7 +408,7 @@ def test_full_endpoint_drops_reports_instead_of_deasserting_ready():
     # Was ``test_report_ready_deasserts_when_fifo_full``. fifo_depth=4 with
     # max_report_bytes=1 keeps the original admission arithmetic while the
     # assertion moves from backpressure to a counted drop.
-    dut = ReportRelay(endpoint_numbers=(1,), fifo_depth=4, max_report_bytes=1)
+    dut = ReportRelay(initial_slot_numbers=(1,), fifo_depth=4, max_report_bytes=1)
     sim = Simulator(dut)
     sim.add_clock(1e-6, domain="usb")
 
@@ -437,7 +437,7 @@ def test_full_endpoint_drops_reports_instead_of_deasserting_ready():
 
 
 def test_report_is_admitted_whole_or_not_at_all():
-    dut = ReportRelay(endpoint_numbers=(1,), fifo_depth=8, max_report_bytes=4)
+    dut = ReportRelay(initial_slot_numbers=(1,), fifo_depth=8, max_report_bytes=4)
     sim = Simulator(dut)
     sim.add_clock(1e-6, domain="usb")
 
@@ -476,7 +476,7 @@ def test_report_is_admitted_whole_or_not_at_all():
 
 
 def test_dropped_report_does_not_leave_an_unterminated_packet():
-    dut = ReportRelay(endpoint_numbers=(1,), fifo_depth=8, max_report_bytes=4)
+    dut = ReportRelay(initial_slot_numbers=(1,), fifo_depth=8, max_report_bytes=4)
     sim = Simulator(dut)
     sim.add_clock(1e-6, domain="usb")
 
@@ -509,7 +509,7 @@ def test_dropped_report_does_not_leave_an_unterminated_packet():
 
 
 def test_unmatched_and_congested_strobes_are_one_pulse_per_report():
-    dut = ReportRelay(endpoint_numbers=(1,), fifo_depth=8, max_report_bytes=4)
+    dut = ReportRelay(initial_slot_numbers=(1,), fifo_depth=8, max_report_bytes=4)
     sim = Simulator(dut)
     sim.add_clock(1e-6, domain="usb")
 
@@ -544,16 +544,48 @@ def test_unmatched_and_congested_strobes_are_one_pulse_per_report():
 
 def test_fifo_depth_below_max_report_bytes_is_rejected():
     with pytest.raises(ValueError):
-        ReportRelay(endpoint_numbers=(1,), fifo_depth=32, max_report_bytes=64)
+        ReportRelay(initial_slot_numbers=(1,), fifo_depth=32, max_report_bytes=64)
 
 
-def test_relay_endpoint_numbers_are_contiguous_from_one():
-    # enumerator.py rejects with `ep_addr[:4] > MAX_RELAY_ENDPOINT_NUMBER`, a
-    # comparison that is exact only while this tuple is contiguous from 1. A
-    # non-contiguous set would leave a silently admitted hole.
-    assert tuple(range(1, len(RELAY_ENDPOINT_NUMBERS) + 1)) == RELAY_ENDPOINT_NUMBERS
-    assert max(RELAY_ENDPOINT_NUMBERS) == MAX_RELAY_ENDPOINT_NUMBER
+def test_an_undriven_relay_has_four_parked_slots():
+    """Nothing is served until the clone binds a slot to the captured device's number."""
+    dut = ReportRelay()
+    assert len(dut.slot_numbers) == MAX_ENDPOINTS
+    assert tuple(n.init for n in dut.slot_numbers) == PARKED_SLOT_NUMBERS
+    assert set(PARKED_SLOT_NUMBERS) == {UNMATCHABLE_ENDPOINT_NUMBER}
 
 
-def test_relay_default_endpoint_numbers_match_the_shared_constant():
-    assert ReportRelay().endpoint_numbers == RELAY_ENDPOINT_NUMBERS
+def _simulate_bound(bench, numbers):
+    dut = ReportRelay(fifo_depth=128)
+    sim = Simulator(dut)
+    sim.add_clock(1e-6, domain="usb")
+
+    async def wrapped(ctx):
+        for slot, number in enumerate(numbers):
+            ctx.set(dut.slot_numbers[slot], number)
+        await bench(ctx, dut)
+
+    sim.add_testbench(wrapped)
+    sim.run()
+
+
+def test_a_slot_bound_at_runtime_to_endpoint_fifteen_carries_its_reports():
+    async def bench(ctx, dut):
+        await _push_report(ctx, dut, 15, [0xAA, 0xBB])
+        assert await _drain_stream(ctx, dut.streams[2], 2) == ([0xAA, 0xBB], True)
+        assert not ctx.get(dut.streams[0].valid)
+
+    _simulate_bound(bench, (1, 9, 15, UNMATCHABLE_ENDPOINT_NUMBER))
+
+
+def test_a_parked_slot_takes_nothing_and_a_rebound_slot_follows_its_number():
+    async def bench(ctx, dut):
+        await _push_report(ctx, dut, 4, [0x11])
+        for stream in dut.streams:
+            assert not ctx.get(stream.valid)
+        # A new device: slot 0 is now endpoint 4.
+        ctx.set(dut.slot_numbers[0], 4)
+        await _push_report(ctx, dut, 4, [0x22])
+        assert await _drain_stream(ctx, dut.streams[0], 1) == ([0x22], True)
+
+    _simulate_bound(bench, PARKED_SLOT_NUMBERS)
