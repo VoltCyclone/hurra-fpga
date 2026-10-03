@@ -42,11 +42,11 @@
 //
 // --- Why a move is a budget and not a delta ---------------------------------
 //
-// `km.move(300,450)` is a one-shot displacement. The injected X/Y field is
-// 8-bit signed with logical range +/-127 (inj_session.c boot_mouse_entries), and
-// the engine rejects a field whose sum leaves that range, passing the report
-// through unmodified -- so a single RELATIVE carrying 300 does not clip, it
-// vanishes. A move is therefore held as a pending budget and drained in bounded
+// `km.move(300,450)` is a one-shot displacement. The injected X/Y field is the
+// mouse's own, compiled from its report descriptor, and hid_mouse_layout.c
+// refuses any X/Y field that cannot hold at least +/-127. The engine rejects a
+// field whose sum leaves its range, passing the report through unmodified -- so
+// on an 8-bit mouse a single RELATIVE carrying 300 does not clip, it vanishes. A move is therefore held as a pending budget and drained in bounded
 // steps by kmcmd_step(), one RELATIVE per call, summing exactly to the request.
 //
 // This also answers the 8 kHz hazard from the other direction. A SUSTAINED
@@ -115,37 +115,15 @@ typedef enum {
 // console_ops_t::write makes, and for the same reason: the foreground loop that
 // would be stalled is the one running the link's ERR051588 recovery.
 //
-// --- Wiring this to inj_session (the integrator's one change) ---------------
+// --- How this is wired -------------------------------------------------------
 //
-// inj_session.c currently emits a fixed drift (INJ_SESSION_DEFAULT_X/Y paced by
-// INJ_SESSION_DEFAULT_PACE). To drive it from here it needs a one-shot request
-// slot that inj_session_fill_tx() prefers over the drift:
-//
-//   in inj_session.h, inside inj_session_t:
-//       int16_t req_x, req_y, req_wheel, req_pan;   // pending one-shot RELATIVE
-//       uint64_t req_buttons; uint16_t req_hold;    // pending BUTTON_STATE
-//       uint8_t req_pending;                        // bit0 relative, bit1 buttons
-//
-//   in inj_session.h, two new entry points:
-//       bool inj_session_request_relative(inj_session_t *s, int16_t x, int16_t y,
-//                                         int16_t wheel, int16_t pan);
-//       bool inj_session_request_buttons(inj_session_t *s, uint64_t mask,
-//                                        uint16_t hold_reports);
-//
-//   in inj_session_fill_tx(), in the INJ_PHASE_INJECTING arm, ahead of the
-//   pace_counter check:
-//       if (s->req_pending & 1u) { /* build RELATIVE from req_* */ }
-//
-// Both request functions return false when a request is already pending, which
-// is what makes the one-deep FPGA command queue visible to this module instead
-// of overwriting an in-flight command. `ready` is
-// `inj_session_phase(s) == INJ_PHASE_INJECTING`, which is exactly the MCU-side
-// mirror of gateware.py's command_fresh, and `physical_mask` is the same shape
-// as request_buttons against a PHYSICAL_MASK frame.
-//
-// Until that exists, bind the ops with NULL callbacks: the parser stays fully
-// exercised and every motion command is refused with `!nosink`, which is a
-// truthful answer rather than a silent no-op.
+// usb_console.c binds these to link.c's link_inject_* wrappers, which mask the
+// retirement interrupt around inj_session's one-deep request slot. `ready` is
+// `inj_session_phase(s) == INJ_PHASE_INJECTING`, the MCU-side mirror of
+// gateware.py's command_fresh; `no_mouse` is inj_session's NO_MOUSE verdict.
+// Bind the ops with NULL callbacks and the parser stays fully exercised while
+// every motion command is refused with `!nosink` -- a truthful answer rather
+// than a silent no-op.
 typedef struct {
     // Queue one one-shot RELATIVE. Each argument is already bounded to
     // +/-KMCMD_STEP_MAX (wheel and pan to +/-1). False means "not now"; the
@@ -164,6 +142,12 @@ typedef struct {
     // map committed and the active generation matching. A NULL `ready` is NOT
     // treated as ready -- it means nothing is wired yet.
     bool (*ready)(void *ctx);
+
+    // True once the attached device is KNOWN to have nothing a mouse command
+    // could land in -- a keyboard or a game pad (inj_session NO_MOUSE). Refused
+    // as `nomouse` rather than `notready`, because waiting will not help. NULL
+    // means the question is never answered, which is the old behaviour.
+    bool (*no_mouse)(void *ctx);
 
     void *ctx;
 } kmcmd_ops_t;

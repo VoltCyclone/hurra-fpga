@@ -1,6 +1,10 @@
 # Ruff's context-manager simplification obscures nested Amaranth control-flow DSL structure.
 # ruff: noqa: SIM117
 
+from functools import reduce
+from operator import or_
+from types import SimpleNamespace
+
 from amaranth import Array, Elaboratable, Module, Mux, Signal
 
 from .control import USBControlTransferEngine
@@ -9,7 +13,6 @@ from .descriptors import (
     MAX_ENDPOINTS,
     MAX_INTERFACES,
     MAX_PACKET_SIZE,
-    MAX_RELAY_ENDPOINT_NUMBER,
     MAX_REPORT_SIZE,
     MAX_STRING_SIZE,
     DescriptorStore,
@@ -39,7 +42,13 @@ _HOST_CHIRP_PAIRS = 3
 
 
 class BoundedMouseEnumerator(Elaboratable):
-    """Power, reset, and enumerate one bounded full-speed HID boot mouse."""
+    """Power, reset, and enumerate one bounded HID device.
+
+    Any HID device with at least one interrupt-IN endpoint is accepted --
+    a gamepad as readily as a mouse. There is no bInterfaceProtocol check:
+    endpoints are only captured from HID interfaces, so the existing
+    ``ep_count == 0`` failure already implies a HID interface was seen.
+    """
 
     def __init__(self, timing=None, control=None, descriptor_store=None) -> None:
         self.timing = timing if timing is not None else HostTiming.hardware()
@@ -119,12 +128,61 @@ class BoundedMouseEnumerator(Elaboratable):
         self.ep_report_length = Array(
             [Signal(16, name=f"ep_report_length_{k}") for k in range(MAX_ENDPOINTS)]
         )
+        # The one HID interrupt-OUT endpoint relayed PC -> device. Held apart
+        # from the table above on purpose: nothing here feeds ep_count, ready
+        # or error_code, so an OUT endpoint can never cost a device its IN
+        # relay. The first in-bounds one is captured; see descriptors.py for
+        # the Python mirror, which must agree case for case.
+        self.out_present = Signal()
+        self.out_number = Signal(4)
+        self.out_max_packet = Signal(7)
+        #: bInterval verbatim, in the device's encoding, like ep_interval.
+        self.out_interval = Signal(8)
+        #: Sticky for the session: a HID interrupt-OUT endpoint was declared
+        #: but not captured (out of bounds, or not the first). Debug only.
+        self.out_ignored = Signal()
+
+        # Post-enumeration control ownership.
+        #
+        # This enumerator is the only Amaranth driver of ``control.*`` -- it
+        # sets blanket defaults every cycle and overrides them per state. A
+        # second module driving those signals is a driver conflict, not a mux,
+        # so the control relay cannot reach the engine from host.py. Ownership
+        # therefore transfers here instead: while ``ready`` is high these
+        # inputs are forwarded to the engine verbatim.
+        self.relay_start = Signal()
+        self.relay_request_type = Signal(8)
+        self.relay_request = Signal(8)
+        self.relay_value = Signal(16)
+        self.relay_index = Signal(16)
+        self.relay_length = Signal(16)
+        self.relay_out_payload = Signal(8)
+        self.relay_data_ready = Signal()
 
     def elaborate(self, platform) -> Module:
         del platform
         m = Module()
         m.submodules.control = control = self.control
         m.submodules.descriptor_store = store = self.descriptor_store
+        # The store's control strobes, decided combinationally by the FSM below
+        # and registered on their way out. Unregistered, the cursor compares
+        # behind them (report_cursor, oversized) reached the store's serve-side
+        # ready and through it the clone's GET_DESCRIPTOR streamer: the critical
+        # path on 10 of 12 seeds. One cycle is free here -- start, commit,
+        # abort and clear all shift together, so their order is unchanged, and
+        # the data handshake (capture_valid/capture_ready) stays combinational.
+        store_strobe = SimpleNamespace(
+            clear=Signal(name="store_clear"),
+            capture_start=Signal(name="store_capture_start"),
+            capture_type=Signal(8, name="store_capture_type"),
+            capture_index=Signal(8, name="store_capture_index"),
+            capture_w_index=Signal(16, name="store_capture_w_index"),
+            capture_commit=Signal(name="store_capture_commit"),
+            capture_abort=Signal(name="store_capture_abort"),
+        )
+        m.d.usb += [
+            getattr(store, name).eq(getattr(store_strobe, name)) for name in vars(store_strobe)
+        ]
 
         timing = self.timing
         # Host-commanded TARGET-A port power. Asserted after the discharge
@@ -183,12 +241,17 @@ class BoundedMouseEnumerator(Elaboratable):
         interface_count = Signal(range(MAX_INTERFACES + 2))
         declared_interfaces = Signal(8)
         cur_is_hid = Signal()
+        cur_alt_nonzero = Signal()
         cur_interface = Signal(8)
         cur_report_length = Signal(16)
-        mouse_seen = Signal()
         endpoint_mps_low = Signal(8)
         ep_addr = Signal(8)
         ep_attrs = Signal(8)
+        # bInterval, latched at offset 6. Capture happens on the descriptor's
+        # LAST byte, which is bInterval only for the 7-byte form; for the
+        # 9-byte USB Audio form it is bSynchAddress, at offset 8.
+        ep_interval_q = Signal(8)
+        ep_interval_now = Mux(descriptor_position == 6, control.data, ep_interval_q)
         ep_mps = Signal(16)
         hid_declared_count = Signal(8)
         hid_subordinate_phase = Signal(2)
@@ -274,15 +337,15 @@ class BoundedMouseEnumerator(Elaboratable):
             control.max_packet_size.eq(self.ep0_max_packet),
             control.out_payload.eq(0),
             control.data_ready.eq(0),
-            store.clear.eq(0),
-            store.capture_start.eq(0),
-            store.capture_type.eq(0),
-            store.capture_index.eq(0),
-            store.capture_w_index.eq(0),
+            store_strobe.clear.eq(0),
+            store_strobe.capture_start.eq(0),
+            store_strobe.capture_type.eq(0),
+            store_strobe.capture_index.eq(0),
+            store_strobe.capture_w_index.eq(0),
             store.capture_valid.eq(0),
             store.capture_data.eq(control.data),
-            store.capture_commit.eq(0),
-            store.capture_abort.eq(0),
+            store_strobe.capture_commit.eq(0),
+            store_strobe.capture_abort.eq(0),
         ]
 
         with m.If(~self.connected | reset_active | ~disconnect_seen):
@@ -299,6 +362,8 @@ class BoundedMouseEnumerator(Elaboratable):
                 self.ep0_max_packet.eq(8),
                 self.configuration_value.eq(0),
                 self.ep_count.eq(0),
+                self.out_present.eq(0),
+                self.out_ignored.eq(0),
                 self.traffic_enable.eq(0),
                 self.high_speed.eq(0),
                 detach_counter.eq(0),
@@ -310,7 +375,7 @@ class BoundedMouseEnumerator(Elaboratable):
                 self.error_code.eq(HostError.DISCONNECTED.value),
                 attach_counter.eq(0),
             ]
-            m.d.comb += [store.clear.eq(1), store.capture_abort.eq(1)]
+            m.d.comb += [store_strobe.clear.eq(1), store_strobe.capture_abort.eq(1)]
             m.next = "WAIT_ATTACH"
 
         def fail(error: HostError) -> None:
@@ -319,7 +384,7 @@ class BoundedMouseEnumerator(Elaboratable):
                 self.ready.eq(0),
                 self.error_code.eq(error.value),
             ]
-            m.d.comb += store.capture_abort.eq(1)
+            m.d.comb += store_strobe.capture_abort.eq(1)
             m.next = "ERROR"
 
         def retry_enumeration() -> None:
@@ -335,6 +400,8 @@ class BoundedMouseEnumerator(Elaboratable):
                 self.ep0_max_packet.eq(8),
                 self.configuration_value.eq(0),
                 self.ep_count.eq(0),
+                self.out_present.eq(0),
+                self.out_ignored.eq(0),
                 self.high_speed.eq(0),
                 self.error_code.eq(HostError.NONE.value),
                 reset_counter.eq(0),
@@ -342,7 +409,7 @@ class BoundedMouseEnumerator(Elaboratable):
                 chirp_pairs.eq(0),
                 chirp_done.eq(0),
             ]
-            m.d.comb += [store.clear.eq(1), store.capture_abort.eq(1)]
+            m.d.comb += [store_strobe.clear.eq(1), store_strobe.capture_abort.eq(1)]
             m.next = "BUS_RESET"
 
         def handle_control_failure() -> None:
@@ -369,10 +436,10 @@ class BoundedMouseEnumerator(Elaboratable):
 
         def begin_capture(descriptor_type, descriptor_index, w_index) -> None:
             m.d.comb += [
-                store.capture_start.eq(1),
-                store.capture_type.eq(descriptor_type),
-                store.capture_index.eq(descriptor_index),
-                store.capture_w_index.eq(w_index),
+                store_strobe.capture_start.eq(1),
+                store_strobe.capture_type.eq(descriptor_type),
+                store_strobe.capture_index.eq(descriptor_index),
+                store_strobe.capture_w_index.eq(w_index),
             ]
             m.d.usb += [
                 byte_count.eq(0),
@@ -423,7 +490,7 @@ class BoundedMouseEnumerator(Elaboratable):
             with m.State("WAIT_ATTACH"):
                 with m.If(~self.enable):
                     clear_session()
-                    m.d.comb += store.clear.eq(1)
+                    m.d.comb += store_strobe.clear.eq(1)
                     m.next = "POWER_OFF"
                 with m.Elif(~powered | (self.line_state == 0)):
                     m.d.usb += [attach_counter.eq(0), self.error_code.eq(HostError.DISCONNECTED)]
@@ -451,7 +518,7 @@ class BoundedMouseEnumerator(Elaboratable):
                                 chirp_pairs.eq(0),
                                 chirp_done.eq(0),
                             ]
-                            m.d.comb += store.clear.eq(1)
+                            m.d.comb += store_strobe.clear.eq(1)
                             m.next = "BUS_RESET"
                     with m.Else():
                         m.d.usb += attach_counter.eq(attach_counter + 1)
@@ -751,7 +818,7 @@ class BoundedMouseEnumerator(Elaboratable):
                     with m.Elif(unsupported):
                         fail(HostError.UNSUPPORTED_TOPOLOGY)
                     with m.Else():
-                        m.d.comb += store.capture_commit.eq(1)
+                        m.d.comb += store_strobe.capture_commit.eq(1)
                         m.next = "CONFIG_HEADER_START"
 
             with m.State("CONFIG_HEADER_START"):
@@ -821,9 +888,10 @@ class BoundedMouseEnumerator(Elaboratable):
                     current_descriptor_type.eq(0),
                     interface_count.eq(0),
                     self.ep_count.eq(0),
+                    self.out_present.eq(0),
+                    self.out_ignored.eq(0),
                     cur_is_hid.eq(0),
                     cur_report_length.eq(0),
-                    mouse_seen.eq(0),
                     declared_interfaces.eq(0),
                 ]
                 m.next = "CONFIG_START"
@@ -858,18 +926,22 @@ class BoundedMouseEnumerator(Elaboratable):
                             m.d.usb += [
                                 interface_count.eq(interface_count + 1),
                                 cur_is_hid.eq(0),
+                                cur_alt_nonzero.eq(0),
                                 cur_report_length.eq(0),
                             ]
                             with m.If(current_descriptor_length != 9):
                                 m.d.usb += malformed.eq(1)
-                            with m.If(interface_count >= MAX_INTERFACES):
-                                m.d.usb += unsupported.eq(1)
                         with m.Elif(control.data == 0x21):
                             m.d.usb += hid_subordinate_phase.eq(0)
                             with m.If(cur_is_hid & (current_descriptor_length < 9)):
                                 m.d.usb += malformed.eq(1)
                         with m.Elif(control.data == 5):
-                            with m.If(current_descriptor_length != 7):
+                            # 7 = standard endpoint; 9 = USB Audio 1.0, which
+                            # appends bRefresh/bSynchAddress. See the matching
+                            # comment in descriptors.py.
+                            with m.If(
+                                (current_descriptor_length != 7) & (current_descriptor_length != 9)
+                            ):
                                 m.d.usb += malformed.eq(1)
                         with m.If(current_descriptor_length == 2):
                             m.d.usb += descriptor_position.eq(0)
@@ -898,13 +970,31 @@ class BoundedMouseEnumerator(Elaboratable):
                                 with m.Case(2):
                                     m.d.usb += cur_interface.eq(control.data)
                                 with m.Case(3):
+                                    # An alternate setting redescribes an
+                                    # interface bNumInterfaces already counts
+                                    # once. Skip its endpoints, and undo the
+                                    # increment taken at type-byte time two
+                                    # positions ago -- bAlternateSetting is not
+                                    # readable until now.
                                     with m.If(control.data != 0):
+                                        m.d.usb += [
+                                            cur_alt_nonzero.eq(1),
+                                            interface_count.eq(interface_count - 1),
+                                        ]
+                                    # The interface limit is checked HERE, not
+                                    # at type-byte time: only now is it known
+                                    # whether this descriptor is a new
+                                    # interface or an alternate setting of
+                                    # one already counted. Checking earlier
+                                    # counted a trailing alt setting as a
+                                    # fifth interface -- and disagreed with
+                                    # the Python mirror, which counts alt 0
+                                    # only. interface_count is post-increment
+                                    # here, hence > rather than >=.
+                                    with m.Elif(interface_count > MAX_INTERFACES):
                                         m.d.usb += unsupported.eq(1)
                                 with m.Case(5):
                                     m.d.usb += cur_is_hid.eq(control.data == 3)
-                                with m.Case(7):
-                                    with m.If(cur_is_hid & (control.data == 2)):
-                                        m.d.usb += mouse_seen.eq(1)
                         with m.Elif(current_descriptor_type == 0x21):
                             with m.If(cur_is_hid):
                                 with m.If(descriptor_position == 5):
@@ -956,6 +1046,8 @@ class BoundedMouseEnumerator(Elaboratable):
                                     m.d.usb += endpoint_mps_low.eq(control.data)
                                 with m.Case(5):
                                     m.d.usb += ep_mps.eq((control.data << 8) | endpoint_mps_low)
+                                with m.Case(6):
+                                    m.d.usb += ep_interval_q.eq(control.data)
 
                         with m.If(descriptor_position == current_descriptor_length - 1):
                             with m.If(current_descriptor_type == 0x21):
@@ -966,24 +1058,29 @@ class BoundedMouseEnumerator(Elaboratable):
                                     m.d.usb += malformed.eq(1)
                             with m.Elif(current_descriptor_type == 5):
                                 # capture a HID interrupt-IN endpoint of the current interface;
-                                # OUT and non-interrupt endpoints are skipped.
-                                with m.If(cur_is_hid & ep_addr[7] & (ep_attrs[:2] == 3)):
-                                    with m.If(
-                                        (ep_addr[4:7] != 0)
-                                        | (ep_addr[:4] == 0)
-                                        # The clone relay serves
-                                        # RELAY_ENDPOINT_NUMBERS only, and the clone
-                                        # presents the captured descriptors verbatim -
-                                        # so a number it cannot serve would be
-                                        # advertised to the PC and then NAK forever.
-                                        | (ep_addr[:4] > MAX_RELAY_ENDPOINT_NUMBER)
-                                    ):
+                                # non-interrupt endpoints are skipped.
+                                with m.If(
+                                    cur_is_hid & ~cur_alt_nonzero & ep_addr[7] & (ep_attrs[:2] == 3)
+                                ):
+                                    # Any number 1..15: the clone binds each relay
+                                    # slot's number at runtime. Two slots on one
+                                    # number would both answer the PC's token.
+                                    duplicate = reduce(
+                                        or_,
+                                        [
+                                            (self.ep_count > k) & (self.ep_number[k] == ep_addr[:4])
+                                            for k in range(MAX_ENDPOINTS)
+                                        ],
+                                    )
+                                    with m.If((ep_addr[4:7] != 0) | (ep_addr[:4] == 0)):
+                                        m.d.usb += unsupported.eq(1)
+                                    with m.Elif(duplicate):
                                         m.d.usb += unsupported.eq(1)
                                     with m.Elif(ep_mps == 0):
                                         m.d.usb += malformed.eq(1)
                                     with m.Elif(ep_mps > MAX_PACKET_SIZE):
                                         m.d.usb += unsupported.eq(1)
-                                    with m.Elif(control.data == 0):
+                                    with m.Elif(ep_interval_now == 0):
                                         m.d.usb += malformed.eq(1)
                                     with m.Elif(cur_report_length == 0):
                                         m.d.usb += malformed.eq(1)
@@ -994,12 +1091,39 @@ class BoundedMouseEnumerator(Elaboratable):
                                             self.ep_interface[self.ep_count].eq(cur_interface),
                                             self.ep_number[self.ep_count].eq(ep_addr[:4]),
                                             self.ep_max_packet[self.ep_count].eq(ep_mps[:7]),
-                                            self.ep_interval[self.ep_count].eq(control.data),
+                                            self.ep_interval[self.ep_count].eq(ep_interval_now),
                                             self.ep_report_length[self.ep_count].eq(
                                                 cur_report_length
                                             ),
                                             self.ep_count.eq(self.ep_count + 1),
                                         ]
+                                # The interrupt-OUT relay endpoint. Unlike the IN
+                                # path above, no violation here sets unsupported
+                                # or malformed: the IN relay is the product, so
+                                # an OUT endpoint it cannot carry is dropped and
+                                # flagged instead of refusing the whole device.
+                                with m.Elif(
+                                    cur_is_hid
+                                    & ~cur_alt_nonzero
+                                    & ~ep_addr[7]
+                                    & (ep_attrs[:2] == 3)
+                                ):
+                                    out_in_bounds = (
+                                        (ep_addr[4:7] == 0)
+                                        & (ep_addr[:4] != 0)
+                                        & (ep_mps != 0)
+                                        & (ep_mps <= MAX_PACKET_SIZE)
+                                        & (ep_interval_now != 0)
+                                    )
+                                    with m.If(out_in_bounds & ~self.out_present):
+                                        m.d.usb += [
+                                            self.out_present.eq(1),
+                                            self.out_number.eq(ep_addr[:4]),
+                                            self.out_max_packet.eq(ep_mps[:7]),
+                                            self.out_interval.eq(ep_interval_now),
+                                        ]
+                                    with m.Else():
+                                        m.d.usb += self.out_ignored.eq(1)
                             m.d.usb += descriptor_position.eq(0)
                         with m.Else():
                             m.d.usb += descriptor_position.eq(descriptor_position + 1)
@@ -1024,12 +1148,11 @@ class BoundedMouseEnumerator(Elaboratable):
                     with m.Elif(
                         unsupported
                         | (interface_count != declared_interfaces)
-                        | ~mouse_seen
                         | (self.ep_count == 0)
                     ):
                         fail(HostError.UNSUPPORTED_TOPOLOGY)
                     with m.Else():
-                        m.d.comb += store.capture_commit.eq(1)
+                        m.d.comb += store_strobe.capture_commit.eq(1)
                         with m.If(
                             (manufacturer_index != 0) | (product_index != 0) | (serial_index != 0)
                         ):
@@ -1082,7 +1205,7 @@ class BoundedMouseEnumerator(Elaboratable):
                     ):
                         fail(HostError.MALFORMED_DESCRIPTOR)
                     with m.Else():
-                        m.d.comb += store.capture_commit.eq(1)
+                        m.d.comb += store_strobe.capture_commit.eq(1)
                         m.d.usb += string_cursor.eq(0)
                         m.next = "STRING_SELECT"
 
@@ -1139,7 +1262,7 @@ class BoundedMouseEnumerator(Elaboratable):
                     ):
                         fail(HostError.MALFORMED_DESCRIPTOR)
                     with m.Else():
-                        m.d.comb += store.capture_commit.eq(1)
+                        m.d.comb += store_strobe.capture_commit.eq(1)
                         m.d.usb += string_cursor.eq(string_cursor + 1)
                         m.next = "STRING_SELECT"
 
@@ -1222,7 +1345,7 @@ class BoundedMouseEnumerator(Elaboratable):
                     ):
                         fail(HostError.MALFORMED_DESCRIPTOR)
                     with m.Else():
-                        m.d.comb += store.capture_commit.eq(1)
+                        m.d.comb += store_strobe.capture_commit.eq(1)
                         m.d.usb += report_cursor.eq(report_cursor + 1)
                         m.next = "REPORT_SELECT"
 
@@ -1233,9 +1356,27 @@ class BoundedMouseEnumerator(Elaboratable):
             with m.State("ERROR"):
                 with m.If(~self.enable):
                     clear_session()
-                    m.d.comb += store.clear.eq(1)
+                    m.d.comb += store_strobe.clear.eq(1)
                     m.next = "POWER_OFF"
                 with m.Elif(detached):
                     go_detached()
+
+        # Hand the control engine to the relay once enumeration has finished.
+        #
+        # Placed after the FSM so it overrides both the blanket defaults above
+        # and anything a state drives. That is safe because ``ready`` only goes
+        # high in the terminal state, which issues no control requests of its
+        # own -- so there is no cycle where both want the engine.
+        with m.If(self.ready):
+            m.d.comb += [
+                control.start.eq(self.relay_start),
+                control.request_type.eq(self.relay_request_type),
+                control.request.eq(self.relay_request),
+                control.value.eq(self.relay_value),
+                control.index.eq(self.relay_index),
+                control.length.eq(self.relay_length),
+                control.out_payload.eq(self.relay_out_payload),
+                control.data_ready.eq(self.relay_data_ready),
+            ]
 
         return m

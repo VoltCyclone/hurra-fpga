@@ -404,6 +404,7 @@ def test_forward_sequence_gap_is_accepted_once_and_counted() -> None:
         await drive_relative(ctx, plane, x=20, sequence=0x07)
         await push_report(ctx, plane, bytes([5]))
         assert await drain_output(ctx, plane, 1) == bytes([25])
+        await ctx.tick("usb")  # sequence_gap_count counts a cycle after consumption
         assert ctx.get(plane.sequence_gap_count) == 1
         assert ctx.get(plane.command_commit_count) == 2
         assert ctx.get(plane.last_rx_sequence) == 0x07
@@ -1079,6 +1080,7 @@ def test_in_window_rejected_frames_advance_the_sequence_window() -> None:
         assert classification == {"allowed": 1, "duplicate": 0, "stale": 0, "gap": 1}
         assert ctx.get(plane.last_rx_sequence) == 0x12
         assert ctx.get(plane.invalid_rx_count) == 1
+        await ctx.tick("usb")  # sequence_gap_count counts a cycle after consumption
         assert ctx.get(plane.sequence_gap_count) == 1
         assert ctx.get(plane.command_commit_count) == 0
 
@@ -1170,5 +1172,38 @@ def test_stale_and_duplicate_sequences_cannot_move_the_window_backwards() -> Non
         assert ctx.get(plane.duplicate_rx_count) == duplicate_before + 1
         assert ctx.get(plane.command_commit_count) == 0
         assert ctx.get(plane.last_rx_sequence) == 0x10
+
+    run_simulation(bench)
+
+
+def test_a_command_for_a_boot_protocol_endpoint_is_dropped_not_left_blocking_the_queue() -> None:
+    """The engine passes a boot endpoint's reports through and never acks a command.
+
+    Left fresh, a RELATIVE for that endpoint would wait in the one-deep RX queue
+    for an ack that never comes, blocking every later command -- including ones
+    for an interface still in report protocol.
+    """
+
+    async def bench(ctx, harness) -> None:
+        plane = harness.plane
+        await initialize(ctx, plane)
+        entry = relative_x_entry(descriptor_generation=ctx.get(harness.store.descriptor_generation))
+        await commit_map(ctx, harness, entry)
+        ctx.set(plane.boot_protocol, 1 << 1)
+        await ctx.tick("usb")
+        before = ctx.get(plane.invalid_rx_count)
+        await drive_relative(ctx, plane, x=10, sequence=0x21)
+        for _ in range(2):
+            await ctx.tick("usb")
+        assert ctx.get(plane.invalid_rx_count) == before + 1
+        await push_report(ctx, plane, bytes([5]))
+        assert await drain_output(ctx, plane, 1) == bytes([5])
+        assert ctx.get(plane.command_commit_count) == 0
+
+        ctx.set(plane.boot_protocol, 0)
+        await ctx.tick("usb")
+        await drive_relative(ctx, plane, x=10, sequence=0x22)
+        await push_report(ctx, plane, bytes([5]))
+        assert await drain_output(ctx, plane, 1) == bytes([15])
 
     run_simulation(bench)

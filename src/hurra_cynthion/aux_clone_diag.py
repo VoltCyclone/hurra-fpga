@@ -5,6 +5,7 @@ from luna.gateware.interface.ulpi import UTMITranslator
 
 from .debug_block import DebugRegisterBlock
 from .debug_regs import aux_clone_register_map
+from .descriptors import MAX_ENDPOINTS
 from .device import MouseCloneDevice
 from .host import BoundedMouseHost
 
@@ -126,6 +127,8 @@ class AuxCloneDiagnosticTop(Elaboratable):
             device.report_last.eq(host.report_last),
             device.report_endpoint.eq(host.report_endpoint),
             host.report_ready.eq(device.report_ready),
+            device.in_endpoint_count.eq(host.ep_count),
+            *[device.in_endpoint_number[k].eq(host.ep_number[k]) for k in range(MAX_ENDPOINTS)],
             state.effective_connect.eq(effective_connect),
             state.rx_active.eq(aux_utmi.rx_active),
             state.rx_valid.eq(aux_utmi.rx_valid),

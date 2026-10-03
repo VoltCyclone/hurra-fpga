@@ -1,17 +1,15 @@
-"""End-to-end proof that the MCXN947 firmware's boot-mouse injection is valid.
+"""End-to-end proof that a boot-mouse RELATIVE injection is valid at the FPGA.
 
-``firmware/mcxn947/src/inj_session.c`` builds a fixed two-entry field map (X at
-byte 1, Y at byte 2 of the standard [buttons, X, Y, wheel] boot report) and then
-emits RELATIVE motion against it. The firmware's host tests prove it emits those
-exact bytes; these tests prove those same field *values* are accepted by the real
-gateware decode path and mutate a live report additively -- so the two ends meet
-at the actual FPGA, not just in a shared assumption.
+This uses a hand-built two-entry boot-mouse map (X at byte 1, Y at byte 2 of a
+[buttons, X, Y, wheel] report) and emits RELATIVE motion against it, proving the
+gateware decode path accepts those field values and mutates a live report
+additively.
 
-The map *shape* below mirrors inj_session.c on purpose -- the boot-mouse layout
-(X at byte 1, Y at byte 2, report_length 4, report_id 0) is the contract the
-gateware validates, so if the firmware's map shape changes this test must change
-with it. The injected X/Y *magnitude* is not part of that contract (it is a
-tunable demo default); representative values are used here purely to prove the
+It is no longer the map the MCXN947 firmware uploads: the firmware now compiles
+its map from the attached device's report descriptor, and those compiled maps --
+buttons, 16-bit and 12-bit axes, report IDs -- are checked against the same
+gateware in ``test_mcu_compiled_map_e2e.py``. The injected X/Y *magnitude* here is
+not part of any contract; representative values are used purely to prove the
 mutation is additive.
 """
 
@@ -56,12 +54,10 @@ FW_MAP_GENERATION = 1
 
 
 def _boot_entries(descriptor_generation: int) -> list[MapEntryPayload]:
-    """Build the fixed two-entry boot-mouse field map that ``inj_session.c`` uploads.
+    """Build a two-entry boot-mouse field map.
 
-    X lands at bit offset 8 (byte 1) and Y at bit offset 16 (byte 2) of the
-    standard [buttons, X, Y, wheel] boot report, both as 8-bit signed relative
-    axes. This layout is the contract the gateware validates, so it deliberately
-    mirrors the firmware rather than restating it independently.
+    X lands at bit offset 8 (byte 1) and Y at bit offset 16 (byte 2) of a
+    [buttons, X, Y, wheel] boot report, both as 8-bit signed relative axes.
     """
     common = {
         "descriptor_generation": descriptor_generation,

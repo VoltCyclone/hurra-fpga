@@ -325,9 +325,17 @@ class InjectionMapStore(Elaboratable):
             self.active_generation.eq(Array(bank_map_generations)[self.active_bank]),
             self.active_entry_count.eq(Array(bank_entry_counts)[self.active_bank]),
             self.active_layout_count.eq(Array(bank_layout_counts)[self.active_bank]),
+            # Not `~self.invalidate`: that is the plane's link/session/
+            # descriptor OR, and gating here put it at the head of every engine
+            # lookup, the relay handshake and the engine's state-commit enable
+            # -- the critical path on 4 of 12 seeds. The latch below follows it
+            # one cycle later, and nothing needs the sooner answer: the plane
+            # masks rx_accept with ~invalidate itself and the engine clears its
+            # state on store.invalidate directly, so the one cycle can only let
+            # an in-flight report finish, exactly as a link lost a cycle later
+            # would have.
             self.active_valid.eq(
                 Array(bank_valid)[self.active_bank]
-                & ~self.invalidate
                 & ~invalidation_latched
                 & (
                     Array(bank_descriptor_generations)[self.active_bank]
@@ -650,12 +658,6 @@ class InjectionMapStore(Elaboratable):
                 with m.Elif(validation_entry_q.entry_index != validation_index):
                     m.d.usb += [
                         pending_error.eq(MapError.DUPLICATE_ENTRY),
-                        pending_error_entry_index.eq(validation_index),
-                    ]
-                    m.next = "REJECT"
-                with m.Elif(validation_entry_q.interface_number >= LIMITS["interfaces"]):
-                    m.d.usb += [
-                        pending_error.eq(MapError.INTERFACE),
                         pending_error_entry_index.eq(validation_index),
                     ]
                     m.next = "REJECT"

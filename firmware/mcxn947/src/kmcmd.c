@@ -199,9 +199,9 @@ static bool classify_refusal(const char *name, classified_t *out)
         out->reason = "nocatch";
         return true;
     }
-    // The FPGA enumerates and clones a HID boot mouse only (descriptors.py
-    // refuses a capture without bInterfaceProtocol == 2), so there is no
-    // keyboard interface to inject into.
+    // The FPGA does clone keyboards, but it cannot inject into one: the field
+    // map supports only relative axes and buttons, and the link has no key
+    // command, so there is nothing that could press or release a key.
     if (streq(name, "press") || streq(name, "down") || streq(name, "up") ||
         streq(name, "string") || streq(name, "isdown") || streq(name, "disable") ||
         streq(name, "mask") || streq(name, "remap") || streq(name, "keyboard") ||
@@ -403,6 +403,11 @@ static const char *sink_blocked(bool required_op_present)
 {
     if (!required_op_present) {
         return "nosink";
+    }
+    // Before `notready`: a keyboard or a pad will never become ready, so the
+    // honest answer is that there is nothing to inject into.
+    if (s_ops.no_mouse != NULL && s_ops.no_mouse(s_ops.ctx)) {
+        return "nomouse";
     }
     if (!sink_ready()) {
         return "notready";

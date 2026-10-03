@@ -6,9 +6,12 @@
 from amaranth import Array, Cat, DomainRenamer, Elaboratable, Module, Mux, Signal
 from luna.gateware.interface.utmi import UTMIInterface
 
+from .boot_protocol import BootProtocolTracker
 from .control import USBControlTransferEngine
-from .descriptors import MAX_ENDPOINTS, DescriptorStore
+from .control_relay import ControlRelay
+from .descriptors import MAX_ENDPOINT_NUMBER, MAX_ENDPOINTS, DescriptorStore
 from .enumerator import BoundedMouseEnumerator
+from .out_writer import InterruptOutWriter
 from .poller import InterruptInPoller
 from .scheduler import FrameScheduler
 from .timing import HostTiming
@@ -27,6 +30,11 @@ class USBHostTransactionArbiter(Elaboratable):
     in-flight transaction is routed its ``done``/``status``/``rx_*`` result.
     ``poller_busy`` (the OR of every poller's ``active``) blocks new poller
     grants while any poller still owns the shared receive buffer.
+
+    A "poller" here is any port with that contract; the host puts its
+    interrupt-OUT writer on the last one. Its ``active`` must be in
+    ``poller_busy`` too: the engine reads ``tx_payload`` live through
+    SEND_DATA, and ``control_owns`` switches that mux combinationally.
     """
 
     def __init__(self, *, engine, control_port, poller_ports) -> None:
@@ -55,7 +63,15 @@ class USBHostTransactionArbiter(Elaboratable):
         engine_done_d = Signal()
         m.d.usb += engine_done_d.eq(engine.done)
 
-        control_grant = self.control_phase & control.start & ~engine.busy
+        # Who owns the engine AND its shared receive buffer. A poller holds
+        # both from its grant until it has copied its report out
+        # (poller_busy), so control may not take over until then -- even with
+        # control_phase high. That could never happen while control only ran
+        # during enumeration; the control relay forwards transfers AFTER it,
+        # while pollers are live, and a control grant mid-copy overwrote the
+        # buffer the poller was still reading.
+        control_owns = self.control_phase & ~self.poller_busy
+        control_grant = control_owns & control.start & ~engine.busy
         sof_grant = self.sof_start & ~engine.busy & ~engine.done & ~engine_done_d & ~control_grant
         poll_bus_free = ~self.control_phase & ~self.sof_start & ~engine.busy & ~self.poller_busy
 
@@ -76,22 +92,25 @@ class USBHostTransactionArbiter(Elaboratable):
 
         m.d.comb += [
             self.sof_ready.eq(sof_grant),
-            control.start_ready.eq(self.control_phase & ~engine.busy),
+            control.start_ready.eq(control_owns & ~engine.busy),
             engine.start.eq(control_grant | sof_grant | poller_grant),
             engine.sof.eq(sof_grant),
             engine.frame.eq(self.sof_frame),
-            engine.token_pid.eq(Mux(self.control_phase, control.token_pid, token_pid)),
-            engine.address.eq(Mux(self.control_phase, control.address, address)),
-            engine.endpoint.eq(Mux(self.control_phase, control.endpoint, endpoint)),
-            engine.data_toggle.eq(Mux(self.control_phase, control.data_toggle, data_toggle)),
-            engine.tx_length.eq(Mux(self.control_phase, control.tx_length, tx_length)),
-            engine.tx_payload.eq(Mux(self.control_phase, control.tx_payload, tx_payload)),
+            engine.token_pid.eq(Mux(control_owns, control.token_pid, token_pid)),
+            engine.address.eq(Mux(control_owns, control.address, address)),
+            engine.endpoint.eq(Mux(control_owns, control.endpoint, endpoint)),
+            engine.data_toggle.eq(Mux(control_owns, control.data_toggle, data_toggle)),
+            engine.tx_length.eq(Mux(control_owns, control.tx_length, tx_length)),
+            engine.tx_payload.eq(Mux(control_owns, control.tx_payload, tx_payload)),
             engine.connected.eq(self.connected),
-            engine.rx_read_index.eq(Mux(self.control_phase, control.rx_read_index, rx_read_index)),
+            engine.rx_read_index.eq(Mux(control_owns, control.rx_read_index, rx_read_index)),
         ]
 
-        # Control transfers only run during enumeration, never concurrently
-        # with polling, so its result routing stays unconditional.
+        # Result routing stays unconditional: the control engine only acts on
+        # done/rx_* while one of its own transactions is in flight, and
+        # control_owns keeps that from overlapping a poller's. (Control used
+        # to run only during enumeration; the relay now runs it afterwards
+        # too, which is why ownership above is no longer just control_phase.)
         m.d.comb += [
             control.busy.eq(engine.busy),
             control.done.eq(engine.done),
@@ -222,19 +241,28 @@ class BoundedMouseHost(Elaboratable):
             control=self.control,
             descriptor_store=self.descriptor_store,
         )
+        self.control_relay = ControlRelay()
+        self.boot_protocol_tracker = BootProtocolTracker()
         self.scheduler = FrameScheduler(timing)
 
-        # One interrupt poller per capturable endpoint, all sharing the single
-        # transaction engine through the arbiter.
-        self.poller_ports = [USBHostTransactionPort() for _ in range(MAX_ENDPOINTS)]
+        # One interrupt poller per capturable endpoint, plus the interrupt-OUT
+        # writer on the last port, all sharing the single transaction engine
+        # through the arbiter. The arbiter is generic in its port count, so the
+        # writer is simply one more round-robin participant.
+        self.poller_ports = [USBHostTransactionPort() for _ in range(MAX_ENDPOINTS + 1)]
         self.pollers = [
             InterruptInPoller(
                 transaction=port,
                 timing=timing,
                 add_transaction_submodule=False,
             )
-            for port in self.poller_ports
+            for port in self.poller_ports[:MAX_ENDPOINTS]
         ]
+        self.out_writer = InterruptOutWriter(
+            transaction=self.poller_ports[MAX_ENDPOINTS],
+            timing=timing,
+            add_transaction_submodule=False,
+        )
         self.arbiter = USBHostTransactionArbiter(
             engine=self.transaction,
             control_port=self.control_port,
@@ -289,6 +317,27 @@ class BoundedMouseHost(Elaboratable):
         self.report_interface = Signal(8)
         self.report_endpoint = Signal(4)
 
+        # PC -> real device: the clone's interrupt-OUT endpoint stream, sunk
+        # into the writer. ``out_ready`` stays low while a packet is held, so
+        # the clone's FIFO fills and the PC is NAKed. ``out_flush`` pulses when
+        # the clone resets that FIFO.
+        self.out_flush = Signal()
+        self.out_valid = Signal()
+        self.out_data = Signal(8)
+        self.out_last = Signal()
+        self.out_ready = Signal()
+        #: The captured interrupt-OUT endpoint, for the clone to serve.
+        self.out_present = Signal()
+        self.out_number = Signal(4)
+
+        #: Registered: a PC bus reset or SET_CONFIGURATION on the clone. The
+        #: real device never sees either, so the tracker replays
+        #: SET_PROTOCOL(report) to any interface the PC had left in boot.
+        self.boot_resync_trigger = Signal()
+        #: Registered. Bit n: endpoint number n's interface is in boot
+        #: protocol on the real device, so its reports are boot-layout.
+        self.boot_protocol = Signal(MAX_ENDPOINT_NUMBER + 1)
+
         # Read-only mirror of the captured endpoint table.
         self.ep_count = Signal(range(MAX_ENDPOINTS + 1))
         self.ep_interface = Array(
@@ -322,9 +371,12 @@ class BoundedMouseHost(Elaboratable):
         m.submodules.enumerator = self.enumerator
         m.submodules.scheduler = DomainRenamer({"sync": "usb"})(self.scheduler)
         m.submodules.arbiter = self.arbiter
+        m.submodules.control_relay = relay = self.control_relay
+        m.submodules.boot_protocol = tracker = self.boot_protocol_tracker
         m.submodules.report_merge = self.merge
         for k, poller in enumerate(self.pollers):
             m.submodules[f"poller_{k}"] = poller
+        m.submodules.out_writer = writer = self.out_writer
 
         enumerator = self.enumerator
         # "The PHY is configured for normal operation at the negotiated speed",
@@ -390,11 +442,59 @@ class BoundedMouseHost(Elaboratable):
             self.scheduler.high_speed.eq(enumerator.high_speed),
             self.transaction.high_speed.eq(enumerator.high_speed),
             self.scheduler.token_ready.eq(self.arbiter.sof_ready),
-            self.arbiter.control_phase.eq(~enumerator.ready),
+            # The relay pre-empts the pollers only while the control engine is
+            # actually working for it -- not while it waits on the AUX host's
+            # own data and status stages, or a slow or absent AUX host could
+            # silence the controller. A report gap of a few frames per forward
+            # is ordinary USB; starving the auth handshake is not.
+            self.arbiter.control_phase.eq(~enumerator.ready | relay.engine_owned),
+            # The engine is the enumerator's until TARGET is enumerated.
+            relay.enable.eq(enumerator.ready),
+            # Relay -> engine, by way of the enumerator, which is the only
+            # module permitted to drive control.* (see its port comment).
+            enumerator.relay_start.eq(relay.ctl_start),
+            enumerator.relay_request_type.eq(relay.ctl_request_type),
+            enumerator.relay_request.eq(relay.ctl_request),
+            enumerator.relay_value.eq(relay.ctl_value),
+            enumerator.relay_index.eq(relay.ctl_index),
+            enumerator.relay_length.eq(relay.ctl_length),
+            enumerator.relay_out_payload.eq(relay.ctl_out_payload),
+            enumerator.relay_data_ready.eq(relay.ctl_data_ready),
+            # Engine -> relay.
+            relay.ctl_busy.eq(self.control.busy),
+            relay.ctl_done.eq(self.control.done),
+            relay.ctl_status.eq(self.control.status),
+            relay.ctl_transferred.eq(self.control.transferred),
+            relay.ctl_data.eq(self.control.data),
+            relay.ctl_data_valid.eq(self.control.data_valid),
+            relay.ctl_data_first.eq(self.control.data_first),
+            relay.ctl_data_last.eq(self.control.data_last),
+            relay.ctl_out_index.eq(self.control.out_index),
+            # Boot protocol: the tracker snoops the PC's completed forwards and
+            # offers its replays as the relay's lower-priority second source.
+            tracker.ready.eq(enumerator.ready),
+            tracker.ep_count.eq(enumerator.ep_count),
+            tracker.forward_ok.eq(relay.forward_ok),
+            tracker.forward_type.eq(relay.ctl_request_type),
+            tracker.forward_request.eq(relay.ctl_request),
+            tracker.forward_value.eq(relay.ctl_value),
+            tracker.forward_index.eq(relay.ctl_index),
+            tracker.resync_trigger.eq(self.boot_resync_trigger),
+            relay.resync_valid.eq(tracker.resync_valid),
+            relay.resync_index.eq(tracker.resync_index),
+            tracker.relay_resync_active.eq(relay.resync_active),
+            tracker.relay_resync_done.eq(relay.resync_done),
+            tracker.relay_error.eq(relay.response_error),
+            self.boot_protocol.eq(tracker.boot_mask),
             self.arbiter.connected.eq(enumerator.connected),
             self.arbiter.sof_start.eq(self.scheduler.sof_start),
             self.arbiter.sof_frame.eq(self.scheduler.frame_number),
-            self.arbiter.poller_busy.eq(polling_active),
+            # The writer holds the engine through its whole OUT exactly as a
+            # poller holds it through poll+copy. Without it, a control relay
+            # start mid-OUT would flip control_owns -- and with it the
+            # engine's tx_payload/tx_length -- while SEND_DATA is reading
+            # them. polling_active itself stays pollers-only.
+            self.arbiter.poller_busy.eq(polling_active | writer.active),
             self.polling_active.eq(polling_active),
             self.polling_failed.eq(polling_failed),
             self.enumerated.eq(enumerator.ready & ~polling_failed),
@@ -425,6 +525,31 @@ class BoundedMouseHost(Elaboratable):
                 poller.high_speed.eq(enumerator.high_speed),
             ]
 
+        # The writer feeds none of polling_failed, device_unresponsive,
+        # enumerated or error_code: a STALLed rumble or LED endpoint must
+        # never be able to stop the input path. Its enable is registered,
+        # which costs one cycle on a level that changes once per session and
+        # keeps the enumerator's state off the writer's FSM.
+        out_enable = Signal()
+        m.d.usb += out_enable.eq(enumerator.ready & enumerator.connected & enumerator.out_present)
+        m.d.comb += [
+            writer.enable.eq(out_enable),
+            writer.connected.eq(enumerator.connected),
+            writer.sof_tick.eq(self.scheduler.frame_tick),
+            writer.address.eq(enumerator.device_address),
+            writer.endpoint.eq(enumerator.out_number),
+            writer.max_packet_size.eq(enumerator.out_max_packet),
+            writer.interval.eq(enumerator.out_interval),
+            writer.high_speed.eq(enumerator.high_speed),
+            writer.flush.eq(self.out_flush),
+            writer.out_valid.eq(self.out_valid),
+            writer.out_data.eq(self.out_data),
+            writer.out_last.eq(self.out_last),
+            self.out_ready.eq(writer.out_ready),
+            self.out_present.eq(enumerator.out_present),
+            self.out_number.eq(enumerator.out_number),
+        ]
+
         m.d.comb += [
             self.merge.report_ready.eq(self.report_ready),
             self.report_valid.eq(self.merge.report_valid),
@@ -441,12 +566,21 @@ class BoundedMouseHost(Elaboratable):
                 self.ep_number[k].eq(enumerator.ep_number[k]),
                 self.ep_max_packet[k].eq(enumerator.ep_max_packet[k]),
                 self.ep_interval[k].eq(enumerator.ep_interval[k]),
+                tracker.ep_interface[k].eq(enumerator.ep_interface[k]),
+                tracker.ep_number[k].eq(enumerator.ep_number[k]),
             ]
 
-        # Control transfers only run while ``control_phase`` is high (that is,
-        # before the enumerator is ready), so once polling starts an engine
-        # start that is not a SOF is a poll and nothing else.
-        poll_start = self.transaction.start & ~self.transaction.sof & enumerator.ready
+        # Once the enumerator is ready, an engine start that is neither a SOF
+        # nor the writer's OUT is a poll. The writer's start is only ever
+        # raised under its own arbiter grant (it is gated on start_ready), so
+        # it marks exactly the OUT grants. (The control relay's transfers are
+        # still counted here, as they were before the writer existed.)
+        poll_start = (
+            self.transaction.start
+            & ~self.transaction.sof
+            & ~writer.transaction.start
+            & enumerator.ready
+        )
         poll_in_flight = Signal()
         with m.If(poll_start):
             m.d.usb += poll_in_flight.eq(1)

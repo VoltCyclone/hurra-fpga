@@ -2,6 +2,7 @@ import re
 from dataclasses import dataclass, replace
 
 import pytest
+from _out_endpoint_cases import IN_CASES, OUT_CASES, OUT_ONLY_CONFIGURATION
 from amaranth import Elaboratable, Module, Signal
 from amaranth.back import rtlil
 from amaranth.sim import Simulator
@@ -366,7 +367,7 @@ def test_enumerator_fetches_one_report_descriptor_per_interface() -> None:
         ep_a = bytes([7, 5, 0x81, 3, 8, 0, 10])  # interrupt IN, endpoint 1
         # Endpoint 2, not 8: the number is incidental to this test (any second
         # distinct interrupt-IN endpoint of interface 0 exercises the property),
-        # and numbers above RELAY_ENDPOINT_NUMBERS now fail enumeration.
+        # and any endpoint number 1..15 now enumerates.
         ep_b = bytes([7, 5, 0x82, 3, 8, 0, 10])  # interrupt IN, endpoint 2
         body = interface + hid + ep_a + ep_b
         total = 9 + len(body)
@@ -422,11 +423,12 @@ def test_enumerates_composite_with_vendor_interface_skipped() -> None:
     simulate(bench)
 
 
-def test_enumerator_skips_interrupt_out_and_captures_the_interrupt_in() -> None:
+def test_enumerator_captures_interrupt_out_apart_from_the_interrupt_in_table() -> None:
     async def bench(ctx, dut, control, timing) -> None:
         # The keyboard interface (interface 1) carries an interrupt-OUT endpoint
-        # (LED reports, address 0x02) ahead of its interrupt-IN (0x82); the OUT
-        # must be skipped while the IN is captured, alongside the mouse's IN.
+        # (LED reports, address 0x02) ahead of its interrupt-IN (0x82). The IN
+        # table must be exactly what it was before OUT relaying -- the OUT goes
+        # to its own registers, never into an ep_* row or ep_count.
         mouse = (
             bytes([9, 4, 0, 0, 1, 3, 1, 2, 0])
             + bytes([9, 0x21, 0x11, 1, 0, 1, 0x22, 52, 0])
@@ -435,8 +437,8 @@ def test_enumerator_skips_interrupt_out_and_captures_the_interrupt_in() -> None:
         keyboard = (
             bytes([9, 4, 1, 0, 2, 3, 1, 1, 0])
             + bytes([9, 0x21, 0x11, 1, 0, 1, 0x22, 65, 0])
-            + bytes([7, 5, 0x02, 3, 8, 0, 10])  # interrupt OUT -> skipped
-            + bytes([7, 5, 0x82, 3, 8, 0, 10])  # interrupt IN  -> captured
+            + bytes([7, 5, 0x02, 3, 8, 0, 10])  # interrupt OUT -> relay OUT
+            + bytes([7, 5, 0x82, 3, 8, 0, 10])  # interrupt IN  -> IN table
         )
         body = mouse + keyboard
         total = 9 + len(body)
@@ -459,6 +461,11 @@ def test_enumerator_skips_interrupt_out_and_captures_the_interrupt_in() -> None:
         assert ctx.get(dut.ep_count) == 2
         assert [ctx.get(dut.ep_interface[k]) for k in range(2)] == [0, 1]
         assert [ctx.get(dut.ep_number[k]) for k in range(2)] == [1, 2]
+        assert ctx.get(dut.out_present)
+        assert ctx.get(dut.out_number) == 2
+        assert ctx.get(dut.out_max_packet) == 8
+        assert ctx.get(dut.out_interval) == 10
+        assert not ctx.get(dut.out_ignored)
 
     simulate(bench)
 
@@ -1100,43 +1107,10 @@ def test_enumerator_elaborates_to_bounded_logic_and_one_descriptor_memory() -> N
     assert len(netlist) < 2_000_000
 
 
-def test_endpoint_number_above_the_relay_range_fails_enumeration() -> None:
-    # The clone serves the captured descriptors verbatim, so an endpoint
-    # number ReportRelay cannot serve would be advertised to the PC and then
-    # NAK forever. Reject it where an operator can attribute it instead.
-    requests = descriptor_requests(configuration=mouse_configuration(endpoint_address=0x85))[:5]
-
-    async def bench(ctx, dut, control, timing) -> None:
-        await power_attach_and_reset(ctx, dut, timing)
-        await serve_all(ctx, dut, control, requests)
-        await settle(ctx)
-        assert ctx.get(dut.error_code) == HostError.UNSUPPORTED_TOPOLOGY, (
-            f"endpoint 5 enumerated: error_code={ctx.get(dut.error_code)} "
-            f"ready={ctx.get(dut.ready)} ep_count={ctx.get(dut.ep_count)} "
-            f"ep_number[0]={ctx.get(dut.ep_number[0])}"
-        )
-        assert not ctx.get(dut.ready)
-
-    simulate(bench)
-
-
-def test_endpoint_number_fifteen_fails_enumeration() -> None:
-    # 0x8F is the top of the 4-bit endpoint field; guards the comparison width.
-    requests = descriptor_requests(configuration=mouse_configuration(endpoint_address=0x8F))[:5]
-
-    async def bench(ctx, dut, control, timing) -> None:
-        await power_attach_and_reset(ctx, dut, timing)
-        await serve_all(ctx, dut, control, requests)
-        await settle(ctx)
-        assert ctx.get(dut.error_code) == HostError.UNSUPPORTED_TOPOLOGY
-        assert not ctx.get(dut.ready)
-
-    simulate(bench)
-
-
-@pytest.mark.parametrize("endpoint_address", [0x81, 0x82, 0x83, 0x84])
-def test_endpoint_numbers_one_through_four_still_enumerate(endpoint_address: int) -> None:
-    # Non-regression against an over-tight predicate.
+@pytest.mark.parametrize("endpoint_address", [0x81, 0x84, 0x85, 0x8F])
+def test_any_endpoint_number_enumerates(endpoint_address: int) -> None:
+    # 0x8F is the top of the 4-bit endpoint field; the clone binds the number
+    # at runtime, so nothing above 4 is refused any more.
     requests = descriptor_requests(
         configuration=mouse_configuration(endpoint_address=endpoint_address)
     )
@@ -1538,3 +1512,345 @@ def test_force_full_speed_suppresses_the_chirp_entirely() -> None:
         assert not ctx.get(dut.high_speed)
 
     simulate_with(CHIRP_TIMING, bench)
+
+
+def test_relay_owns_control_engine_after_ready() -> None:
+    """Once enumeration completes, the relay's request reaches the engine.
+
+    The enumerator is the sole Amaranth driver of ``control.*``, so ownership
+    has to transfer inside it -- host.py cannot mux those signals without
+    creating a second driver.
+    """
+
+    async def bench(ctx, dut, control, timing) -> None:
+        await power_attach_and_reset(ctx, dut, timing)
+        await serve_all(ctx, dut, control, descriptor_requests())
+        await settle(ctx)
+        assert ctx.get(dut.ready)
+
+        ctx.set(dut.relay_request_type, 0xA1)
+        ctx.set(dut.relay_request, 0x01)
+        ctx.set(dut.relay_value, 0x03F2)
+        ctx.set(dut.relay_index, 3)
+        ctx.set(dut.relay_length, 16)
+        ctx.set(dut.relay_start, 1)
+        await settle(ctx)
+
+        assert ctx.get(dut.control.request_type) == 0xA1
+        assert ctx.get(dut.control.request) == 0x01
+        assert ctx.get(dut.control.value) == 0x03F2
+        assert ctx.get(dut.control.start) == 1
+
+    simulate(bench)
+
+
+def test_relay_is_ignored_before_enumeration_completes() -> None:
+    """Before ready, the enumeration FSM must keep full ownership.
+
+    Without this, a relay request racing enumeration would corrupt a
+    descriptor fetch mid-flight.
+    """
+
+    async def bench(ctx, dut, control, timing) -> None:
+        await power_attach_and_reset(ctx, dut, timing)
+        assert not ctx.get(dut.ready)
+
+        ctx.set(dut.relay_request_type, 0xA1)
+        ctx.set(dut.relay_request, 0x01)
+        ctx.set(dut.relay_start, 1)
+        await settle(ctx)
+
+        assert ctx.get(dut.control.request_type) != 0xA1
+
+    simulate(bench)
+
+
+def _requests_for(config: bytes, report_interface: int, report_length: int) -> list[Request]:
+    """The full enumeration exchange for one HID interface in ``config``."""
+    return [
+        Request(0, 0x80, 6, 0x0100, 0, 8, 8, DEVICE[:8]),
+        Request(0, 0x00, 5, 1, 0, 0, 64),
+        Request(1, 0x80, 6, 0x0100, 0, 18, 64, DEVICE),
+        Request(1, 0x80, 6, 0x0200, 0, 9, 64, config[:9]),
+        Request(1, 0x80, 6, 0x0200, 0, len(config), 64, config),
+        Request(1, 0x00, 9, config[5], 0, 0, 64),
+        Request(1, 0x81, 6, 0x2200, report_interface, report_length, 64, bytes(report_length)),
+    ]
+
+
+def _assert_gateware_accepts(config: bytes, report_interface: int, report_length: int):
+    """Enumerate ``config`` on the real gateware; it must reach ready."""
+
+    async def bench(ctx, dut, control, timing) -> None:
+        await power_attach_and_reset(ctx, dut, timing)
+        await serve_all(ctx, dut, control, _requests_for(config, report_interface, report_length))
+        await settle(ctx)
+        assert (
+            ctx.get(dut.error_code) == HostError.NONE
+        ), f"gateware rejected it: {HostError(ctx.get(dut.error_code)).name}"
+        assert ctx.get(dut.ready)
+        assert ctx.get(dut.ep_count) == 1
+
+    simulate(bench)
+
+
+def test_trailing_alt_setting_after_the_fourth_interface_mirrors_python() -> None:
+    """Review I4: the two parsers disagreed on this input.
+
+    Four interfaces, the last of which also has an alternate setting. The
+    gateware checked MAX_INTERFACES at type-byte time, before
+    bAlternateSetting is readable, so the alt-setting descriptor counted as a
+    fifth interface and was rejected. The Python mirror counts only alt 0 and
+    accepted it. A DS4 happens to be safe -- its alt settings come before its
+    fourth interface -- but any device with trailing alt settings was not.
+    """
+    from hurra_cynthion.descriptors import parse_mouse_configuration
+
+    hid = (
+        bytes([9, 4, 0, 0, 1, 3, 0, 0, 0])
+        + bytes([9, 0x21, 0x11, 0x01, 0, 1, 0x22, 52, 0])
+        + bytes([7, 5, 0x81, 3, 8, 0, 10])
+    )
+    audio_control = bytes([9, 4, 1, 0, 0, 1, 1, 0, 0])
+    stream_2 = bytes([9, 4, 2, 0, 0, 1, 2, 0, 0])
+    stream_3_alt0 = bytes([9, 4, 3, 0, 0, 1, 2, 0, 0])
+    stream_3_alt1 = bytes([9, 4, 3, 1, 1, 1, 2, 0, 0]) + bytes(
+        [9, 5, 0x02, 0x01, 0xC0, 0x00, 0x01, 0x00, 0x00]
+    )
+    body = hid + audio_control + stream_2 + stream_3_alt0 + stream_3_alt1
+    total = 9 + len(body)
+    config = bytes([9, 2, total & 0xFF, total >> 8, 4, 7, 0, 0x80, 50]) + body
+
+    assert len(parse_mouse_configuration(config).endpoints) == 1, "Python mirror rejects it"
+    _assert_gateware_accepts(config, report_interface=0, report_length=52)
+
+
+def test_ds4_configuration_enumerates_on_the_gateware() -> None:
+    """The DS4 fixture had only ever been parsed by the Python mirror.
+
+    Phase A exists so the real enumerator accepts a DS4; this is the test
+    that says it does.
+    """
+    from _ds4_fixture import DS4_CONFIG_DESCRIPTOR
+
+    _assert_gateware_accepts(DS4_CONFIG_DESCRIPTOR, report_interface=3, report_length=507)
+
+
+def _hid_with_nine_byte_endpoint(synch_address: int) -> bytes:
+    """A HID interface whose interrupt-IN endpoint uses the 9-byte form."""
+    interface = bytes([9, 4, 0, 0, 1, 3, 0, 0, 0])
+    hid = bytes([9, 0x21, 0x11, 0x01, 0, 1, 0x22, 52, 0])
+    # bLength 9: ... bInterval=10 at offset 6, bRefresh at 7, bSynchAddress at 8.
+    endpoint = bytes([9, 5, 0x81, 3, 8, 0, 10, 0, synch_address])
+    body = interface + hid + endpoint
+    total = 9 + len(body)
+    return bytes([9, 2, total & 0xFF, total >> 8, 1, 7, 0, 0x80, 50]) + body
+
+
+@pytest.mark.parametrize("synch_address", [0, 3])
+def test_nine_byte_endpoint_interval_is_read_from_offset_six(synch_address: int) -> None:
+    """Review: bInterval of a 9-byte endpoint came from bSynchAddress.
+
+    The gateware captures an endpoint on its descriptor's LAST byte and took
+    control.data there as bInterval. For the 7-byte form that is offset 6,
+    bInterval; for the 9-byte form it is offset 8, bSynchAddress. So a zero
+    bSynchAddress failed enumeration as malformed, and any other value was
+    captured as the polling interval and handed to the PC. The Python mirror
+    reads data[offset + 6], so the two parsers disagreed.
+    """
+    from hurra_cynthion.descriptors import parse_mouse_configuration
+
+    config = _hid_with_nine_byte_endpoint(synch_address)
+    assert parse_mouse_configuration(config).endpoints[0].interval == 10
+
+    async def bench(ctx, dut, control, timing) -> None:
+        await power_attach_and_reset(ctx, dut, timing)
+        await serve_all(ctx, dut, control, _requests_for(config, 0, 52))
+        await settle(ctx)
+        assert (
+            ctx.get(dut.error_code) == HostError.NONE
+        ), f"gateware rejected it: {HostError(ctx.get(dut.error_code)).name}"
+        assert (
+            ctx.get(dut.ep_interval[0]) == 10
+        ), f"bInterval captured as {ctx.get(dut.ep_interval[0])}, not 10"
+
+    simulate(bench)
+
+
+# --- Interrupt-OUT relay endpoint --------------------------------------------
+
+
+def _requests_for_reports(config: bytes, reports) -> list[Request]:
+    """The full enumeration exchange for ``config``, one report GET per entry."""
+    return [
+        Request(0, 0x80, 6, 0x0100, 0, 8, 8, DEVICE[:8]),
+        Request(0, 0x00, 5, 1, 0, 0, 64),
+        Request(1, 0x80, 6, 0x0100, 0, 18, 64, DEVICE),
+        Request(1, 0x80, 6, 0x0200, 0, 9, 64, config[:9]),
+        Request(1, 0x80, 6, 0x0200, 0, len(config), 64, config),
+        Request(1, 0x00, 9, config[5], 0, 0, 64),
+        *(
+            Request(1, 0x81, 6, 0x2200, interface, length, 64, bytes(length))
+            for interface, length in reports
+        ),
+    ]
+
+
+async def _read_out_capture(ctx, dut) -> tuple[tuple[int, int, int, int] | None, bool]:
+    """The captured OUT endpoint, in the shared case table's shape."""
+    out = None
+    if ctx.get(dut.out_present):
+        # The interface number is not kept: nothing downstream needs it.
+        out = (
+            None,
+            ctx.get(dut.out_number),
+            ctx.get(dut.out_max_packet),
+            ctx.get(dut.out_interval),
+        )
+    return out, bool(ctx.get(dut.out_ignored))
+
+
+@pytest.mark.parametrize("name", sorted(OUT_CASES))
+def test_out_endpoint_capture_mirrors_python_case_for_case(name: str) -> None:
+    """The gateware half of the shared table in tests/_out_endpoint_cases.py.
+
+    The same table drives the Python mirror in test_descriptors.py, so a case
+    either passes on both parsers or the disagreement is named here.
+    """
+    from hurra_cynthion.descriptors import parse_mouse_configuration
+
+    case = OUT_CASES[name]
+    parsed = parse_mouse_configuration(case.config)
+    seen: dict = {}
+
+    async def bench(ctx, dut, control, timing) -> None:
+        await power_attach_and_reset(ctx, dut, timing)
+        await serve_all(ctx, dut, control, _requests_for_reports(case.config, case.reports))
+        await settle(ctx)
+        assert ctx.get(dut.error_code) == HostError.NONE, (
+            f"an OUT endpoint must never fail enumeration: "
+            f"{HostError(ctx.get(dut.error_code)).name}"
+        )
+        assert ctx.get(dut.ready)
+        # The IN table is untouched by any OUT endpoint.
+        assert ctx.get(dut.ep_count) == len(parsed.endpoints)
+        seen["out"], seen["ignored"] = await _read_out_capture(ctx, dut)
+
+    simulate(bench)
+
+    expected = None if case.out is None else (None, *case.out[1:])
+    assert seen["out"] == expected
+    assert seen["ignored"] == case.ignored
+    python = None
+    if parsed.out_endpoint is not None:
+        python = (
+            None,
+            parsed.out_endpoint.endpoint_number,
+            parsed.out_endpoint.max_packet_size,
+            parsed.out_endpoint.interval,
+        )
+    assert (seen["out"], seen["ignored"]) == (python, parsed.out_ignored), "parsers disagree"
+
+
+@pytest.mark.parametrize("name", sorted(IN_CASES))
+def test_in_endpoint_numbers_mirror_python_case_for_case(name: str) -> None:
+    """The gateware half of IN_CASES in tests/_out_endpoint_cases.py."""
+    case = IN_CASES[name]
+    requests = _requests_for_reports(case.config, case.reports)
+    if case.numbers is None:
+        requests = requests[:5]
+    seen: dict = {}
+
+    async def bench(ctx, dut, control, timing) -> None:
+        await power_attach_and_reset(ctx, dut, timing)
+        await serve_all(ctx, dut, control, requests)
+        await settle(ctx)
+        seen["error"] = HostError(ctx.get(dut.error_code))
+        seen["numbers"] = tuple(ctx.get(dut.ep_number[k]) for k in range(ctx.get(dut.ep_count)))
+
+    simulate(bench)
+
+    if case.numbers is None:
+        assert seen["error"] == HostError.UNSUPPORTED_TOPOLOGY
+    else:
+        assert seen["error"] == HostError.NONE
+        assert seen["numbers"] == case.numbers
+
+
+def test_out_only_hid_interface_still_fails_enumeration() -> None:
+    """An OUT endpoint gives the PC nothing to read; it is not an IN endpoint."""
+    requests = _requests_for_reports(OUT_ONLY_CONFIGURATION, ())[:5]
+
+    async def bench(ctx, dut, control, timing) -> None:
+        await power_attach_and_reset(ctx, dut, timing)
+        await serve_all(ctx, dut, control, requests)
+        await settle(ctx)
+        assert ctx.get(dut.error_code) == HostError.UNSUPPORTED_TOPOLOGY
+        assert not ctx.get(dut.ready)
+
+    simulate(bench)
+
+
+def test_reenumeration_clears_the_captured_out_endpoint() -> None:
+    """A detach must not let one device's OUT endpoint leak into the next session.
+
+    The first device declares an OUT endpoint plus an ignored second one; the
+    replacement declares none. Both out_present and the sticky out_ignored
+    must read 0 once the replacement is enumerated.
+    """
+    first = OUT_CASES["second_out"]
+    second = OUT_CASES["no_out"]
+
+    async def bench(ctx, dut, control, timing) -> None:
+        await power_attach_and_reset(ctx, dut, timing)
+        await serve_all(ctx, dut, control, _requests_for_reports(first.config, first.reports))
+        await settle(ctx)
+        assert ctx.get(dut.ready)
+        assert ctx.get(dut.out_present)
+        assert ctx.get(dut.out_ignored)
+
+        ctx.set(dut.line_state, 0)
+        await settle(ctx)
+        assert ctx.get(dut.error_code) == HostError.DISCONNECTED
+        assert not ctx.get(dut.out_present)
+        assert not ctx.get(dut.out_ignored)
+
+        ctx.set(dut.line_state, 1)
+        for _ in range(timing.attach_stable_cycles + timing.reset_cycles):
+            await ctx.tick("usb")
+        await serve_all(ctx, dut, control, _requests_for_reports(second.config, second.reports))
+        await settle(ctx)
+        assert ctx.get(dut.ready)
+        assert not ctx.get(dut.out_present)
+        assert not ctx.get(dut.out_ignored)
+
+    simulate(bench)
+
+
+def test_enumeration_retry_clears_the_captured_out_endpoint() -> None:
+    """A retry re-reads the configuration; the old capture must not survive it.
+
+    The first attempt captures an OUT endpoint and then fails SET_CONFIGURATION,
+    which retries the whole enumeration. The retry is served a configuration
+    with no OUT endpoint, so anything still set came from the failed attempt.
+    """
+    first = OUT_CASES["second_out"]
+    second = OUT_CASES["no_out"]
+    failing = _requests_for_reports(first.config, first.reports)[:6]
+    failing[-1] = replace(failing[-1], status=TransactionStatus.STALL)
+
+    async def bench(ctx, dut, control, timing) -> None:
+        await power_attach_and_reset(ctx, dut, timing)
+        await serve_all(ctx, dut, control, failing)
+        await ctx.tick("usb")
+        assert ctx.get(dut.enum_attempt) == 1
+        assert not ctx.get(dut.out_present)
+        assert not ctx.get(dut.out_ignored)
+        # serve_all waits out the retry's bus reset on its own.
+        await serve_all(ctx, dut, control, _requests_for_reports(second.config, second.reports))
+        await settle(ctx)
+        assert ctx.get(dut.ready)
+        assert not ctx.get(dut.out_present)
+        assert not ctx.get(dut.out_ignored)
+
+    simulate(bench)

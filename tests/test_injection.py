@@ -1,5 +1,6 @@
 import random
 import zlib
+from dataclasses import replace
 
 from amaranth import Elaboratable, Module
 from amaranth.back import rtlil
@@ -1095,6 +1096,7 @@ def test_residual_overflow_rejects_command_without_wrapping_pending_state() -> N
 
         assert stationary == bytes([127])
         assert acknowledgements == {"relative"}
+        await ctx.tick("usb")  # command_overflow counts a cycle after its commit
         assert ctx.get(engine.command_overflow) == 1
         assert ctx.get(engine.pending_x) == (1 << 31) - 1 - 127
         assert ctx.get(engine.last_committed_command_sequence) == 0x64
@@ -1638,6 +1640,7 @@ def test_negative_residual_overflow_rejects_and_preserves_sequence() -> None:
         ctx.set(engine.relative_valid, 0)
         assert stationary == bytes([0x81])
         assert acknowledgements == {"relative"}
+        await ctx.tick("usb")  # command_overflow counts a cycle after its commit
         assert ctx.get(engine.command_overflow) == 1
         assert ctx.get(engine.pending_x) == -(1 << 31) + 127
         assert ctx.get(engine.last_committed_command_sequence) == 0x67
@@ -1702,6 +1705,7 @@ def test_multi_axis_overflow_rejects_whole_relative_command() -> None:
         assert stationary == bytes([127, 0])
         assert acknowledgements == {"relative"}
         assert ctx.get(engine.pending_y) == 0
+        await ctx.tick("usb")  # command_overflow counts a cycle after its commit
         assert ctx.get(engine.command_overflow) == 1
         assert ctx.get(engine.last_committed_command_sequence) == 0x69
 
@@ -1828,6 +1832,129 @@ def test_stationary_scan_is_skipped_when_active_map_has_no_layouts() -> None:
         for cycle in range(32):
             await ctx.tick("usb")
             assert ctx.get(engine._stationary_scan_active) == 0, f"entered scan at +{cycle}"
+
+    simulation.add_testbench(bench)
+    simulation.run()
+
+
+# --- Boot protocol: the engine stands aside on a boot-protocol endpoint -------------
+
+
+def _relative_entry(*, endpoint: int, entry_index: int = 0) -> MapEntryPayload:
+    return replace(
+        map_entry(
+            bit_offset=0,
+            bit_width=8,
+            flags=(INJ_MAP_ENTRY_FLAG_SIGNED | INJ_MAP_ENTRY_FLAG_RELATIVE | INJ_MAP_ENTRY_FLAG_X),
+            logical_minimum=-127,
+            logical_maximum=127,
+            report_length=2,
+            entry_index=entry_index,
+        ),
+        endpoint_number=endpoint,
+    )
+
+
+def _offer_relative(ctx, engine, *, endpoint: int, x: int, sequence: int) -> None:
+    ctx.set(engine.relative_valid, 1)
+    ctx.set(engine.relative_interface, 0)
+    ctx.set(engine.relative_endpoint, endpoint)
+    ctx.set(engine.relative_report_id, 0)
+    ctx.set(engine.relative_flags, INJ_RELATIVE_FLAG_X)
+    ctx.set(engine.relative_x, x)
+    ctx.set(engine.relative_command_sequence, sequence)
+
+
+def test_a_boot_protocol_endpoint_passes_through_without_a_map_lookup() -> None:
+    """Its reports are in the boot layout; the map describes the report layout."""
+    harness = InjectionHarness()
+    engine, store = harness.engine, harness.map_store
+    simulation = Simulator(harness)
+    simulation.add_clock(1e-6, domain="usb")
+    queries = [0]
+
+    async def watch(ctx) -> None:
+        while True:
+            queries[0] += ctx.get(store.query_valid)
+            await ctx.tick("usb")
+
+    async def bench(ctx) -> None:
+        await commit_map(ctx, store, [_relative_entry(endpoint=1)])
+        ctx.set(engine.boot_protocol, 1 << 1)
+        _offer_relative(ctx, engine, endpoint=1, x=50, sequence=0x71)
+        before = queries[0]
+        await push_report(ctx, engine, bytes([0x01, 0x02]))
+        emitted, acknowledgements = await drain_report(ctx, engine, 2)
+        assert emitted == bytes([0x01, 0x02])
+        assert acknowledgements == set(), "a boot report must not consume the command"
+        assert queries[0] == before
+
+        # Back in report protocol, the same command applies to the next report.
+        ctx.set(engine.boot_protocol, 0)
+        await push_report(ctx, engine, bytes([0x01, 0x02]))
+        emitted, acknowledgements = await drain_report(ctx, engine, 2)
+        ctx.set(engine.relative_valid, 0)
+        assert emitted == bytes([51, 0x02])
+        assert acknowledgements == {"relative"}
+
+    simulation.add_testbench(watch, background=True)
+    simulation.add_testbench(bench)
+    simulation.run()
+
+
+def test_another_endpoint_stays_injectable_while_one_is_in_boot_protocol() -> None:
+    harness = InjectionHarness()
+    engine = harness.engine
+    simulation = Simulator(harness)
+    simulation.add_clock(1e-6, domain="usb")
+
+    async def bench(ctx) -> None:
+        await commit_map(
+            ctx,
+            harness.map_store,
+            [_relative_entry(endpoint=1), _relative_entry(endpoint=2, entry_index=1)],
+        )
+        ctx.set(engine.boot_protocol, 1 << 1)
+        _offer_relative(ctx, engine, endpoint=2, x=7, sequence=0x72)
+        await push_report(ctx, engine, bytes([0x10, 0x20]), endpoint=2)
+        emitted, acknowledgements = await drain_report(ctx, engine, 2)
+        ctx.set(engine.relative_valid, 0)
+        assert emitted == bytes([0x17, 0x20])
+        assert acknowledgements == {"relative"}
+
+    simulation.add_testbench(bench)
+    simulation.run()
+
+
+def test_no_stationary_report_is_synthesised_for_a_boot_protocol_endpoint() -> None:
+    harness = InjectionHarness()
+    engine = harness.engine
+    simulation = Simulator(harness)
+    simulation.add_clock(1e-6, domain="usb")
+
+    async def bench(ctx) -> None:
+        await commit_map(ctx, harness.map_store, [_relative_entry(endpoint=1)])
+        _offer_relative(ctx, engine, endpoint=1, x=100, sequence=0x73)
+        await push_report(ctx, engine, bytes([100, 0xA5]))
+        emitted, _ = await drain_report(ctx, engine, 2)
+        ctx.set(engine.relative_valid, 0)
+        assert emitted == bytes([127, 0xA5])
+        assert ctx.get(engine.pending_x) == 73
+
+        # The device switched to boot protocol: a report-layout template must
+        # not be synthesised onto its endpoint.
+        ctx.set(engine.boot_protocol, 1 << 1)
+        for _ in range(3):
+            await pulse_sof(ctx, engine)
+            for _ in range(40):
+                assert not ctx.get(engine.output_valid)
+                await ctx.tick("usb")
+        assert ctx.get(engine.pending_x) == 73
+
+        ctx.set(engine.boot_protocol, 0)
+        await pulse_sof(ctx, engine)
+        stationary, _ = await drain_report(ctx, engine, 2)
+        assert stationary == bytes([73, 0xA5])
 
     simulation.add_testbench(bench)
     simulation.run()

@@ -28,6 +28,39 @@ typedef struct {
     uint8_t _pad[7];
 } link_snapshot_t;
 
+// Build the complete source image passed to link_snapshot_publish(). Keeping
+// every field here makes additions to the 32-byte ABI visible to the producer
+// and avoids a byte-at-a-time memset in the 8 kHz retirement ISR.
+static inline void link_snapshot_assign(link_snapshot_t *snapshot,
+                                        uint32_t slot_counter,
+                                        uint32_t native_report_count,
+                                        uint16_t usb_frame,
+                                        uint16_t usb_subframe,
+                                        uint16_t link_flags,
+                                        uint16_t descriptor_generation,
+                                        uint16_t map_generation,
+                                        uint16_t fault_flags,
+                                        uint8_t last_rx_sequence)
+{
+    snapshot->seq = 0u;
+    snapshot->slot_counter = slot_counter;
+    snapshot->native_report_count = native_report_count;
+    snapshot->usb_frame = usb_frame;
+    snapshot->usb_subframe = usb_subframe;
+    snapshot->link_flags = link_flags;
+    snapshot->descriptor_generation = descriptor_generation;
+    snapshot->map_generation = map_generation;
+    snapshot->fault_flags = fault_flags;
+    snapshot->last_rx_sequence = last_rx_sequence;
+    snapshot->_pad[0] = 0u;
+    snapshot->_pad[1] = 0u;
+    snapshot->_pad[2] = 0u;
+    snapshot->_pad[3] = 0u;
+    snapshot->_pad[4] = 0u;
+    snapshot->_pad[5] = 0u;
+    snapshot->_pad[6] = 0u;
+}
+
 _Static_assert(sizeof(link_snapshot_t) == 32u, "link snapshot must be 32 bytes");
 
 // Publish one complete generation. src->seq is deliberately ignored: only the

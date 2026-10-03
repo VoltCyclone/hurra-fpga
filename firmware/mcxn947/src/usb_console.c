@@ -17,6 +17,7 @@
 #include "link_retire.h"
 #include "platform.h"
 #include "core1_release.h"
+#include "reset_cause.h"
 #include "shared_window.h"
 
 #include "fsl_clock.h"
@@ -26,6 +27,13 @@
 #include "clock_config.h"  // BOARD_XTAL0_CLK_HZ
 
 #include "tusb.h"
+
+_Static_assert(CONSOLE_CPU1_FAULT_VALID == SHARED_CPU1_FAULT_VALID,
+               "console CPU1 fault-valid bit must match shared window");
+_Static_assert(CONSOLE_CPU1_FAULT_KIND_SHIFT == SHARED_CPU1_FAULT_KIND_SHIFT,
+               "console CPU1 fault-kind shift must match shared window");
+_Static_assert(CONSOLE_CPU1_FAULT_KIND_MASK == SHARED_CPU1_FAULT_KIND_MASK,
+               "console CPU1 fault-kind mask must match shared window");
 
 // Port 1 is the ChipIdea High Speed controller. Resolved from the pinned
 // TinyUSB tree rather than assumed; the argument is in src/tusb_config.h.
@@ -120,9 +128,11 @@ static void usb_console_stats(void *ctx, console_stats_t *out)
     out->recoveries = diagnostics.recoveries;
     out->framing_recoveries = diagnostics.framing_recoveries;
     out->gap_wait_timeouts = diagnostics.gap_wait_timeouts;
+    out->debug_tx_drop = dbg_uart_dropped_bytes();
     out->link_ready = diagnostics.ready;
 
     out->uptime_ms = platform_ticks();
+    out->reset_srs = reset_cause_latched();
 
     // CPU0 deliberately exercises the same bounded reader CPU1 uses. If the
     // ISR wins all four attempts, keep reporting the previous complete copy
@@ -150,6 +160,14 @@ static void usb_console_stats(void *ctx, console_stats_t *out)
         out->cpu1_display_flags = g_shared_window.cpu1_display_flags;
         out->cpu1_heartbeat = heartbeat;
         out->cpu1_seen_slot_counter = g_shared_window.cpu1_seen_slot_counter;
+        out->cpu1_fault_flags = g_shared_window.fault.fault_flags;
+        __DMB();
+        out->cpu1_fault_cfsr = g_shared_window.fault.cfsr;
+        out->cpu1_fault_hfsr = g_shared_window.fault.hfsr;
+        out->cpu1_fault_mmfar = g_shared_window.fault.mmfar;
+        out->cpu1_fault_bfar = g_shared_window.fault.bfar;
+        out->cpu1_fault_pc = g_shared_window.fault.pc;
+        out->cpu1_fault_lr = g_shared_window.fault.lr;
         out->cpu1_alive = heartbeat != previous_cpu1_heartbeat;
         previous_cpu1_heartbeat = heartbeat;
     } else {
@@ -160,6 +178,13 @@ static void usb_console_stats(void *ctx, console_stats_t *out)
         out->cpu1_display_flags = 0u;
         out->cpu1_heartbeat = 0u;
         out->cpu1_seen_slot_counter = 0u;
+        out->cpu1_fault_flags = 0u;
+        out->cpu1_fault_cfsr = 0u;
+        out->cpu1_fault_hfsr = 0u;
+        out->cpu1_fault_mmfar = 0u;
+        out->cpu1_fault_bfar = 0u;
+        out->cpu1_fault_pc = 0u;
+        out->cpu1_fault_lr = 0u;
         out->cpu1_alive = false;
     }
 }
@@ -314,11 +339,18 @@ static void usb_console_cpu1_start(void *ctx)
     (void)core1_release();
 }
 
+static bool usb_console_fault_inject(void *ctx, fault_injection_t injection)
+{
+    (void)ctx;
+    return fault_inject(injection);
+}
+
 static const console_ops_t s_console_ops = {
     .write = usb_console_write,
     .stats = usb_console_stats,
     .cpu1_halt = usb_console_cpu1_halt,
     .cpu1_start = usb_console_cpu1_start,
+    .fault_inject = usb_console_fault_inject,
     .ctx = NULL,
 };
 
@@ -361,11 +393,18 @@ static bool km_ready(void *ctx)
     return link_inject_ready();
 }
 
+static bool km_no_mouse(void *ctx)
+{
+    (void)ctx;
+    return link_inject_no_mouse();
+}
+
 static const kmcmd_ops_t s_kmcmd_ops = {
     .relative = km_relative,
     .buttons = km_buttons,
     .physical_mask = km_physical_mask,
     .ready = km_ready,
+    .no_mouse = km_no_mouse,
     .ctx = NULL,
 };
 

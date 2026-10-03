@@ -1,5 +1,5 @@
-// Injection session: the MCU-side policy that turns a live, enumerated boot
-// mouse into injected motion on the wire. It is the driver that sits above the
+// Injection session: the MCU-side policy that turns a live, enumerated mouse
+// into injected motion on the wire. It is the driver that sits above the
 // transport (link.c / link_retire.c) and the frame builders (inj_command.c).
 //
 // The FPGA only acts on a RELATIVE command when a field map is committed and
@@ -7,21 +7,26 @@
 // link_ready & session_active & map_store.active_valid & rx_map_generation ==
 // active_generation). So this session enforces the mandatory order:
 //
-//   WAIT_LINK -> WAIT_REPORT -> SEND_BEGIN/ENTRY/COMMIT -> WAIT_COMMIT -> INJECTING
+//   WAIT_LINK -> WAIT_DESCRIPTOR -> WAIT_REPORT -> SEND_BEGIN/ENTRY/COMMIT
+//             -> WAIT_COMMIT -> INJECTING
 //
-// It learns the target report's addressing (interface / endpoint / report_id /
-// length) and the descriptor generation from an observed REPORT_FRAGMENT rather
-// than hardcoding them, uploads a fixed boot-mouse field map (X at byte 1, Y at
-// byte 2 -- the standard [buttons, X, Y, wheel] layout), waits for the FPGA's
-// MAP_STATUS to confirm the commit, then emits RELATIVE motion to fight the
-// physical device. Everything here is portable and MMIO-free; link.c calls
-// inj_session_fill_tx() when it would otherwise stage an IDLE slot, and feeds
-// observed telemetry in through the observe_* entry points.
+// The map is COMPILED from the device's own report descriptor, never assumed.
+// Enumeration accepts any HID device, and a fixed boot-mouse map laid over a
+// keyboard types keys, over a game pad moves a stick, and over a report-ID or
+// 16-bit mouse lands in the wrong bytes. The foreground compiles each
+// interface's descriptor (hid_mouse_layout.c) and offers the verdict here; only
+// an interface inside a Generic Desktop / Mouse application ever gets a map. A
+// device with none ends in NO_MOUSE, which kmcmd reports as `nomouse`.
 //
-// The injected motion is intentionally static (a steady counter-drift, tunable
-// below): the goal of this first milestone is to prove injection reaches live
-// traffic, not to servo the cursor, and a fixed value keeps the effect and the
-// tests deterministic.
+// Addressing the descriptor cannot supply -- the endpoint, and the length the
+// device actually sends -- is learned from the first matching REPORT_FRAGMENT.
+// Everything here is portable and MMIO-free; link.c calls inj_session_fill_tx()
+// when it would otherwise stage an IDLE slot, and feeds observed telemetry in
+// through the observe_* entry points.
+//
+// The injected drift is intentionally static (a steady counter-drift, tunable
+// below): it proves injection reaches live traffic, and a fixed value keeps the
+// effect and the tests deterministic.
 
 #ifndef INJ_SESSION_H
 #define INJ_SESSION_H
@@ -29,10 +34,20 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "hid_mouse_layout.h"
 #include "injection_wire.h"
 
-// The fixed boot-mouse map has two injected axes, X then Y.
-#define INJ_SESSION_MAP_ENTRIES 2u
+// How long descriptor traffic must be quiet, in retired slots (~8 kHz, so
+// ~64 ms), before a device whose every completed descriptor was judged "not a
+// mouse" is declared NO_MOUSE. The FPGA sends no "export finished" marker, and a
+// composite device's mouse descriptor may still be in flight behind its
+// keyboard's; declaring earlier would answer `nomouse` for a mouse.
+#define INJ_SESSION_SETTLE_SLOTS 512u
+
+// How long to wait for the FPGA's MAP_STATUS after MAP_COMMIT, in retired
+// slots (~0.5 s). It normally answers within a few slots; a lost status frame
+// would otherwise park the session in WAIT_COMMIT until the link dropped.
+#define INJ_SESSION_COMMIT_TIMEOUT_SLOTS 4096u
 
 // Steady injected deltas, added to every targeted report's X/Y: a slow
 // up-and-left drift laid over the test mouse's motion. Additive with per-field
@@ -57,24 +72,47 @@
 #define INJ_SESSION_REQ_PHYSICAL_MASK 3u
 
 typedef enum {
-    INJ_PHASE_WAIT_LINK = 0,  // Transport down; nothing to send.
-    INJ_PHASE_WAIT_REPORT,    // Up; learning addressing from a REPORT_FRAGMENT.
-    INJ_PHASE_SEND_BEGIN,     // Next fill emits MAP_BEGIN.
-    INJ_PHASE_SEND_ENTRY,     // Next fill emits the entry at entry_cursor.
-    INJ_PHASE_SEND_COMMIT,    // Next fill emits MAP_COMMIT.
-    INJ_PHASE_WAIT_COMMIT,    // Awaiting MAP_STATUS commit acceptance.
-    INJ_PHASE_INJECTING,      // Emitting RELATIVE motion.
+    INJ_PHASE_WAIT_LINK = 0,   // Transport down; nothing to send.
+    INJ_PHASE_WAIT_DESCRIPTOR, // Up; no mouse layout offered yet, verdict pending.
+    INJ_PHASE_NO_MOUSE,        // Every completed descriptor judged; none injectable.
+    INJ_PHASE_WAIT_REPORT,     // Layout adopted; waiting for one of its reports.
+    INJ_PHASE_SEND_BEGIN,      // Next fill emits MAP_BEGIN.
+    INJ_PHASE_SEND_ENTRY,      // Next fill emits the entry at entry_cursor.
+    INJ_PHASE_SEND_COMMIT,     // Next fill emits MAP_COMMIT.
+    INJ_PHASE_WAIT_COMMIT,     // Awaiting MAP_STATUS commit acceptance.
+    INJ_PHASE_INJECTING,       // Emitting RELATIVE motion.
 } inj_phase_t;
 
 typedef struct {
     inj_phase_t phase;
 
-    // Learned from the first usable REPORT_FRAGMENT.
+    // The device the session is working against. A DESCRIPTOR_FRAGMENT of
+    // another generation means it re-enumerated: everything learned is dropped.
+    // Reports of another generation are ignored (see adopt_generation).
     uint16_t descriptor_generation;
+    bool have_generation;
+
+    // The adopted mouse layout and the interface it came from. Composite
+    // devices: the FIRST interface offered with a mouse layout wins.
+    hid_mouse_layout_t layout;
+    bool have_layout;
+    // Descriptor-set slots (hid_descriptor_set.h), not interface numbers:
+    uint8_t complete_mask;  // slots whose descriptor completed this generation
+    uint8_t judged_mask;    // ... and have been offered a verdict
+    uint16_t settle_slots;  // quiet descriptor traffic, while WAIT_DESCRIPTOR
+    uint16_t commit_wait_slots;  // time in WAIT_COMMIT
+    bool no_mouse_verdict;  // NO_MOUSE was reached this generation; kept across link drops
+
+    // Addressing of the target report: the interface the layout came from, and
+    // the endpoint its report was seen on (the descriptor does not say). The
+    // report ID is the layout's.
     uint8_t interface_number;
     uint8_t endpoint_number;
-    uint8_t report_id;
-    uint8_t report_length;
+
+    // The map being uploaded, built once per attempt (and its CRC with it).
+    inj_map_entry_payload_t entries[HID_MOUSE_MAX_FIELDS];
+    uint8_t entry_count;
+    uint32_t entries_crc32;
 
     // Map identity. map_generation is what we propose; it increments on every
     // (re)attempt so a retry can never be mistaken for the rejected map.
@@ -122,24 +160,57 @@ typedef struct {
     // Diagnostics (monotonic; cleared only by init).
     uint32_t requests_sent;
     uint32_t requests_refused;
-
-    // Diagnostics (monotonic; cleared only by init).
     uint32_t maps_committed;
     uint32_t map_rejections;
     uint32_t relatives_sent;
+    // The device's report was a different length from its descriptor's figure:
+    // adopted when it still reaches every mapped field, refused otherwise. The
+    // FPGA binds a layout only on an exact length match, so a silent mismatch
+    // would be a map that commits and never applies.
+    uint32_t length_overrides;
+    uint32_t length_conflicts;
+    // Requested wheel/pan components dropped because the mouse has no such axis.
+    uint32_t axis_drops;
+    // BUTTON_STATE / PHYSICAL_MASK requests dropped because the layout maps no
+    // buttons.
+    uint32_t button_drops;
+    // MAP_COMMITs abandoned for want of a MAP_STATUS.
+    uint32_t commit_timeouts;
 } inj_session_t;
 
 // Reset to WAIT_LINK and load the default pattern/pacing.
 void inj_session_init(inj_session_t *s);
 
-// Transport up/down, driven from link.c's mcu_ready. A rising edge arms map
-// upload (WAIT_REPORT); a falling edge drops all learned state back to
-// WAIT_LINK, since the FPGA tears its session and RX window down with the link.
+// Transport up/down, driven from link.c's mcu_ready. A falling edge returns to
+// WAIT_LINK and voids everything tied to the FPGA's session (map, sequences,
+// queued request), since the FPGA tears both down with the link. The layout and
+// the NO_MOUSE verdict are kept: the FPGA re-exports the same generation's
+// descriptors on link-up, which are not new completions and are never
+// re-judged. A rising edge resumes at WAIT_REPORT, NO_MOUSE or WAIT_DESCRIPTOR.
 void inj_session_set_link(inj_session_t *s, bool up);
 
 // Feed one observed FPGA->MCU telemetry frame. Non-matching phases ignore it.
 void inj_session_observe_report(inj_session_t *s, const inj_report_fragment_payload_t *frag);
 void inj_session_observe_map_status(inj_session_t *s, const inj_map_status_payload_t *status);
+
+// One DESCRIPTOR_FRAGMENT was retired (ISR context) into descriptor-set slot
+// `slot`. `complete_edge` is true when it completed that slot's descriptor
+// (hid_descriptor_set_push()).
+void inj_session_observe_descriptor(inj_session_t *s, uint16_t generation, uint8_t slot,
+                                    bool complete_edge);
+
+// Reconcile with what the descriptor set holds for `generation` (foreground,
+// masked): `complete_now` has bit i set when slot i's descriptor is complete.
+// A slot that is no longer complete stops counting as one the verdict must
+// wait for, and loses any judgement it had.
+void inj_session_sync_descriptors(inj_session_t *s, uint16_t generation, uint8_t complete_now);
+
+// The foreground's verdict on one slot's compiled descriptor, which belongs to
+// interface `interface_number`; call it with the retirement ISR masked.
+// `layout` is NULL for "not injectable". A verdict for any generation but the
+// current one is stale and ignored.
+void inj_session_offer_layout(inj_session_t *s, uint16_t generation, uint8_t slot,
+                              uint8_t interface_number, const hid_mouse_layout_t *layout);
 
 // Stage the next TX slot. Returns true and writes a command frame into `slot`
 // when the session has one to send this slot; returns false when the caller
@@ -148,9 +219,11 @@ bool inj_session_fill_tx(inj_session_t *s, uint8_t slot[INJ_FRAME_SIZE]);
 
 // Queue one one-shot RELATIVE, to be emitted on the next TX slot ahead of the
 // paced drift. Each argument is added to whatever the physical device reports
-// on the same report, and the injected field's logical range is +/-127 -- an
-// out-of-range sum is REJECTED by the engine and the report passes through
-// unmodified, so an oversized value does not clip, it vanishes. Callers must
+// on the same report, within the mapped field's logical range (at least
+// +/-127 for X/Y, see hid_mouse_layout.c) -- an out-of-range sum is REJECTED by
+// the engine and the report passes through unmodified, so an oversized value
+// does not clip, it vanishes. A wheel or pan the mouse does not have is dropped
+// at emission and counted in axis_drops. Callers must
 // therefore split a large displacement into bounded steps; kmcmd.h explains the
 // step cap it uses and why.
 //
@@ -194,6 +267,12 @@ void inj_session_set_drift(inj_session_t *s, int16_t x, int16_t y);
 static inline inj_phase_t inj_session_phase(const inj_session_t *s)
 {
     return s->phase;
+}
+
+// The attached device is known to have nothing to inject into.
+static inline bool inj_session_no_mouse(const inj_session_t *s)
+{
+    return s->phase == INJ_PHASE_NO_MOUSE;
 }
 
 #endif  // INJ_SESSION_H

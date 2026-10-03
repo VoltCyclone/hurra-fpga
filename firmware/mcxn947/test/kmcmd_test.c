@@ -45,6 +45,7 @@ static uint32_t g_physical_masks[SINK_MAX];
 static uint32_t g_physical_count;
 
 static bool g_ready;
+static bool g_no_mouse;
 // Number of further sink calls that will be refused. The sink is allowed to
 // refuse, exactly as the console's writer is: the FPGA has a one-deep command
 // queue, so "not now" is a normal answer and must not be retried in a spin.
@@ -92,6 +93,12 @@ static bool sink_ready(void *ctx)
     return g_ready;
 }
 
+static bool sink_no_mouse(void *ctx)
+{
+    (void)ctx;
+    return g_no_mouse;
+}
+
 static char g_reply[KMCMD_REPLY_MAX];
 
 static void setup(void)
@@ -104,6 +111,7 @@ static void setup(void)
     memset(g_physical_masks, 0, sizeof(g_physical_masks));
     g_physical_count = 0u;
     g_ready = true;
+    g_no_mouse = false;
     g_refuse_after = 0xFFFFFFFFu;
     memset(g_reply, 0, sizeof(g_reply));
 
@@ -112,6 +120,7 @@ static void setup(void)
         .buttons = sink_buttons,
         .physical_mask = sink_physical_mask,
         .ready = sink_ready,
+        .no_mouse = sink_no_mouse,
         .ctx = NULL,
     };
     kmcmd_init(&ops);
@@ -340,6 +349,46 @@ static void test_move_is_refused_when_only_buttons_are_wired(void)
     assert(kmcmd_line("km.move(10,10)", reply, sizeof(reply)) == KMCMD_HANDLED);
     assert(strstr(reply, "!") != NULL);
     assert(kmcmd_pending_counts() == 0u);
+}
+
+// A keyboard or a pad on TARGET: every mouse command is refused as `nomouse`,
+// and that beats `notready` -- waiting will not make a keyboard a mouse. Nothing
+// is queued, so no budget survives to land later.
+static void test_mouse_commands_are_refused_on_a_device_with_no_mouse(void)
+{
+    setup();
+    g_no_mouse = true;
+    g_ready = false;
+
+    const char *commands[] = {
+        "km.move(10,10)", "km.wheel(1)", "km.left(1)", "km.click(1)", "km.lock_ml(1)",
+    };
+    for (size_t i = 0u; i < sizeof(commands) / sizeof(commands[0]); ++i) {
+        assert(line(commands[i]) == KMCMD_HANDLED);
+        assert(replied("nomouse"));
+    }
+    assert(kmcmd_pending_counts() == 0u);
+    drain();
+    assert(g_step_count == 0u && g_mask_count == 0u && g_physical_count == 0u);
+}
+
+// An unwired op still says `nosink`: that is a build problem, and the more
+// specific answer.
+static void test_nosink_beats_nomouse(void)
+{
+    char reply[KMCMD_REPLY_MAX];
+    const kmcmd_ops_t buttons_only = {
+        .buttons = sink_buttons,
+        .ready = sink_ready,
+        .no_mouse = sink_no_mouse,
+    };
+    g_no_mouse = true;
+    kmcmd_init(&buttons_only);
+    kmcmd_set_mode(KMCMD_MODE_MAKCU);
+    memset(reply, 0, sizeof(reply));
+    assert(kmcmd_line("km.move(10,10)", reply, sizeof(reply)) == KMCMD_HANDLED);
+    assert(strstr(reply, "nosink") != NULL);
+    g_no_mouse = false;
 }
 
 // kmcmd_pending() answers yes/no, which cannot distinguish a budget that is
@@ -866,6 +915,8 @@ int main(void)
 
     test_large_move_is_split_and_sums_exactly();
     test_move_is_refused_when_only_buttons_are_wired();
+    test_mouse_commands_are_refused_on_a_device_with_no_mouse();
+    test_nosink_beats_nomouse();
     test_pending_counts_tracks_the_undrained_budget();
     test_step_emits_at_most_one_relative_per_call();
     test_small_move_is_one_step();

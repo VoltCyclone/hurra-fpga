@@ -4,15 +4,26 @@ from amaranth import Array, Elaboratable, Module, Mux, Signal
 from amaranth.lib.memory import Memory
 from luna.gateware.stream import StreamInterface
 
-from .descriptors import MAX_PACKET_SIZE, RELAY_ENDPOINT_NUMBERS
+from .descriptors import MAX_ENDPOINTS, MAX_PACKET_SIZE, UNMATCHABLE_ENDPOINT_NUMBER
 
-__all__ = ["ReportRelay"]
+__all__ = ["PARKED_SLOT_NUMBERS", "ReportRelay"]
+
+#: Every slot parked: what a relay nobody binds serves, which is nothing.
+PARKED_SLOT_NUMBERS = (UNMATCHABLE_ENDPOINT_NUMBER,) * MAX_ENDPOINTS
 
 
 class ReportRelay(Elaboratable):
+    """One queue per relay slot, each serving the endpoint number it is bound to.
+
+    ``slot_numbers`` are runtime inputs: the clone binds each slot to a captured
+    endpoint's number, 1..15, and parks the rest on UNMATCHABLE_ENDPOINT_NUMBER.
+    ``initial_slot_numbers`` sets only their reset values, which is what a relay
+    nobody drives serves.
+    """
+
     def __init__(
         self,
-        endpoint_numbers=RELAY_ENDPOINT_NUMBERS,
+        initial_slot_numbers=PARKED_SLOT_NUMBERS,
         fifo_depth: int = 128,
         max_report_bytes: int = MAX_PACKET_SIZE,
     ):
@@ -21,7 +32,10 @@ class ReportRelay(Elaboratable):
                 f"fifo_depth {fifo_depth} cannot hold a whole {max_report_bytes}-byte report; "
                 "whole-report admission would refuse every report"
             )
-        self.endpoint_numbers = tuple(endpoint_numbers)
+        self.slot_numbers = [
+            Signal(5, init=number, name=f"slot_number_{slot}")
+            for slot, number in enumerate(initial_slot_numbers)
+        ]
         self._fifo_depth = fifo_depth
         self._max_report_bytes = max_report_bytes
 
@@ -36,7 +50,12 @@ class ReportRelay(Elaboratable):
         self.unmatched_report = Signal()
         self.congested_report = Signal()
 
-        self.streams = [StreamInterface() for _ in self.endpoint_numbers]
+        #: Empty every queue and drop the report in flight through its last
+        #: byte: a new PC session must not be served the last one's reports.
+        #: Neither is counted as a drop -- they belong to no session.
+        self.flush = Signal()
+
+        self.streams = [StreamInterface() for _ in self.slot_numbers]
 
     def elaborate(self, platform):
         del platform
@@ -53,7 +72,7 @@ class ReportRelay(Elaboratable):
         head_valids = []
         dequeues = []
         admit = []
-        for index, _epnum in enumerate(self.endpoint_numbers):
+        for index in range(len(self.slot_numbers)):
             memory = Memory(
                 shape=9,
                 depth=self._fifo_depth,
@@ -81,14 +100,15 @@ class ReportRelay(Elaboratable):
             # for a whole report at its first byte.
             admit.append(levels[index] + self._max_report_bytes <= self._fifo_depth)
 
-        # Select the target queue by matching endpoint number.
-        selected = Signal(range(len(self.endpoint_numbers)))
+        # Select the target queue by matching endpoint number. The enumerator
+        # refuses a duplicate number, so at most one slot matches.
+        selected = Signal(range(len(self.slot_numbers)))
         matched = Signal()
         default_index = 0
         sel_expr = default_index
         match_expr = 0
-        for index, epnum in enumerate(self.endpoint_numbers):
-            is_match = self.report_endpoint == epnum
+        for index, number in enumerate(self.slot_numbers):
+            is_match = self.report_endpoint == number
             sel_expr = Mux(is_match, index, sel_expr)
             match_expr = match_expr | is_match
         m.d.comb += [selected.eq(sel_expr), matched.eq(match_expr)]
@@ -96,7 +116,7 @@ class ReportRelay(Elaboratable):
         # Per-bucket admission state. The extra bucket absorbs reports for
         # endpoint numbers this relay does not serve, so an unmatched report
         # cannot be mistaken for a continuation of a matched one.
-        buckets = len(self.endpoint_numbers) + 1
+        buckets = len(self.slot_numbers) + 1
         bucket = Mux(matched, selected, buckets - 1)
         in_report = Array([Signal(name=f"in_report_{index}") for index in range(buckets)])
         accepting = Array([Signal(name=f"accepting_{index}") for index in range(buckets)])
@@ -120,6 +140,10 @@ class ReportRelay(Elaboratable):
             # report's remaining bytes are not each re-evaluated as a fresh
             # report start.
             m.d.usb += in_report[bucket].eq(~self.report_last)
+        # Overrides the admission above. ``in_report`` keeps tracking, so the
+        # in-flight report's tail is dropped rather than taken for a new start.
+        with m.If(self.flush):
+            m.d.usb += [accepting[index].eq(0) for index in range(buckets)]
 
         # Write and read sides remain fully independent across endpoints.
         for index, stream in enumerate(self.streams):
@@ -162,5 +186,13 @@ class ReportRelay(Elaboratable):
                 m.d.usb += levels[index].eq(levels[index] + 1)
             with m.Elif(dequeues[index] & ~enqueue):
                 m.d.usb += levels[index].eq(levels[index] - 1)
+
+            with m.If(self.flush):
+                m.d.usb += [
+                    read_pointers[index].eq(0),
+                    write_pointers[index].eq(0),
+                    levels[index].eq(0),
+                    head_valids[index].eq(0),
+                ]
 
         return m

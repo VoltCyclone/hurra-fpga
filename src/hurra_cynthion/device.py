@@ -1,10 +1,15 @@
 """AUX-side USB device that clones the captured mouse and relays its reports."""
 
-from amaranth import Cat, Elaboratable, Module, Signal
+from amaranth import Cat, Elaboratable, Module, Mux, ResetInserter, Signal
 from luna.gateware.usb.usb2.device import USBDevice
-from luna.gateware.usb.usb2.endpoints.stream import USBStreamInEndpoint
+from luna.gateware.usb.usb2.endpoints.stream import USBStreamInEndpoint, USBStreamOutEndpoint
 
-from .descriptors import DESCRIPTOR_ENTRY_COUNT, MAX_PACKET_SIZE, RELAY_ENDPOINT_NUMBERS
+from .descriptors import (
+    DESCRIPTOR_ENTRY_COUNT,
+    MAX_ENDPOINTS,
+    MAX_PACKET_SIZE,
+    UNMATCHABLE_ENDPOINT_NUMBER,
+)
 from .device_control import ClonedStandardRequestHandler, HIDClassRequestHandler
 from .relay import ReportRelay
 
@@ -154,6 +159,24 @@ class DescriptorStoreCopyEngine(Elaboratable):
         return m
 
 
+class _RelayInEndpoint(USBStreamInEndpoint):
+    """LUNA's IN stream endpoint, returned whole to its initial state by ``reset``.
+
+    As for ``_RelayOutEndpoint``: USB requires DATA0 after a bus reset and after
+    SET_CONFIGURATION [USB2.0 9.1.1.5, 9.4.5], and LUNA resets the toggle only
+    on ClearFeature(ENDPOINT_HALT). The reset also empties the transfer
+    manager's packet buffers, which fill from the relay whether or not the PC
+    is polling -- and the PC polls nothing until it configures the clone.
+    """
+
+    def __init__(self, *, endpoint_number: Signal, max_packet_size: int) -> None:
+        super().__init__(endpoint_number=endpoint_number, max_packet_size=max_packet_size)
+        self.reset = Signal()
+
+    def elaborate(self, platform):
+        return ResetInserter({"usb": self.reset})(super().elaborate(platform))
+
+
 #: One distinct subclass per relay endpoint, so that synthesis is reproducible.
 #:
 #: LUNA names endpoint submodules after their class, and falls back to
@@ -161,7 +184,7 @@ class DescriptorStoreCopyEngine(Elaboratable):
 #: class (``luna/gateware/usb/usb2/device.py``). ``id()`` is an object address,
 #: so every build emitted different instance names, a different RTLIL, and --
 #: because yosys cell naming feeds abc9's cut selection -- a different netlist.
-#: All four relay endpoints share a base class, so three of the four were named
+#: Every relay endpoint shares a base class, so all but the first were named
 #: this way.
 #:
 #: That is not cosmetic here. Measured 2026-09-15: two builds from identical
@@ -173,11 +196,47 @@ class DescriptorStoreCopyEngine(Elaboratable):
 #: one throwaway netlist.
 #:
 #: Giving each endpoint its own class keeps LUNA on its stable-name path;
-#: the endpoints are otherwise unmodified.
-_RELAY_ENDPOINT_CLASSES = {
-    epnum: type(f"USBStreamInEndpoint{epnum}", (USBStreamInEndpoint,), {})
-    for epnum in RELAY_ENDPOINT_NUMBERS
-}
+#: they differ from LUNA's only by ``_RelayInEndpoint``'s reset. One class per
+#: relay SLOT: a slot's endpoint number is bound at runtime (see
+#: MouseCloneDevice), so the classes no longer carry one.
+_RELAY_ENDPOINT_CLASSES = tuple(
+    type(f"USBStreamInEndpointSlot{slot}", (_RelayInEndpoint,), {}) for slot in range(MAX_ENDPOINTS)
+)
+
+
+class _RelayOutEndpoint(USBStreamOutEndpoint):
+    """LUNA's OUT stream endpoint on a runtime endpoint number.
+
+    LUNA reads ``_endpoint_number`` only in two Amaranth ``==`` comparisons
+    (the token's endpoint, and ClearFeature(ENDPOINT_HALT)'s), so a Signal
+    serves as well as an int -- for its IN endpoints too, which are bound the
+    same way. The clone learns its number from the captured device, after
+    elaboration.
+
+    Exactly one instance of this distinct class exists, which keeps LUNA on its
+    stable class-name path; see ``_RELAY_ENDPOINT_CLASSES``.
+
+    ``reset`` returns the whole endpoint -- expected data toggle and FIFO -- to
+    its initial state. LUNA resets the toggle only on ClearFeature(ENDPOINT_HALT),
+    but USB requires DATA0 after a bus reset and after SET_CONFIGURATION
+    [USB2.0 9.1.1.5, 9.4.5]. Without it, a session that ended on the odd toggle
+    made the PC's first OUT of the next one look like a resend: ACKed, and
+    silently discarded.
+
+    The reset is applied inside ``elaborate`` rather than by wrapping the
+    instance, so USBDevice still finds ``.interface`` and still names the
+    submodule after this class.
+    """
+
+    def __init__(self, *, endpoint_number: Signal) -> None:
+        # max_packet_size is the relay's bound, not the device's
+        # wMaxPacketSize: LUNA marks ``last`` only on a short packet, and the
+        # writer frames a full one by its own count.
+        super().__init__(endpoint_number=endpoint_number, max_packet_size=MAX_PACKET_SIZE)
+        self.reset = Signal()
+
+    def elaborate(self, platform):
+        return ResetInserter({"usb": self.reset})(super().elaborate(platform))
 
 
 class MouseCloneDevice(Elaboratable):
@@ -188,9 +247,14 @@ class MouseCloneDevice(Elaboratable):
     change output.
     """
 
-    def __init__(self, bus, store):
+    def __init__(self, bus, store, control_relay=None):
         self._bus = bus
         self.store = store
+        # The host-side ControlRelay that forwards HID class control requests
+        # to the real device on TARGET. None keeps the relay-less behaviour
+        # (STALL unknown class requests), which the diagnostic tops use.
+        # Distinct from ``self.relay`` below, which relays *reports*.
+        self.control_relay = control_relay
 
         self.connect = Signal()
         self.configured = Signal()
@@ -233,11 +297,55 @@ class MouseCloneDevice(Elaboratable):
         self.report_endpoint = Signal(4)
         self.report_ready = Signal()
 
-        self.relay = ReportRelay(endpoint_numbers=RELAY_ENDPOINT_NUMBERS)
+        # The real device's bMaxPacketSize0, from the host's enumerator.
+        #
+        # The clone serves that device's descriptor verbatim, byte 7 included,
+        # so the PC splits every EP0 data stage at this size and a longer
+        # packet is babble. Both control handlers packetise their IN data at
+        # it. Unconnected, it keeps the fixed 64 used before it existed.
+        self.ep0_max_packet = Signal(7, init=MAX_PACKET_SIZE)
+        # Registered and legalised copy the handlers actually use. Registering
+        # keeps the legality check -- and the wire from the host side of the
+        # die -- out of the handlers' packet arithmetic; the value only
+        # changes before the clone connects.
+        self._ep0_mps = Signal(7, init=MAX_PACKET_SIZE)
 
-        self._std_handler = ClonedStandardRequestHandler(
-            self.store, max_packet_size=MAX_PACKET_SIZE
-        )
+        # The four relay IN endpoints' numbers: the captured device's IN
+        # endpoints, slot k serving ``in_endpoint_number[k]`` for every
+        # k < ``in_endpoint_count``. Unbound slots are parked where they answer
+        # nothing. Registered before use, like the OUT endpoint's below.
+        self.in_endpoint_count = Signal(range(MAX_ENDPOINTS + 1))
+        self.in_endpoint_number = [
+            Signal(4, name=f"in_endpoint_number_{slot}") for slot in range(MAX_ENDPOINTS)
+        ]
+        self._in_endpoint_number = [
+            Signal(5, init=UNMATCHABLE_ENDPOINT_NUMBER, name=f"in_endpoint_bound_{slot}")
+            for slot in range(MAX_ENDPOINTS)
+        ]
+
+        # The one relayed interrupt-OUT endpoint, PC -> clone -> real device.
+        #
+        # ``out_present``/``out_endpoint_number`` are the captured device's OUT
+        # endpoint. Absent, or number 0, parks the endpoint where it answers
+        # nothing. Registered before use: they come from the host side of the
+        # die and only change before the clone connects.
+        self.out_present = Signal()
+        self.out_endpoint_number = Signal(4)
+        self._out_endpoint_number = Signal(5, init=UNMATCHABLE_ENDPOINT_NUMBER)
+        #: Registered: the PC bus-reset or (re)configured the clone. Every
+        #: relay endpoint resets on it and the report relay flushes, so a new
+        #: session is served no report queued before it; so must whatever
+        #: downstream holds that PC session's state: the OUT writer's partial
+        #: packet, and a boot protocol the PC left the real device in.
+        self.session_reset = Signal()
+        self.out_valid = Signal()
+        self.out_data = Signal(8)
+        self.out_last = Signal()
+        self.out_ready = Signal()
+
+        self.relay = ReportRelay()
+
+        self._std_handler = ClonedStandardRequestHandler(self.store, max_packet_size=self._ep0_mps)
 
     def elaborate(self, platform):
         del platform
@@ -248,15 +356,58 @@ class MouseCloneDevice(Elaboratable):
 
         control_ep = device.add_control_endpoint()
         control_ep.add_request_handler(self._std_handler)
-        control_ep.add_request_handler(HIDClassRequestHandler())
+        control_ep.add_request_handler(
+            HIDClassRequestHandler(relay=self.control_relay, max_packet_size=self._ep0_mps)
+        )
         setup = self._std_handler.interface.setup
 
-        for index, epnum in enumerate(RELAY_ENDPOINT_NUMBERS):
-            ep = _RELAY_ENDPOINT_CLASSES[epnum](
-                endpoint_number=epnum, max_packet_size=MAX_PACKET_SIZE
+        for slot, endpoint_class in enumerate(_RELAY_ENDPOINT_CLASSES):
+            bound = self._in_endpoint_number[slot]
+            m.d.usb += bound.eq(
+                Mux(
+                    self.in_endpoint_count > slot,
+                    self.in_endpoint_number[slot],
+                    UNMATCHABLE_ENDPOINT_NUMBER,
+                )
             )
+            ep = endpoint_class(endpoint_number=bound, max_packet_size=MAX_PACKET_SIZE)
             device.add_endpoint(ep)
-            m.d.comb += ep.stream.stream_eq(relay.streams[index])
+            m.d.comb += [
+                relay.slot_numbers[slot].eq(bound),
+                ep.stream.stream_eq(relay.streams[slot]),
+                ep.reset.eq(self.session_reset),
+            ]
+
+        out_ep = _RelayOutEndpoint(endpoint_number=self._out_endpoint_number)
+        device.add_endpoint(out_ep)
+        out_number = self.out_endpoint_number
+        m.d.usb += self._out_endpoint_number.eq(
+            Mux(self.out_present & (out_number != 0), out_number, UNMATCHABLE_ENDPOINT_NUMBER)
+        )
+        # Registered: it fans out to every register in the endpoint and its
+        # FIFO, and across the die to the host, and the PC cannot send another
+        # OUT within a cycle of either event anyway.
+        m.d.usb += self.session_reset.eq(
+            device.reset_detected | self._std_handler.interface.config_changed
+        )
+        m.d.comb += [
+            relay.flush.eq(self.session_reset),
+            out_ep.reset.eq(self.session_reset),
+            self.out_valid.eq(out_ep.stream.valid),
+            self.out_data.eq(out_ep.stream.payload),
+            self.out_last.eq(out_ep.stream.last),
+            out_ep.stream.ready.eq(self.out_ready),
+        ]
+
+        # The enumerator already refuses any other value; this is defence in
+        # depth. 0 would never end a packet and 12 is no size a host accepts.
+        ep0_legal = (
+            (self.ep0_max_packet == 8)
+            | (self.ep0_max_packet == 16)
+            | (self.ep0_max_packet == 32)
+            | (self.ep0_max_packet == 64)
+        )
+        m.d.usb += self._ep0_mps.eq(Mux(ep0_legal, self.ep0_max_packet, MAX_PACKET_SIZE))
 
         source_mutating = self.store.clear | self.store.capture_start | self.store.capture_busy
         copy_rearm_armed = Signal(init=1)

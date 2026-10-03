@@ -7,6 +7,7 @@ from amaranth import Cat, Const, Elaboratable, Module, Mux, Signal, signed
 from amaranth.lib.data import StructLayout, unsigned
 from amaranth.lib.memory import Memory
 
+from .descriptors import MAX_ENDPOINT_NUMBER
 from .injection_wire import (
     INJ_CLEAR_FLAG_BUTTONS,
     INJ_CLEAR_FLAG_MOTION,
@@ -88,6 +89,12 @@ class ReportInjectionEngine(Elaboratable):
         # report admission rather than elapsed SOFs.
         self.sof_tick = Signal()
         self.accepted_report_count = Signal(32)
+
+        #: Bit n: endpoint number n's interface is in boot protocol, so its
+        #: reports are in the boot layout, not the one the map describes.
+        #: Registered at the plane edge. Such reports pass through untouched,
+        #: are never queried against the map, and get no stationary reports.
+        self.boot_protocol = Signal(MAX_ENDPOINT_NUMBER + 1)
 
         # Decoded relative command.
         self.relative_valid = Signal()
@@ -197,6 +204,7 @@ class ReportInjectionEngine(Elaboratable):
         captured_first_byte = Signal(8)
         captured_interface = Signal(8)
         captured_endpoint = Signal(4)
+        captured_boot = Signal()
         selected_report_id = Signal(8)
         layout_query_report_id = Signal(8)
         snapshot_descriptor_generation = Signal(16)
@@ -234,6 +242,7 @@ class ReportInjectionEngine(Elaboratable):
         stationary_predicate_index_q = Signal(range(layout_count))
         stationary_predicate_interface_q = Signal(8)
         stationary_predicate_endpoint_q = Signal(4)
+        stationary_predicate_boot_q = Signal()
         stationary_predicate_report_id_q = Signal(8)
         stationary_predicate_report_length_q = Signal(7)
 
@@ -390,6 +399,12 @@ class ReportInjectionEngine(Elaboratable):
         transaction_mapped = Signal()
         transaction_invalidated = Signal()
         transaction_sequence = Signal(16)
+        # command_overflow counts a cycle after the commit that overflowed. It
+        # is a diagnostic, and its 32-bit clock enable, driven straight off the
+        # live commit_allowed (and so off the map store's bank select), was the
+        # critical path on 5 of 12 seeds.
+        overflow_committed = Signal()
+        m.d.usb += overflow_committed.eq(0)
         output_started = Signal()
         emit_native = Signal()
         deferred_sof = Signal()
@@ -427,9 +442,29 @@ class ReportInjectionEngine(Elaboratable):
             0,
         )
 
-        clear_motion = self.clear_valid & ((self.clear_flags & INJ_CLEAR_FLAG_MOTION) != 0)
-        clear_buttons = self.clear_valid & ((self.clear_flags & INJ_CLEAR_FLAG_BUTTONS) != 0)
-        clear_masks = self.clear_valid & ((self.clear_flags & INJ_CLEAR_FLAG_PHYSICAL_MASKS) != 0)
+        # The command decisions PREPARE builds a transaction from, registered
+        # one state earlier in BASE_CAPTURE. Taken live, each ran from the
+        # plane's RX staging (rx_staged_type -> *_valid -> three address
+        # compares -> command mask -> the 33-bit candidate adder -> overflow
+        # select) into working_* -- the critical path on 5 of 12 seeds. The
+        # plane holds a command until its *_ready, and every *_ready is tied to
+        # the transaction_* flags registered from these same decisions, so a
+        # command that arrives between the two states simply waits for the next
+        # report, exactly as one arriving a cycle after PREPARE always did.
+        relative_targets_q = Signal()
+        relative_flags_q = Signal.like(self.relative_flags)
+        button_targets_q = Signal()
+        mask_targets_q = Signal()
+        clear_valid_q = Signal()
+        clear_flags_q = Signal.like(self.clear_flags)
+        command_x_q = Signal.like(self.relative_x)
+        command_y_q = Signal.like(self.relative_y)
+        command_wheel_q = Signal.like(self.relative_wheel)
+        command_pan_q = Signal.like(self.relative_pan)
+
+        clear_motion = clear_valid_q & ((clear_flags_q & INJ_CLEAR_FLAG_MOTION) != 0)
+        clear_buttons = clear_valid_q & ((clear_flags_q & INJ_CLEAR_FLAG_BUTTONS) != 0)
+        clear_masks = clear_valid_q & ((clear_flags_q & INJ_CLEAR_FLAG_PHYSICAL_MASKS) != 0)
 
         command_x = Mux(
             relative_targets_report & ((self.relative_flags & INJ_RELATIVE_FLAG_X) != 0),
@@ -472,16 +507,18 @@ class ReportInjectionEngine(Elaboratable):
         minimum_residual = Const(-(1 << 31), signed(33))
         maximum_residual = Const((1 << 31) - 1, signed(33))
         m.d.comb += [
-            candidate_x.eq(Mux(clear_motion, command_x, captured_x + command_x)),
-            candidate_y.eq(Mux(clear_motion, command_y, captured_y + command_y)),
-            candidate_wheel.eq(Mux(clear_motion, command_wheel, captured_wheel + command_wheel)),
-            candidate_pan.eq(Mux(clear_motion, command_pan, captured_pan + command_pan)),
+            candidate_x.eq(Mux(clear_motion, command_x_q, captured_x + command_x_q)),
+            candidate_y.eq(Mux(clear_motion, command_y_q, captured_y + command_y_q)),
+            candidate_wheel.eq(
+                Mux(clear_motion, command_wheel_q, captured_wheel + command_wheel_q)
+            ),
+            candidate_pan.eq(Mux(clear_motion, command_pan_q, captured_pan + command_pan_q)),
             candidate_buttons.eq(
                 Mux(
                     clear_buttons,
-                    Mux(button_targets_report, self.button_buttons, 0),
+                    Mux(button_targets_q, self.button_buttons, 0),
                     Mux(
-                        button_targets_report,
+                        button_targets_q,
                         self.button_buttons,
                         Mux(captured_click_release_due, 0, captured_buttons),
                     ),
@@ -490,30 +527,30 @@ class ReportInjectionEngine(Elaboratable):
             candidate_mask.eq(
                 Mux(
                     clear_masks,
-                    Mux(mask_targets_report, self.mask_buttons, 0),
-                    Mux(mask_targets_report, self.mask_buttons, captured_mask),
+                    Mux(mask_targets_q, self.mask_buttons, 0),
+                    Mux(mask_targets_q, self.mask_buttons, captured_mask),
                 )
             ),
         ]
-        relative_overflow = relative_targets_report & (
+        relative_overflow = relative_targets_q & (
             (
-                ((self.relative_flags & INJ_RELATIVE_FLAG_X) != 0)
+                ((relative_flags_q & INJ_RELATIVE_FLAG_X) != 0)
                 & ((candidate_x < minimum_residual) | (candidate_x > maximum_residual))
             )
             | (
-                ((self.relative_flags & INJ_RELATIVE_FLAG_Y) != 0)
+                ((relative_flags_q & INJ_RELATIVE_FLAG_Y) != 0)
                 & ((candidate_y < minimum_residual) | (candidate_y > maximum_residual))
             )
             | (
-                ((self.relative_flags & INJ_RELATIVE_FLAG_WHEEL) != 0)
+                ((relative_flags_q & INJ_RELATIVE_FLAG_WHEEL) != 0)
                 & ((candidate_wheel < minimum_residual) | (candidate_wheel > maximum_residual))
             )
             | (
-                ((self.relative_flags & INJ_RELATIVE_FLAG_PAN) != 0)
+                ((relative_flags_q & INJ_RELATIVE_FLAG_PAN) != 0)
                 & ((candidate_pan < minimum_residual) | (candidate_pan > maximum_residual))
             )
         )
-        relative_admitted = relative_targets_report & ~relative_overflow
+        relative_admitted = relative_targets_q & ~relative_overflow
 
         state_write_click_active = Signal()
         selected_state_mask = Const(1, layout_count) << selected_state
@@ -721,6 +758,9 @@ class ReportInjectionEngine(Elaboratable):
                         captured_first_byte.eq(self.report_data),
                         captured_interface.eq(self.report_interface),
                         captured_endpoint.eq(self.report_endpoint),
+                        # Latched once per report, so one in flight as the
+                        # device changes protocol is wholly one or the other.
+                        captured_boot.eq((self.boot_protocol >> self.report_endpoint)[0]),
                         transaction_stationary.eq(0),
                     ]
                     with m.If(self.report_last):
@@ -777,15 +817,26 @@ class ReportInjectionEngine(Elaboratable):
                     stationary_predicate_index_q.eq(stationary_scan_index),
                     stationary_predicate_interface_q.eq(state_record.interface_number),
                     stationary_predicate_endpoint_q.eq(state_record.endpoint_number),
+                    # The record's number is a map entry's u8; only 1..15
+                    # can name a captured endpoint.
+                    stationary_predicate_boot_q.eq(
+                        (self.boot_protocol >> state_record.endpoint_number[:4])[0]
+                        & (state_record.endpoint_number[4:] == 0)
+                    ),
                     stationary_predicate_report_id_q.eq(state_record.report_id),
                     stationary_predicate_report_length_q.eq(state_record.report_length),
                     stationary_decision_valid.eq(stationary_predicate_valid_q),
                     stationary_decision_pending.eq(
-                        stationary_predicate_motion_q
-                        | stationary_predicate_relative_q
-                        | stationary_predicate_button_q
-                        | stationary_predicate_mask_q
-                        | stationary_predicate_click_q
+                        (
+                            stationary_predicate_motion_q
+                            | stationary_predicate_relative_q
+                            | stationary_predicate_button_q
+                            | stationary_predicate_mask_q
+                            | stationary_predicate_click_q
+                        )
+                        # A report-layout template must not be synthesised
+                        # onto an endpoint sending boot-layout reports.
+                        & ~stationary_predicate_boot_q
                     ),
                     stationary_decision_last.eq(stationary_predicate_last_q),
                     stationary_decision_index.eq(stationary_predicate_index_q),
@@ -864,15 +915,27 @@ class ReportInjectionEngine(Elaboratable):
                         m.next = "QUERY_REPORT_ID_ISSUE"
 
             with m.State("QUERY_REPORT_ID_ISSUE"):
-                m.d.comb += store.query_valid.eq(1)
-                with m.If(store.query_ready):
+                with m.If(captured_boot):
+                    # Passed through native, without ever querying the map:
+                    # nothing in it describes the boot layout.
                     m.d.usb += [
-                        snapshot_descriptor_generation.eq(store.active_descriptor_generation),
-                        snapshot_map_generation.eq(store.active_generation),
-                        snapshot_bank.eq(store.active_bank),
-                        snapshot_entry_count.eq(store.active_entry_count),
+                        output_index.eq(0),
+                        output_started.eq(0),
+                        emit_native.eq(1),
+                        transaction_mapped.eq(0),
+                        selected_state_available.eq(0),
                     ]
-                    m.next = "QUERY_REPORT_ID_WAIT"
+                    m.next = "OUTPUT_PRIME"
+                with m.Else():
+                    m.d.comb += store.query_valid.eq(1)
+                    with m.If(store.query_ready):
+                        m.d.usb += [
+                            snapshot_descriptor_generation.eq(store.active_descriptor_generation),
+                            snapshot_map_generation.eq(store.active_generation),
+                            snapshot_bank.eq(store.active_bank),
+                            snapshot_entry_count.eq(store.active_entry_count),
+                        ]
+                        m.next = "QUERY_REPORT_ID_WAIT"
 
             with m.State("QUERY_REPORT_ID_WAIT"):
                 with m.If(~snapshot_matches):
@@ -974,75 +1037,87 @@ class ReportInjectionEngine(Elaboratable):
                         transaction_button.eq(state_motion_live.bit_select(selected_state, 1)),
                         transaction_mask.eq(state_buttons_live.bit_select(selected_state, 1)),
                         transaction_clear.eq(state_masks_live.bit_select(selected_state, 1)),
+                        relative_targets_q.eq(relative_targets_report),
+                        relative_flags_q.eq(self.relative_flags),
+                        command_x_q.eq(command_x),
+                        command_y_q.eq(command_y),
+                        command_wheel_q.eq(command_wheel),
+                        command_pan_q.eq(command_pan),
+                        button_targets_q.eq(button_targets_report),
+                        mask_targets_q.eq(mask_targets_report),
+                        clear_valid_q.eq(self.clear_valid),
+                        clear_flags_q.eq(self.clear_flags),
                     ]
                     m.next = "PREPARE"
 
             with m.State("PREPARE"):
-                with m.If(~snapshot_matches):
-                    m.next = "ABORT_MUTATION"
-                with m.Else():
-                    m.d.usb += [
-                        working_x.eq(Mux(relative_overflow, captured_x, candidate_x)),
-                        working_y.eq(Mux(relative_overflow, captured_y, candidate_y)),
-                        working_wheel.eq(Mux(relative_overflow, captured_wheel, candidate_wheel)),
-                        working_pan.eq(Mux(relative_overflow, captured_pan, candidate_pan)),
-                        working_buttons.eq(candidate_buttons),
-                        working_mask.eq(candidate_mask),
-                        transaction_relative.eq(relative_targets_report),
-                        transaction_relative_admitted.eq(relative_admitted),
-                        transaction_relative_overflow.eq(relative_overflow),
-                        transaction_button.eq(button_targets_report),
-                        transaction_mask.eq(mask_targets_report),
-                        transaction_clear.eq(self.clear_valid),
-                        transaction_click_release.eq(
+                # No snapshot check here: LOOKUP_WAIT and every state after it
+                # re-check the live snapshot, and the state commit is gated on
+                # ~snapshot_lost. Checking here too put the map store's bank
+                # select (active_bank -> active_* -> snapshot_matches) on the
+                # clock enable of working_*, the other half of that critical path.
+                m.d.usb += [
+                    working_x.eq(Mux(relative_overflow, captured_x, candidate_x)),
+                    working_y.eq(Mux(relative_overflow, captured_y, candidate_y)),
+                    working_wheel.eq(Mux(relative_overflow, captured_wheel, candidate_wheel)),
+                    working_pan.eq(Mux(relative_overflow, captured_pan, candidate_pan)),
+                    working_buttons.eq(candidate_buttons),
+                    working_mask.eq(candidate_mask),
+                    transaction_relative.eq(relative_targets_q),
+                    transaction_relative_admitted.eq(relative_admitted),
+                    transaction_relative_overflow.eq(relative_overflow),
+                    transaction_button.eq(button_targets_q),
+                    transaction_mask.eq(mask_targets_q),
+                    transaction_clear.eq(clear_valid_q),
+                    transaction_click_release.eq(
+                        Mux(
+                            button_targets_q,
+                            (self.button_hold_reports != 0) & (self.button_buttons != 0),
                             Mux(
-                                button_targets_report,
-                                (self.button_hold_reports != 0) & (self.button_buttons != 0),
+                                captured_click_release_due | clear_buttons,
+                                0,
+                                captured_click_active,
+                            ),
+                        )
+                    ),
+                    transaction_invalidated.eq(0),
+                    state_write_click_release_target.eq(
+                        Mux(
+                            button_targets_q,
+                            self.accepted_report_count + self.button_hold_reports,
+                            captured_click_release_target,
+                        )
+                    ),
+                    transaction_sequence.eq(
+                        Mux(
+                            clear_valid_q,
+                            self.clear_command_sequence,
+                            Mux(
+                                mask_targets_q,
+                                self.mask_command_sequence,
                                 Mux(
-                                    captured_click_release_due | clear_buttons,
-                                    0,
-                                    captured_click_active,
-                                ),
-                            )
-                        ),
-                        transaction_invalidated.eq(0),
-                        state_write_click_release_target.eq(
-                            Mux(
-                                button_targets_report,
-                                self.accepted_report_count + self.button_hold_reports,
-                                captured_click_release_target,
-                            )
-                        ),
-                        transaction_sequence.eq(
-                            Mux(
-                                self.clear_valid,
-                                self.clear_command_sequence,
-                                Mux(
-                                    mask_targets_report,
-                                    self.mask_command_sequence,
+                                    button_targets_q,
+                                    self.button_command_sequence,
                                     Mux(
-                                        button_targets_report,
-                                        self.button_command_sequence,
-                                        Mux(
-                                            relative_admitted,
-                                            self.relative_command_sequence,
-                                            captured_sequence,
-                                        ),
+                                        relative_admitted,
+                                        self.relative_command_sequence,
+                                        captured_sequence,
                                     ),
                                 ),
-                            )
-                        ),
-                        entry_index.eq(0),
+                            ),
+                        )
+                    ),
+                    entry_index.eq(0),
+                ]
+                with m.If(snapshot_entry_count == 0):
+                    m.d.usb += [
+                        output_index.eq(0),
+                        output_started.eq(0),
+                        emit_native.eq(0),
                     ]
-                    with m.If(snapshot_entry_count == 0):
-                        m.d.usb += [
-                            output_index.eq(0),
-                            output_started.eq(0),
-                            emit_native.eq(0),
-                        ]
-                        m.next = "OUTPUT_PRIME"
-                    with m.Else():
-                        m.next = "LOOKUP_WAIT"
+                    m.next = "OUTPUT_PRIME"
+                with m.Else():
+                    m.next = "LOOKUP_WAIT"
 
             with m.State("LOOKUP_WAIT"):
                 # InjectionMapStore's synchronous read port and lookup-valid
@@ -1332,9 +1407,8 @@ class ReportInjectionEngine(Elaboratable):
                             commit_allowed
                             & selected_state_available
                             & transaction_relative_overflow
-                            & (self.command_overflow != (1 << 32) - 1)
                         ):
-                            m.d.usb += self.command_overflow.eq(self.command_overflow + 1)
+                            m.d.usb += overflow_committed.eq(1)
                         with m.If(
                             commit_allowed
                             & (
@@ -1397,6 +1471,9 @@ class ReportInjectionEngine(Elaboratable):
                         buffer_read_enable.eq(1),
                     ]
                     m.d.usb += cache_copy_index.eq(cache_copy_index + 1)
+
+        with m.If(overflow_committed & (self.command_overflow != (1 << 32) - 1)):
+            m.d.usb += self.command_overflow.eq(self.command_overflow + 1)
 
         with m.If(store.invalidate):
             m.d.usb += [

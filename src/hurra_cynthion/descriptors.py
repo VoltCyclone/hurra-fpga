@@ -11,29 +11,33 @@ MAX_STRING_SIZE = 255
 MAX_PACKET_SIZE = 64
 MAX_INTERFACES = 4
 MAX_ENDPOINTS = 4  # how many interrupt-IN endpoints may be captured
-# Which endpoint *numbers* the clone relay can serve. MAX_ENDPOINTS bounds the
-# count; this bounds the numbers. A device may legally declare endpoint 5 while
-# declaring only one endpoint, and the two limits are not interchangeable.
-RELAY_ENDPOINT_NUMBERS = (1, 2, 3, 4)
-MAX_RELAY_ENDPOINT_NUMBER = max(RELAY_ENDPOINT_NUMBERS)
+# The highest endpoint *number*: the whole 4-bit field. MAX_ENDPOINTS bounds the
+# count, not the numbers -- a device may declare endpoint 15 while declaring only
+# one endpoint -- and the clone binds each relay slot's number at runtime.
+MAX_ENDPOINT_NUMBER = 15
+# One past the 4-bit token field, so no token can match it: where an unbound
+# relay slot or an absent OUT endpoint is parked. Every number 1..15 is one a
+# device may declare, and 0 is EP0.
+UNMATCHABLE_ENDPOINT_NUMBER = MAX_ENDPOINT_NUMBER + 1
 
 __all__ = [
     "DESCRIPTOR_ENTRY_COUNT",
     "DESCRIPTOR_STORE_SIZE",
     "MAX_CONFIGURATION_SIZE",
     "MAX_ENDPOINTS",
+    "MAX_ENDPOINT_NUMBER",
     "MAX_INTERFACES",
     "MAX_PACKET_SIZE",
-    "MAX_RELAY_ENDPOINT_NUMBER",
     "MAX_REPORT_SIZE",
     "MAX_STRING_SIZE",
-    "RELAY_ENDPOINT_NUMBERS",
+    "UNMATCHABLE_ENDPOINT_NUMBER",
     "DescriptorError",
     "DescriptorStore",
     "DeviceDescriptor",
     "EndpointBinding",
     "MalformedDescriptorError",
     "MouseConfiguration",
+    "OutEndpointBinding",
     "OversizedDescriptorError",
     "UnsupportedTopologyError",
     "parse_device_descriptor",
@@ -76,9 +80,23 @@ class EndpointBinding:
 
 
 @dataclass(frozen=True)
+class OutEndpointBinding:
+    """The one HID interrupt-OUT endpoint relayed PC -> clone -> device."""
+
+    interface_number: int
+    endpoint_number: int
+    max_packet_size: int
+    interval: int
+
+
+@dataclass(frozen=True)
 class MouseConfiguration:
     configuration_value: int
     endpoints: tuple["EndpointBinding", ...]
+    out_endpoint: OutEndpointBinding | None = None
+    #: A HID interrupt-OUT endpoint was declared but not captured: out of
+    #: bounds, or not the first. Diagnostic only; it never fails a parse.
+    out_ignored: bool = False
 
 
 class DescriptorStore(Elaboratable):
@@ -842,9 +860,11 @@ def parse_mouse_configuration(data: bytes) -> MouseConfiguration:
         raise MalformedDescriptorError("configuration value must be nonzero")
 
     endpoints: list[EndpointBinding] = []
+    out_endpoint: OutEndpointBinding | None = None
+    out_ignored = False
     interface_count = 0
-    has_mouse = False
     current_is_hid = False
+    current_alt_nonzero = False
     current_interface = 0
     current_report_length = 0
 
@@ -863,16 +883,19 @@ def parse_mouse_configuration(data: bytes) -> MouseConfiguration:
         if descriptor_type == 4:
             if descriptor_length != 9:
                 raise MalformedDescriptorError("interface descriptor length must be nine")
-            if data[offset + 3] != 0:
-                raise UnsupportedTopologyError("alternate interface settings are unsupported")
-            interface_count += 1
-            if interface_count > MAX_INTERFACES:
-                raise UnsupportedTopologyError("too many interfaces")
+            # An alternate setting redescribes an interface that bNumInterfaces
+            # already counts once. Skip its endpoints rather than aborting, and
+            # do not count it -- a DS4's AudioStreaming interface declares
+            # altsettings 1 and 2, so counting them makes
+            # interface_count == declared_interfaces unsatisfiable.
+            current_alt_nonzero = data[offset + 3] != 0
+            if not current_alt_nonzero:
+                interface_count += 1
+                if interface_count > MAX_INTERFACES:
+                    raise UnsupportedTopologyError("too many interfaces")
             current_interface = data[offset + 2]
             current_is_hid = data[offset + 5] == 3
             current_report_length = 0
-            if current_is_hid and data[offset + 7] == 2:
-                has_mouse = True
 
         elif descriptor_type == 0x21:
             # HID descriptor belongs to the current interface; non-HID interfaces skip it.
@@ -902,16 +925,49 @@ def parse_mouse_configuration(data: bytes) -> MouseConfiguration:
                         current_report_length = subordinate_length
 
         elif descriptor_type == 5:
-            if descriptor_length != 7:
-                raise MalformedDescriptorError("endpoint descriptor length must be seven")
+            # 7 = standard endpoint descriptor; 9 = the USB Audio 1.0 form,
+            # which appends bRefresh and bSynchAddress. A DS4 carries three
+            # audio interfaces, so rejecting 9 aborts enumeration long before
+            # any HID logic runs -- and this check sits outside the
+            # current_is_hid guard, so it fires on interfaces we never wanted.
+            if descriptor_length not in (7, 9):
+                raise MalformedDescriptorError("endpoint descriptor length must be seven or nine")
             endpoint_address = data[offset + 2]
             attributes = data[offset + 3]
-            is_interrupt_in = bool(endpoint_address & 0x80) and (attributes & 0x03) == 3
-            # Only a HID interface's interrupt-IN endpoints are captured; OUT and
-            # non-interrupt endpoints (e.g. a keyboard's LED endpoint) are skipped.
-            if current_is_hid and is_interrupt_in:
+            is_interrupt = (attributes & 0x03) == 3
+            is_interrupt_in = bool(endpoint_address & 0x80) and is_interrupt
+            is_interrupt_out = not (endpoint_address & 0x80) and is_interrupt
+            # Only a HID interface's interrupt endpoints are captured. The
+            # interrupt-IN endpoints fill the relay table; the first in-bounds
+            # interrupt-OUT (e.g. a keyboard's LED endpoint) is held apart.
+            if current_is_hid and not current_alt_nonzero and is_interrupt_out:
+                # Never raises: the IN relay is the product, so an OUT endpoint
+                # this relay cannot carry is dropped rather than refusing the
+                # whole device. The clone still advertises it verbatim; the PC
+                # then gets no handshake there, which is what it got before.
+                maximum_packet_size = int.from_bytes(data[offset + 4 : offset + 6], "little")
+                number = endpoint_address & 0x0F
+                in_bounds = (
+                    (endpoint_address & 0x70) == 0
+                    and 1 <= number <= MAX_ENDPOINT_NUMBER
+                    and 1 <= maximum_packet_size <= MAX_PACKET_SIZE
+                    and data[offset + 6] != 0
+                )
+                if in_bounds and out_endpoint is None:
+                    out_endpoint = OutEndpointBinding(
+                        interface_number=current_interface,
+                        endpoint_number=number,
+                        max_packet_size=maximum_packet_size,
+                        interval=data[offset + 6],
+                    )
+                else:
+                    out_ignored = True
+            if current_is_hid and not current_alt_nonzero and is_interrupt_in:
                 if (endpoint_address & 0x70) != 0 or (endpoint_address & 0x0F) == 0:
                     raise UnsupportedTopologyError("endpoint must be a nonzero IN endpoint")
+                if any(e.endpoint_number == endpoint_address & 0x0F for e in endpoints):
+                    # Both relay slots would answer the PC's IN token.
+                    raise UnsupportedTopologyError("duplicate IN endpoint number")
                 maximum_packet_size = int.from_bytes(data[offset + 4 : offset + 6], "little")
                 if maximum_packet_size == 0:
                     raise MalformedDescriptorError("endpoint maximum packet size must be nonzero")
@@ -937,12 +993,19 @@ def parse_mouse_configuration(data: bytes) -> MouseConfiguration:
 
     if interface_count != declared_interfaces:
         raise UnsupportedTopologyError("declared interface count does not match descriptors")
-    if not has_mouse:
-        raise UnsupportedTopologyError("no HID mouse interface present")
     if not endpoints:
-        raise MalformedDescriptorError("no interrupt-IN endpoint found")
+        # UnsupportedTopologyError, not Malformed: the descriptors are
+        # well-formed, the device simply has no HID interrupt-IN endpoint to
+        # relay. This must match the gateware, which fails the equivalent
+        # `ep_count == 0` condition with HostError.UNSUPPORTED_TOPOLOGY.
+        raise UnsupportedTopologyError("no interrupt-IN endpoint found")
 
-    return MouseConfiguration(configuration_value=data[5], endpoints=tuple(endpoints))
+    return MouseConfiguration(
+        configuration_value=data[5],
+        endpoints=tuple(endpoints),
+        out_endpoint=out_endpoint,
+        out_ignored=out_ignored,
+    )
 
 
 def validate_string_descriptor(data: bytes, *, index: int) -> None:

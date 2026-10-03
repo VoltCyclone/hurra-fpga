@@ -4,11 +4,11 @@ USB HID relay gateware for a [Cynthion](https://greatscottgadgets.com/cynthion/)
 r1.4 (Lattice ECP5 LFE5U-12F, CABGA256), written in Amaranth on top of LUNA.
 
 It acts as a USB *host* on the TARGET-A port — powering the port, resetting,
-enumerating an attached HID boot mouse and polling its interrupt-IN endpoints —
-and presents a clone of that device to a PC on the AUX port, relaying its reports
-and optionally mutating them in flight. Both links negotiate High Speed
-(480 Mb/s) through a host-side chirp handshake. Debug registers are read over
-JTAG with Apollo.
+enumerating an attached HID device (a mouse, keyboard or HID gamepad) and polling
+its interrupt-IN endpoints — and presents a clone of that device to a PC on the
+AUX port, relaying its reports and optionally mutating them in flight. Both links
+negotiate High Speed (480 Mb/s) through a host-side chirp handshake. Debug
+registers are read over JTAG with Apollo.
 
 ## How it works
 
@@ -22,11 +22,11 @@ mouse / receiver ──> TARGET-A  [ Cynthion r1.4 ]  AUX ──> PC
 (`aux_vbus_en`) rather than sensing VBUS, resets the bus, runs the host half of
 the USB 2.0 §7.1.7.5 chirp handshake, and walks the standard descriptor
 sequence. Enumeration is deliberately bounded — at most 4 interfaces and 4
-interrupt-IN endpoints, endpoint numbers 1..4, max packet size 64, alternate
-setting 0 only — and it refuses to commit a capture unless it saw an interface
-with `bInterfaceClass == 3` and `bInterfaceProtocol == 2`, failing with
-`UNSUPPORTED_TOPOLOGY` otherwise. A failed attempt re-resets and retries, up to
-six times.
+interrupt-IN endpoints (any numbers 1..15, no two alike), max packet size 64,
+alternate setting 0 only — and it commits a capture for any HID device (`bInterfaceClass
+== 3`, whatever its protocol) with at least one interrupt-IN endpoint, failing
+with `UNSUPPORTED_TOPOLOGY` otherwise. A failed attempt re-resets and retries, up
+to six times.
 
 Captured descriptors land in a `DescriptorStore`, copied verbatim into the AUX
 clone's private store, so LUNA's `USBDevice` serves the PC the same VID/PID,
@@ -47,9 +47,31 @@ uploaded at runtime by an external MCU over the SPI control link (see
 [Report injection](#report-injection)). With no MCU attached (`link_ready = 0`)
 no map is ever active and every report passes through unmodified.
 
+The PC's traffic reaches the real device too. HID class control requests on EP0
+— GET/SET_REPORT, SET_IDLE and SET_PROTOCOL included — are forwarded verbatim
+through `control_relay.py`, and one HID interrupt-OUT endpoint (rumble, lightbar,
+keyboard LEDs) is relayed by `out_writer.py`. A device the PC puts in boot
+protocol (a BIOS) sends boot-layout reports the field map does not describe, so
+`boot_protocol.py` tracks it per endpoint, injection stands aside there, and a PC
+bus reset or SET_CONFIGURATION on the clone replays SET_PROTOCOL(report) to the
+real device, which never sees either event itself. Either event also starts the
+clone's own endpoints over: every data toggle restarts at DATA0, and reports
+queued before it are discarded rather than served late. The host polls the real
+device from enumeration on, but the PC polls nothing until it configures the
+clone.
+
+Vendor-type control requests are not forwarded: the clone STALLs them, by
+design. Forwarding them would let the PC send arbitrary vendor writes —
+firmware-update commands included — to the real device; class requests already
+cross that boundary, and HID configuration tools mostly use class feature
+reports, which do work. A forwarded class response is limited to the relay's
+64-byte buffer; a longer one is STALLed. The clone captures no string `0xEE` or
+BOS descriptor, so Windows never asks for MS OS descriptors.
+
 ## Requirements
 
-- A Cynthion r1.4 and a USB HID boot mouse (or its wireless receiver).
+- A Cynthion r1.4 and a USB HID device: a mouse (or its wireless receiver), a
+  keyboard, or a HID gamepad such as a DS4.
 - Python 3.11 or newer. Runtime and dev dependencies are pinned in
   `pyproject.toml` and installed by the command below.
 - An ECP5 toolchain — `yosys`, `nextpnr-ecp5`, `ecppack` — from a single, recent

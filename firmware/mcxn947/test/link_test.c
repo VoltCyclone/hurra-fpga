@@ -34,6 +34,7 @@ int main(void)
         [31] = 0x36u,
     };
     uint8_t slot[INJ_FRAME_SIZE];
+    uint8_t cached[INJ_FRAME_SIZE];
     uint8_t probe[INJ_FRAME_SIZE];
 
     // What link_init() seeds into both TX banks.
@@ -41,6 +42,16 @@ int main(void)
     link_build_idle_slot(slot);
     assert(memcmp(slot, idle_golden, sizeof(idle_golden)) == 0);
     assert(link_slot_is_inert_idle(slot));
+
+    // The steady-state ISR copies a slot packed once at boot. This expectation
+    // stays independent of that cache and its builder: a wrong-but-consistent
+    // IDLE would otherwise be drained by the FPGA as DUPLICATE with every
+    // spi_bad_* counter flat.
+    memset(cached, 0x5Au, sizeof(cached));
+    link_idle_slot_cache_init();
+    link_copy_cached_idle_slot(cached);
+    assert(memcmp(cached, idle_golden, sizeof(idle_golden)) == 0);
+    assert(link_slot_is_inert_idle(cached));
 
     // Design doc section 4: "both TX buffers must be seeded with a complete
     // valid IDLE frame before ERQ is set (zeroed buffers fail SOF)". An

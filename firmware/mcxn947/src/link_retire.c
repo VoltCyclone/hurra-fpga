@@ -31,6 +31,20 @@ static bool ring_full(void)
     return (uint8_t)((s_head + 1u) & LINK_RETIRE_RING_MASK) == s_tail;
 }
 
+static bool slot_is_canonical_idle(const uint8_t slot[INJ_FRAME_SIZE])
+{
+    for (uint32_t offset = 0u; offset < INJ_FRAME_SIZE; offset += sizeof(uint32_t)) {
+        uint32_t actual;
+        uint32_t expected;
+        __builtin_memcpy(&actual, &slot[offset], sizeof(actual));
+        __builtin_memcpy(&expected, &s_canonical_idle[offset], sizeof(expected));
+        if (actual != expected) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool link_retire_active_bank(uint32_t destination_address,
                              uint32_t base,
                              uint32_t stride,
@@ -101,7 +115,7 @@ void link_retire_slot(const uint8_t slot[INJ_FRAME_SIZE])
     // to INJ_TYPE_IDLE would then be counted as a healthy keepalive and bad_crc
     // would go blind. A full compare is strictly stronger than a CRC check, a
     // type test is strictly weaker.
-    if (memcmp(slot, s_canonical_idle, INJ_FRAME_SIZE) == 0) {
+    if (slot_is_canonical_idle(slot)) {
         s_counters.idle++;
         return;
     }
