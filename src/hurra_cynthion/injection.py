@@ -44,6 +44,9 @@ STATE_LAYOUT = StructLayout(
         "report_length": unsigned(7),
         "click_active": unsigned(1),
         "click_release_target": unsigned(32),
+        # Buttons to restore when the click times out. The click command
+        # carries held | clicked, so the pre-click mask is kept here.
+        "click_restore": unsigned(64),
     }
 )
 
@@ -305,13 +308,10 @@ class ReportInjectionEngine(Elaboratable):
         )
         scan_motion_live = state_motion_live.bit_select(stationary_scan_index, 1)
         scan_buttons_live = state_buttons_live.bit_select(stationary_scan_index, 1)
-        scan_masks_live = state_masks_live.bit_select(stationary_scan_index, 1)
         scan_x = Mux(scan_record_matches & scan_motion_live, state_record.x, 0)
         scan_y = Mux(scan_record_matches & scan_motion_live, state_record.y, 0)
         scan_wheel = Mux(scan_record_matches & scan_motion_live, state_record.wheel, 0)
         scan_pan = Mux(scan_record_matches & scan_motion_live, state_record.pan, 0)
-        scan_buttons = Mux(scan_record_matches & scan_buttons_live, state_record.buttons, 0)
-        scan_masks = Mux(scan_record_matches & scan_masks_live, state_record.masks, 0)
         scan_click_active = scan_record_matches & scan_buttons_live & state_record.click_active
         scan_release_delta = Signal(32)
         m.d.comb += scan_release_delta.eq(
@@ -332,26 +332,28 @@ class ReportInjectionEngine(Elaboratable):
                 | (((self.relative_flags & INJ_RELATIVE_FLAG_PAN) != 0) & (self.relative_pan != 0))
             )
         )
-        scan_incoming_button_transition = (
+        # Deliberately not compared against the current state: a command that
+        # changes nothing still needs a report transaction to be acked, or it
+        # blocks the plane's RX queue until the device next moves. (A zero
+        # RELATIVE is excluded above; the firmware never sends one.)
+        scan_incoming_button = (
             self.button_valid
             & (self.button_interface == state_record.interface_number)
             & (self.button_endpoint == state_record.endpoint_number)
             & (self.button_report_id == state_record.report_id)
-            & (self.button_buttons != scan_buttons)
         )
-        scan_incoming_mask_transition = (
+        scan_incoming_mask = (
             self.mask_valid
             & (self.mask_interface == state_record.interface_number)
             & (self.mask_endpoint == state_record.endpoint_number)
             & (self.mask_report_id == state_record.report_id)
-            & (self.mask_buttons != scan_masks)
         )
         scan_motion_pending = scan_record_matches & (
             (scan_x != 0) | (scan_y != 0) | (scan_wheel != 0) | (scan_pan != 0)
         )
         scan_relative_pending = scan_record_matches & scan_incoming_relative
-        scan_button_pending = scan_record_matches & scan_incoming_button_transition
-        scan_mask_pending = scan_record_matches & scan_incoming_mask_transition
+        scan_button_pending = scan_record_matches & scan_incoming_button
+        scan_mask_pending = scan_record_matches & scan_incoming_mask
         scan_click_pending = scan_click_active & ~scan_release_delta[-1]
 
         relative_targets_report = (
@@ -388,6 +390,7 @@ class ReportInjectionEngine(Elaboratable):
         captured_raw_sequence = Signal(16)
         captured_raw_click_active = Signal()
         captured_raw_click_release_target = Signal(32)
+        captured_raw_click_restore = Signal(64)
         transaction_relative = Signal()
         transaction_button = Signal()
         transaction_mask = Signal()
@@ -409,6 +412,18 @@ class ReportInjectionEngine(Elaboratable):
         emit_native = Signal()
         deferred_sof = Signal()
         state_write_click_release_target = Signal(32)
+        state_write_click_restore = Signal(64)
+
+        # A command is only acked through a report transaction, and a
+        # stationary one needs the layout's state record and template. Before
+        # a native report has created them, a command for a still device
+        # could not be acked, and the plane's one-deep RX queue blocked behind
+        # it. Each newly active map therefore seeds every layout it declares
+        # with a zero record and template (byte 0 = report ID), one layout per
+        # pass through CAPTURE so native reports are held for one fill at most.
+        seed_pending = Signal()
+        seed_index = Signal(5)
+        m.d.comb += store.directory_index.eq(seed_index[:4])
 
         captured_state_matches = transaction_relative
         captured_motion_live = transaction_button
@@ -439,6 +454,11 @@ class ReportInjectionEngine(Elaboratable):
         captured_click_release_target = Mux(
             captured_state_matches & captured_buttons_live,
             captured_raw_click_release_target,
+            0,
+        )
+        captured_click_restore = Mux(
+            captured_state_matches & captured_buttons_live,
+            captured_raw_click_restore,
             0,
         )
 
@@ -520,7 +540,7 @@ class ReportInjectionEngine(Elaboratable):
                     Mux(
                         button_targets_q,
                         self.button_buttons,
-                        Mux(captured_click_release_due, 0, captured_buttons),
+                        Mux(captured_click_release_due, captured_click_restore, captured_buttons),
                     ),
                 )
             ),
@@ -574,6 +594,7 @@ class ReportInjectionEngine(Elaboratable):
             state_memory_write.data.report_length.eq(report_length),
             state_memory_write.data.click_active.eq(state_write_click_active),
             state_memory_write.data.click_release_target.eq(state_write_click_release_target),
+            state_memory_write.data.click_restore.eq(state_write_click_restore),
         ]
 
         entry_index = Signal(range(LIMITS["fields"]))
@@ -791,6 +812,72 @@ class ReportInjectionEngine(Elaboratable):
                         snapshot_entry_count.eq(store.active_entry_count),
                     ]
                     m.next = "STATIONARY_SCAN"
+                with m.Elif(seed_pending):
+                    with m.If(~store.active_valid | (seed_index >= store.active_layout_count)):
+                        m.d.usb += seed_pending.eq(0)
+                    with m.Else():
+                        m.d.comb += state_memory_read_address.eq(seed_index[:4])
+                        m.next = "SEED_CHECK"
+
+            with m.State("SEED_CHECK"):
+                # A record a native report has already committed against this
+                # map is kept. Either way the layout is scanned on the next
+                # CAPTURE, so a command waiting on it is served at once rather
+                # than on the next frame.
+                seed_record_current = (
+                    state_valid.bit_select(seed_index[:4], 1)
+                    & (state_record.descriptor_generation == store.active_descriptor_generation)
+                    & (state_record.map_generation == store.active_generation)
+                )
+                m.d.usb += deferred_sof.eq(1)
+                with m.If(seed_record_current):
+                    m.d.usb += seed_index.eq(seed_index + 1)
+                    m.next = "CAPTURE"
+                with m.Else():
+                    m.d.usb += [
+                        selected_state.eq(seed_index[:4]),
+                        captured_interface.eq(store.directory.interface_number),
+                        captured_endpoint.eq(store.directory.endpoint_number[:4]),
+                        selected_report_id.eq(store.directory.report_id),
+                        report_length.eq(store.directory.report_length),
+                        snapshot_descriptor_generation.eq(store.active_descriptor_generation),
+                        snapshot_map_generation.eq(store.active_generation),
+                        working_x.eq(0),
+                        working_y.eq(0),
+                        working_wheel.eq(0),
+                        working_pan.eq(0),
+                        working_buttons.eq(0),
+                        working_mask.eq(0),
+                        transaction_sequence.eq(0),
+                        transaction_click_release.eq(0),
+                        state_write_click_release_target.eq(0),
+                        state_write_click_restore.eq(0),
+                        stationary_load_index.eq(0),
+                    ]
+                    m.next = "SEED_FILL"
+
+            with m.State("SEED_FILL"):
+                # Through the report buffer, so CACHE_COPY caches it like a
+                # native template. The record is written with the last byte.
+                seed_byte = Mux(stationary_load_index == 0, selected_report_id, 0)
+                m.d.comb += [
+                    buffer_write_address.eq(stationary_load_index),
+                    buffer_write_data.eq(Cat(seed_byte, seed_byte)),
+                    buffer_write_enable.eq(1),
+                ]
+                with m.If(stationary_load_index == report_length - 1):
+                    m.d.comb += state_memory_write_enable.eq(1)
+                    m.d.usb += [
+                        state_valid.eq(state_valid | selected_state_mask),
+                        state_motion_live.eq(state_motion_live | selected_state_mask),
+                        state_buttons_live.eq(state_buttons_live | selected_state_mask),
+                        state_masks_live.eq(state_masks_live | selected_state_mask),
+                        seed_index.eq(seed_index + 1),
+                        cache_copy_index.eq(0),
+                    ]
+                    m.next = "CACHE_COPY_PRIME"
+                with m.Else():
+                    m.d.usb += stationary_load_index.eq(stationary_load_index + 1)
 
             with m.State("STATIONARY_SCAN"):
                 # A zero-layout active map has no slot index that can equal
@@ -1033,6 +1120,7 @@ class ReportInjectionEngine(Elaboratable):
                         captured_raw_sequence.eq(state_record.sequence),
                         captured_raw_click_active.eq(state_record.click_active),
                         captured_raw_click_release_target.eq(state_record.click_release_target),
+                        captured_raw_click_restore.eq(state_record.click_restore),
                         transaction_relative.eq(state_record_matches),
                         transaction_button.eq(state_motion_live.bit_select(selected_state, 1)),
                         transaction_mask.eq(state_buttons_live.bit_select(selected_state, 1)),
@@ -1086,6 +1174,25 @@ class ReportInjectionEngine(Elaboratable):
                             button_targets_q,
                             self.accepted_report_count + self.button_hold_reports,
                             captured_click_release_target,
+                        )
+                    ),
+                    # A click releases to the mask held before it. While an
+                    # earlier click is still active, that is the earlier
+                    # click's baseline, not the current mask with its button
+                    # in; the second release must not re-press the first.
+                    state_write_click_restore.eq(
+                        Mux(
+                            button_targets_q,
+                            Mux(
+                                clear_buttons,
+                                0,
+                                Mux(
+                                    captured_click_active,
+                                    captured_click_restore,
+                                    captured_buttons,
+                                ),
+                            ),
+                            captured_click_restore,
                         )
                     ),
                     transaction_sequence.eq(
@@ -1475,12 +1582,20 @@ class ReportInjectionEngine(Elaboratable):
         with m.If(overflow_committed & (self.command_overflow != (1 << 32) - 1)):
             m.d.usb += self.command_overflow.eq(self.command_overflow + 1)
 
+        # After the FSM: a map activated mid-walk restarts it from slot 0.
+        with m.If(store.activated):
+            m.d.usb += [
+                seed_pending.eq(1),
+                seed_index.eq(0),
+            ]
+
         with m.If(store.invalidate):
             m.d.usb += [
                 state_valid.eq(0),
                 state_motion_live.eq(0),
                 state_buttons_live.eq(0),
                 state_masks_live.eq(0),
+                seed_pending.eq(0),
             ]
 
         return m

@@ -163,6 +163,13 @@ class InjectionMapStore(Elaboratable):
         self.active_generation = Signal(16)
         self.active_entry_count = Signal(7)
         self.active_layout_count = Signal(5)
+        #: Pulses on the first cycle ``active_*`` describe a newly committed map.
+        self.activated = Signal()
+
+        #: The active bank's layout directory entry at ``directory_index``, one
+        #: cycle behind it. The engine walks a new map's layouts through this.
+        self.directory_index = Signal(4)
+        self.directory = Signal(LAYOUT_DIRECTORY_LAYOUT)
 
         self.lookup_index = Signal(range(max_fields))
         self.lookup_valid = Signal()
@@ -224,6 +231,11 @@ class InjectionMapStore(Elaboratable):
         layout_directory_write = layout_directory.write_port(domain="usb")
         runtime_layout_read = layout_directory.read_port(domain="usb")
         candidate_layout_read = layout_directory.read_port(domain="usb")
+        indexed_layout_read = layout_directory.read_port(domain="usb")
+        m.d.comb += [
+            indexed_layout_read.addr.eq(Cat(self.directory_index, self.active_bank)),
+            self.directory.eq(indexed_layout_read.data),
+        ]
         directory_write_enable = Signal()
         directory_write_address = Signal(5)
         directory_write_data = Signal(LAYOUT_DIRECTORY_LAYOUT)
@@ -504,6 +516,7 @@ class InjectionMapStore(Elaboratable):
             self.commit_ack.eq(0),
             self.commit_error.eq(MapError.NONE),
             self.commit_error_entry_index.eq(0xFF),
+            self.activated.eq(0),
         ]
 
         with m.FSM(domain="usb"):
@@ -853,6 +866,7 @@ class InjectionMapStore(Elaboratable):
                         self.commit_ack.eq(1),
                         self.commit_error.eq(MapError.NONE),
                         self.commit_error_entry_index.eq(0xFF),
+                        self.activated.eq(1),  # same edge as the bank flip
                     ]
                 m.next = "IDLE"
 

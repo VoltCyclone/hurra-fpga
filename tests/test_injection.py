@@ -6,7 +6,7 @@ from amaranth import Elaboratable, Module
 from amaranth.back import rtlil
 from amaranth.sim import Simulator
 
-from hurra_cynthion.injection import ReportInjectionEngine
+from hurra_cynthion.injection import STATE_LAYOUT, ReportInjectionEngine
 from hurra_cynthion.injection_map import InjectionMapStore, MapError
 from hurra_cynthion.injection_wire import (
     INJ_CLEAR_FLAG_MOTION,
@@ -1550,7 +1550,9 @@ def test_layout_state_is_one_bounded_synchronous_memory() -> None:
         ],
     )
 
-    assert converted.count("memory width 368 size 16") == 1
+    # One record per layout slot in a single memory, never one register array per
+    # field; the width follows STATE_LAYOUT.
+    assert converted.count(f"memory width {STATE_LAYOUT.size} size 16") == 1
     assert "state_x_0" not in converted
     assert "state_buttons_0" not in converted
 
@@ -1955,6 +1957,364 @@ def test_no_stationary_report_is_synthesised_for_a_boot_protocol_endpoint() -> N
         await pulse_sof(ctx, engine)
         stationary, _ = await drain_report(ctx, engine, 2)
         assert stationary == bytes([73, 0xA5])
+
+    simulation.add_testbench(bench)
+    simulation.run()
+
+
+# --- Seeded layouts -------------------------------------------------------------
+#
+# Activating a map seeds every layout with a zero record and template, so a
+# command lands on a still device before it has sent any report against the map.
+
+
+def _buttons_x_entries(*, report_id: int = 0) -> list[MapEntryPayload]:
+    prefix = 8 if report_id else 0
+    return [
+        map_entry(
+            entry_index=0,
+            bit_offset=prefix,
+            bit_width=8,
+            flags=INJ_MAP_ENTRY_FLAG_BUTTON,
+            logical_minimum=0,
+            logical_maximum=1,
+            report_length=2 + (prefix // 8),
+            usage=1,
+            report_id=report_id,
+        ),
+        map_entry(
+            entry_index=1,
+            bit_offset=prefix + 8,
+            bit_width=8,
+            flags=INJ_MAP_ENTRY_FLAG_SIGNED | INJ_MAP_ENTRY_FLAG_RELATIVE | INJ_MAP_ENTRY_FLAG_X,
+            logical_minimum=-127,
+            logical_maximum=127,
+            report_length=2 + (prefix // 8),
+            report_id=report_id,
+        ),
+    ]
+
+
+def _set_relative_x(ctx, engine, x: int, *, report_id: int = 0, sequence: int = 0x51) -> None:
+    ctx.set(engine.relative_valid, 1)
+    ctx.set(engine.relative_interface, 0)
+    ctx.set(engine.relative_endpoint, 1)
+    ctx.set(engine.relative_report_id, report_id)
+    ctx.set(engine.relative_flags, INJ_RELATIVE_FLAG_X)
+    ctx.set(engine.relative_x, x)
+    ctx.set(engine.relative_command_sequence, sequence)
+
+
+def test_relative_command_moves_a_still_device_before_any_native_report() -> None:
+    harness = InjectionHarness()
+    engine = harness.engine
+    simulation = Simulator(harness)
+    simulation.add_clock(1e-6, domain="usb")
+
+    async def bench(ctx) -> None:
+        await commit_map(ctx, harness.map_store, _buttons_x_entries())
+        _set_relative_x(ctx, engine, 5)
+
+        await pulse_sof(ctx, engine)
+        await wait_for_output(ctx, engine)
+        emitted, acknowledgements = await drain_report(ctx, engine, 2)
+        ctx.set(engine.relative_valid, 0)
+        assert emitted == bytes([0x00, 0x05])
+        assert acknowledgements == {"relative"}
+        assert ctx.get(engine.last_committed_command_sequence) == 0x51
+
+        # Fully delivered: nothing is left to drain on later frames.
+        await pulse_sof(ctx, engine)
+        for _ in range(64):
+            await ctx.tick("usb")
+            assert not ctx.get(engine.output_valid)
+
+    simulation.add_testbench(bench)
+    simulation.run()
+
+
+def test_button_command_presses_on_a_still_device_before_any_native_report() -> None:
+    harness = InjectionHarness()
+    engine = harness.engine
+    simulation = Simulator(harness)
+    simulation.add_clock(1e-6, domain="usb")
+
+    async def bench(ctx) -> None:
+        await commit_map(ctx, harness.map_store, _buttons_x_entries())
+        ctx.set(engine.button_valid, 1)
+        ctx.set(engine.button_interface, 0)
+        ctx.set(engine.button_endpoint, 1)
+        ctx.set(engine.button_report_id, 0)
+        ctx.set(engine.button_buttons, 0b101)
+        ctx.set(engine.button_hold_reports, 0)
+        ctx.set(engine.button_command_sequence, 0x52)
+
+        await pulse_sof(ctx, engine)
+        await wait_for_output(ctx, engine)
+        emitted, acknowledgements = await drain_report(ctx, engine, 2)
+        ctx.set(engine.button_valid, 0)
+        assert emitted == bytes([0b101, 0x00])
+        assert acknowledgements == {"button"}
+        assert ctx.get(engine.injected_buttons) == 0b101
+
+    simulation.add_testbench(bench)
+    simulation.run()
+
+
+def test_seeded_template_carries_the_report_id_prefix() -> None:
+    harness = InjectionHarness()
+    engine = harness.engine
+    simulation = Simulator(harness)
+    simulation.add_clock(1e-6, domain="usb")
+
+    async def bench(ctx) -> None:
+        await commit_map(ctx, harness.map_store, _buttons_x_entries(report_id=3))
+        _set_relative_x(ctx, engine, -2, report_id=3)
+
+        await pulse_sof(ctx, engine)
+        await wait_for_output(ctx, engine)
+        emitted, acknowledgements = await drain_report(ctx, engine, 3)
+        ctx.set(engine.relative_valid, 0)
+        assert emitted == bytes([0x03, 0x00, 0xFE])
+        assert acknowledgements == {"relative"}
+
+    simulation.add_testbench(bench)
+    simulation.run()
+
+
+def test_first_native_report_after_commit_still_mutates_additively() -> None:
+    # A report arriving right after the commit is accepted, mutated and becomes
+    # the layout's template; the seed does not displace it.
+    harness = InjectionHarness()
+    engine = harness.engine
+    simulation = Simulator(harness)
+    simulation.add_clock(1e-6, domain="usb")
+
+    async def bench(ctx) -> None:
+        await commit_map(ctx, harness.map_store, _buttons_x_entries())
+        _set_relative_x(ctx, engine, 5)
+        await push_report(ctx, engine, bytes([0x01, 10]))
+        emitted, acknowledgements = await drain_report(ctx, engine, 2)
+        ctx.set(engine.relative_valid, 0)
+        assert emitted == bytes([0x01, 15])
+        assert acknowledgements == {"relative"}
+
+        # Later stationary reports replay that native template, not the seed.
+        _set_relative_x(ctx, engine, 200, sequence=0x53)
+        await pulse_sof(ctx, engine)
+        await wait_for_output(ctx, engine)
+        emitted, acknowledgements = await drain_report(ctx, engine, 2)
+        ctx.set(engine.relative_valid, 0)
+        assert emitted == bytes([0x01, 127])
+        assert acknowledgements == {"relative"}
+
+    simulation.add_testbench(bench)
+    simulation.run()
+
+
+def test_a_fresh_map_generation_reseeds_its_layouts() -> None:
+    # A new map generation for the same device is seeded again.
+    harness = InjectionHarness()
+    engine = harness.engine
+    simulation = Simulator(harness)
+    simulation.add_clock(1e-6, domain="usb")
+
+    async def bench(ctx) -> None:
+        await commit_map(ctx, harness.map_store, _buttons_x_entries())
+        _set_relative_x(ctx, engine, 5)
+        await pulse_sof(ctx, engine)
+        await wait_for_output(ctx, engine)
+        emitted, _ = await drain_report(ctx, engine, 2)
+        ctx.set(engine.relative_valid, 0)
+        assert emitted == bytes([0x00, 0x05])
+
+        entries = [replace(e, map_generation=2) for e in _buttons_x_entries()]
+        await commit_map(ctx, harness.map_store, entries, generation=2)
+        _set_relative_x(ctx, engine, -3, sequence=0x54)
+        await pulse_sof(ctx, engine)
+        await wait_for_output(ctx, engine)
+        emitted, acknowledgements = await drain_report(ctx, engine, 2)
+        ctx.set(engine.relative_valid, 0)
+        assert emitted == bytes([0x00, 0xFD])
+        assert acknowledgements == {"relative"}
+
+    simulation.add_testbench(bench)
+    simulation.run()
+
+
+# --- Commands that change nothing are still acked -------------------------------
+#
+# A BUTTON_STATE or PHYSICAL_MASK equal to the current injected state is
+# synthesised as one redundant report rather than left waiting for a native one.
+
+
+def _set_button_state(ctx, engine, mask: int, *, sequence: int) -> None:
+    ctx.set(engine.button_valid, 1)
+    ctx.set(engine.button_interface, 0)
+    ctx.set(engine.button_endpoint, 1)
+    ctx.set(engine.button_report_id, 0)
+    ctx.set(engine.button_buttons, mask)
+    ctx.set(engine.button_hold_reports, 0)
+    ctx.set(engine.button_command_sequence, sequence)
+
+
+def _set_physical_mask(ctx, engine, mask: int, *, sequence: int) -> None:
+    ctx.set(engine.mask_valid, 1)
+    ctx.set(engine.mask_interface, 0)
+    ctx.set(engine.mask_endpoint, 1)
+    ctx.set(engine.mask_report_id, 0)
+    ctx.set(engine.mask_buttons, mask)
+    ctx.set(engine.mask_command_sequence, sequence)
+
+
+def test_redundant_button_state_is_acked_on_a_still_device() -> None:
+    harness = InjectionHarness()
+    engine = harness.engine
+    simulation = Simulator(harness)
+    simulation.add_clock(1e-6, domain="usb")
+
+    async def bench(ctx) -> None:
+        await commit_map(ctx, harness.map_store, _buttons_x_entries())
+        await push_report(ctx, engine, bytes([0, 0]))
+        await drain_report(ctx, engine, 2)
+
+        # Injected buttons are already 0.
+        _set_button_state(ctx, engine, 0, sequence=0x61)
+        await pulse_sof(ctx, engine)
+        await wait_for_output(ctx, engine)
+        emitted, acknowledgements = await drain_report(ctx, engine, 2)
+        ctx.set(engine.button_valid, 0)
+        assert emitted == bytes([0x00, 0x00])
+        assert acknowledgements == {"button"}
+        assert ctx.get(engine.last_committed_command_sequence) == 0x61
+
+        # Consumed: not synthesised again.
+        await pulse_sof(ctx, engine)
+        for _ in range(64):
+            await ctx.tick("usb")
+            assert not ctx.get(engine.output_valid)
+
+    simulation.add_testbench(bench)
+    simulation.run()
+
+
+def test_redundant_physical_mask_is_acked_on_a_still_device() -> None:
+    harness = InjectionHarness()
+    engine = harness.engine
+    simulation = Simulator(harness)
+    simulation.add_clock(1e-6, domain="usb")
+
+    async def bench(ctx) -> None:
+        await commit_map(ctx, harness.map_store, _buttons_x_entries())
+        await push_report(ctx, engine, bytes([0b10, 0]))
+        await drain_report(ctx, engine, 2)
+
+        _set_physical_mask(ctx, engine, 0b10, sequence=0x62)
+        await pulse_sof(ctx, engine)
+        await wait_for_output(ctx, engine)
+        emitted, acknowledgements = await drain_report(ctx, engine, 2)
+        ctx.set(engine.mask_valid, 0)
+        assert emitted == bytes([0x00, 0x00])  # physical bit 1 now masked
+        assert acknowledgements == {"mask"}
+        assert ctx.get(engine.physical_mask) == 0b10
+
+        # Same mask again.
+        _set_physical_mask(ctx, engine, 0b10, sequence=0x63)
+        await pulse_sof(ctx, engine)
+        await wait_for_output(ctx, engine)
+        emitted, acknowledgements = await drain_report(ctx, engine, 2)
+        ctx.set(engine.mask_valid, 0)
+        assert emitted == bytes([0x00, 0x00])
+        assert acknowledgements == {"mask"}
+        assert ctx.get(engine.last_committed_command_sequence) == 0x63
+
+    simulation.add_testbench(bench)
+    simulation.run()
+
+
+def test_timed_click_release_restores_the_buttons_held_before_it() -> None:
+    # Hold button 1, then click button 2 with a hold. The firmware sends the
+    # union and keeps button 1 in its model, so the timed release must return to
+    # button 1, not to zero.
+    harness = InjectionHarness()
+    engine = harness.engine
+    simulation = Simulator(harness)
+    simulation.add_clock(1e-6, domain="usb")
+
+    async def bench(ctx) -> None:
+        await commit_map(ctx, harness.map_store, _buttons_x_entries())
+        ctx.set(engine.accepted_report_count, 10)
+
+        _set_button_state(ctx, engine, 0b01, sequence=0x71)
+        await pulse_sof(ctx, engine)
+        await wait_for_output(ctx, engine)
+        held, _ = await drain_report(ctx, engine, 2)
+        ctx.set(engine.button_valid, 0)
+        assert held == bytes([0b01, 0x00])
+
+        _set_button_state(ctx, engine, 0b11, sequence=0x72)
+        ctx.set(engine.button_hold_reports, 2)
+        await pulse_sof(ctx, engine)
+        await wait_for_output(ctx, engine)
+        clicked, acknowledgements = await drain_report(ctx, engine, 2)
+        ctx.set(engine.button_valid, 0)
+        assert clicked == bytes([0b11, 0x00])
+        assert acknowledgements == {"button"}
+
+        ctx.set(engine.accepted_report_count, 12)
+        await pulse_sof(ctx, engine)
+        await wait_for_output(ctx, engine)
+        released, acknowledgements = await drain_report(ctx, engine, 2)
+        assert released == bytes([0b01, 0x00])
+        assert not acknowledgements
+        assert ctx.get(engine.injected_buttons) == 0b01
+
+        # Button 1 stays held; nothing more is synthesised.
+        await pulse_sof(ctx, engine)
+        for _ in range(64):
+            await ctx.tick("usb")
+            assert not ctx.get(engine.output_valid)
+
+    simulation.add_testbench(bench)
+    simulation.run()
+
+
+def test_overlapping_timed_clicks_release_to_the_pre_click_baseline() -> None:
+    # A second timed click while the first is held cuts the first short (kmcmd
+    # sends s_buttons | click2, and s_buttons never carried click1). Its release
+    # must return to what was held before the first click, not re-press it.
+    harness = InjectionHarness()
+    engine = harness.engine
+    simulation = Simulator(harness)
+    simulation.add_clock(1e-6, domain="usb")
+
+    async def bench(ctx) -> None:
+        await commit_map(ctx, harness.map_store, _buttons_x_entries())
+        ctx.set(engine.accepted_report_count, 10)
+
+        _set_button_state(ctx, engine, 0b01, sequence=0x81)
+        ctx.set(engine.button_hold_reports, 50)
+        await pulse_sof(ctx, engine)
+        await wait_for_output(ctx, engine)
+        first, _ = await drain_report(ctx, engine, 2)
+        ctx.set(engine.button_valid, 0)
+        assert first == bytes([0b01, 0x00])
+
+        _set_button_state(ctx, engine, 0b10, sequence=0x82)
+        ctx.set(engine.button_hold_reports, 2)
+        await pulse_sof(ctx, engine)
+        await wait_for_output(ctx, engine)
+        second, _ = await drain_report(ctx, engine, 2)
+        ctx.set(engine.button_valid, 0)
+        assert second == bytes([0b10, 0x00])
+
+        ctx.set(engine.accepted_report_count, 12)
+        await pulse_sof(ctx, engine)
+        await wait_for_output(ctx, engine)
+        released, acknowledgements = await drain_report(ctx, engine, 2)
+        assert released == bytes([0x00, 0x00])
+        assert not acknowledgements
+        assert ctx.get(engine.injected_buttons) == 0
 
     simulation.add_testbench(bench)
     simulation.run()

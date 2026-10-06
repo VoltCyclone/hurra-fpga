@@ -583,6 +583,13 @@ static void handle_button(reply_t *reply, const char *name, uint32_t bit, const 
     } else {
         s_buttons &= ~bit;
     }
+    if (s_buttons == previous) {
+        // Already in that state. The engine can only ack an unchanged
+        // BUTTON_STATE with a redundant report; ack it here instead.
+        note_accepted();
+        emit_ack(reply, name, args, count);
+        return;
+    }
     if (s_ops.buttons == NULL || !s_ops.buttons(s_ops.ctx, s_buttons, 0u)) {
         // Roll back rather than leave our idea of the mask ahead of the FPGA's.
         // A refusal here is the one-deep command queue being busy, which the
@@ -686,6 +693,12 @@ static void handle_lock_button(reply_t *reply, const char *name, uint32_t bit, c
         s_physical |= bit;
     } else {
         s_physical &= ~bit;
+    }
+    if (s_physical == previous) {
+        // As in handle_button.
+        note_accepted();
+        emit_ack(reply, name, args, count);
+        return;
     }
     if (s_ops.physical_mask == NULL || !s_ops.physical_mask(s_ops.ctx, s_physical)) {
         s_physical = previous;

@@ -305,7 +305,22 @@ REQUIRED_NEXTPNR_FLAG = "--placer-heap-timingweight"
 #: descriptor_store.descriptor_memory read-address family (handshake, timer
 #: or setup decoder -> the GET_DESCRIPTOR streamer); the twelfth in a relay IN
 #: endpoint's tx_manager. None ends in the flush logic. Pin 6 -> 10.
-DEFAULT_PLACER_SEED = 10
+#:
+#: Injection on a still device: the map store's ``activated`` pulse and
+#: indexed directory read, the engine's SEED_* walk, button/mask commands
+#: synthesised when unchanged, a 64-bit ``click_restore`` in the state record.
+#: About 330 LUTs. Netlist sha 0e9f458c3177d88e (native), 20,196 LUTs = 83%:
+#:
+#:     4: 71.15   11: 71.06  12: 70.20  7: 70.07   1: 70.01   8: 68.54
+#:     2: 68.25   9: 67.89   5: 67.12   3: 66.99   10: 65.45  6: 65.15
+#:
+#: Median 68.4, worst 65.15 (+8.6%). A first draft of the same logic (one
+#: more FSM state, three more muxes) drew median 72.7, worst +16.3% -- the
+#: spread of placement, not of the logic. 10 of 12 seeds end in the clone's
+#: control endpoint -> a relay IN endpoint's tx_manager buffer read (the G5
+#: family); 2 in map_store.active_bank -> engine.layout_state data / its
+#: write enable (the bank -> commit family), both at +13%. Pin 10 -> 4.
+DEFAULT_PLACER_SEED = 4
 
 #: The full option, including the weight and seed that were actually measured.
 #: A caller-supplied ``--seed`` is composed after this one and wins, because

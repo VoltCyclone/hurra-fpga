@@ -566,6 +566,36 @@ static void test_button_state_commands(void)
            (KMCMD_BUTTON_RIGHT | KMCMD_BUTTON_MIDDLE | KMCMD_BUTTON_SIDE1 | KMCMD_BUTTON_SIDE2));
 }
 
+// A setter that leaves the mask as it is is acknowledged but sends no frame:
+// the engine could only ack it with a redundant report.
+static void test_unchanged_button_state_is_acked_without_a_frame(void)
+{
+    setup();
+    assert(line("km.left(0)") == KMCMD_HANDLED);  // already released
+    assert(g_mask_count == 0u);
+    assert(strstr(g_reply, "(!") == NULL);
+
+    line("km.left(1)");
+    assert(g_mask_count == 1u);
+    assert(line("km.left(1)") == KMCMD_HANDLED);  // already pressed
+    assert(g_mask_count == 1u);
+    assert(strstr(g_reply, "(!") == NULL);
+}
+
+static void test_unchanged_button_lock_is_acked_without_a_frame(void)
+{
+    setup();
+    assert(line("km.lock_ml(0)") == KMCMD_HANDLED);  // never locked
+    assert(g_physical_count == 0u);
+    assert(strstr(g_reply, "(!") == NULL);
+
+    line("km.lock_ml(1)");
+    assert(g_physical_count == 1u);
+    assert(line("km.lock_ml(1)") == KMCMD_HANDLED);
+    assert(g_physical_count == 1u);
+    assert(strstr(g_reply, "(!") == NULL);
+}
+
 // MAKCU documents state 2 as "silent_release": zero the state without emitting
 // a frame. Our equivalent is to clear the bit locally and send nothing, so the
 // next real report carries the change.
@@ -929,6 +959,8 @@ int main(void)
     test_link_loss_discards_the_budget();
 
     test_button_state_commands();
+    test_unchanged_button_state_is_acked_without_a_frame();
+    test_unchanged_button_lock_is_acked_without_a_frame();
     test_silent_release_does_not_emit();
     test_button_query_does_not_emit();
     test_click_presses_and_releases();
