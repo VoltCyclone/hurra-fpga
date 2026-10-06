@@ -479,22 +479,36 @@ def test_map_entry_golden_payload():
     assert payload.hex() == "341278569a0203010100300008000c1b00f8ffffff0700000400"
 
 
-def test_generated_c_header_is_current():
-    expected = Path("firmware/ch32h417/include/injection_wire.h").read_text()
+C_HEADERS = (
+    Path("firmware/ch32h417/include/injection_wire.h"),
+    Path("firmware/mcxn947/include/injection_wire.h"),
+)
+
+
+def _load_generator():
     generator_path = Path("tools/generate_report_injection_wire.py")
     spec = importlib.util.spec_from_file_location("generate_report_injection_wire", generator_path)
     assert spec is not None and spec.loader is not None
     generator = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(generator)
+    return generator
 
-    assert expected == generator.render_c(Path("protocol/report_injection_wire.json"))
+
+def test_generator_targets_both_controller_headers():
+    generator = _load_generator()
+    assert tuple(path.resolve() for path in generator.C_HEADER_PATHS) == tuple(
+        path.resolve() for path in C_HEADERS
+    )
+
+
+@pytest.mark.parametrize("header", C_HEADERS, ids=lambda path: path.parts[1])
+def test_generated_c_header_is_current(header):
+    generator = _load_generator()
+    assert header.read_text() == generator.render_c(Path("protocol/report_injection_wire.json"))
 
 
 def test_second_generation_does_not_change_outputs():
-    generated = (
-        Path("src/hurra_cynthion/injection_wire.py"),
-        Path("firmware/ch32h417/include/injection_wire.h"),
-    )
+    generated = (Path("src/hurra_cynthion/injection_wire.py"), *C_HEADERS)
     before = {path: path.read_bytes() for path in generated}
     subprocess.run(
         [sys.executable, "tools/generate_report_injection_wire.py"],

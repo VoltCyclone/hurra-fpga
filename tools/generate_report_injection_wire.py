@@ -11,7 +11,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_PATH = ROOT / "protocol/report_injection_wire.json"
 PYTHON_PATH = ROOT / "src/hurra_cynthion/injection_wire.py"
-C_HEADER_PATH = ROOT / "firmware/ch32h417/include/injection_wire.h"
+# Both controllers consume the same contract header. The MCXN947 copy used to be
+# a hand copy guarded only by `make -C firmware/mcxn947 check-copies`, which is in
+# neither CI nor `make verify`; writing both here is what keeps them identical.
+C_HEADER_PATHS = (
+    ROOT / "firmware/ch32h417/include/injection_wire.h",
+    ROOT / "firmware/mcxn947/include/injection_wire.h",
+)
 
 TYPE_INFO = {
     "u8": (1, "uint8_t", "int"),
@@ -513,7 +519,9 @@ def render_c(path: Path) -> str:
 
 def main() -> None:
     PYTHON_PATH.write_text(render_python(SCHEMA_PATH))
-    C_HEADER_PATH.write_text(render_c(SCHEMA_PATH))
+    header = render_c(SCHEMA_PATH)
+    for path in C_HEADER_PATHS:
+        path.write_text(header)
     subprocess.run(["ruff", "format", str(PYTHON_PATH)], check=True)
 
 
