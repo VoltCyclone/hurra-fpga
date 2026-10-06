@@ -164,8 +164,9 @@ int main(void)
         INJ_TYPE_COUNTERS,   INJ_TYPE_MAP_BEGIN,     INJ_TYPE_MAP_ENTRY,
         INJ_TYPE_MAP_COMMIT, INJ_TYPE_RELATIVE,      INJ_TYPE_BUTTON_STATE,
         INJ_TYPE_PHYSICAL_MASK, INJ_TYPE_CLEAR,      INJ_TYPE_TELEMETRY_CONFIG,
+        INJ_TYPE_ABSOLUTE,
     };
-    CHECK(sizeof(known_types) == 15u);
+    CHECK(sizeof(known_types) == 16u);
     for (size_t known = 0u; known < sizeof(known_types); ++known) {
         const uint8_t candidate = known_types[known];
 
@@ -174,8 +175,8 @@ int main(void)
               (candidate == INJ_TYPE_IDLE ? 0u : INJ_FRAME_PAYLOAD_SIZE));
     }
 
-    /* Every byte value not in the contract's set must be unknown -- 241 of the
-     * 256, checked by sweeping all of them and excluding the 15 above. */
+    /* Every byte value not in the contract's set must be unknown -- 240 of the
+     * 256, checked by sweeping all of them and excluding the 16 above. */
     unsigned unassigned = 0u;
     for (unsigned candidate = 0u; candidate < 256u; ++candidate) {
         int assigned = 0;
@@ -190,7 +191,7 @@ int main(void)
             ++unassigned;
         }
     }
-    CHECK(unassigned == 241u);
+    CHECK(unassigned == 240u);
 
     /* The unpack side of the same two rules. Each slot carries a correct CRC,
      * so only the rule under test can reject it. */

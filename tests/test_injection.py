@@ -53,6 +53,7 @@ def map_entry(
     report_id: int = 0,
     entry_index: int = 0,
     generation: int = 1,
+    channel: int = 0,
 ) -> MapEntryPayload:
     return MapEntryPayload(
         descriptor_generation=1,
@@ -69,6 +70,7 @@ def map_entry(
         logical_minimum=logical_minimum,
         logical_maximum=logical_maximum,
         report_length=report_length,
+        channel=channel,
     )
 
 

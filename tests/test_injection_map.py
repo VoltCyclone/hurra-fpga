@@ -83,6 +83,7 @@ def field(
     logical_minimum: int = -32768,
     logical_maximum: int = 32767,
     report_length: int = 4,
+    channel: int = 0,
 ) -> MapEntryPayload:
     if flags is None:
         flags_by_kind = {
@@ -106,6 +107,7 @@ def field(
         logical_minimum=logical_minimum,
         logical_maximum=logical_maximum,
         report_length=report_length,
+        channel=channel,
     )
 
 

@@ -21,7 +21,7 @@ static void assert_entry(const inj_map_entry_payload_t *e, uint8_t index, uint16
     assert(e->bit_offset == offset && e->bit_width == width);
     assert(e->flags == flags);
     assert(e->logical_minimum == minimum && e->logical_maximum == maximum);
-    assert(e->reserved == 0u);
+    assert(e->channel == 0u);
 }
 
 static void test_boot_mouse_entries(void)

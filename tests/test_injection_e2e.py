@@ -76,6 +76,7 @@ def relative_x_entry(*, descriptor_generation: int, report_length: int = 1) -> M
         logical_minimum=-127,
         logical_maximum=127,
         report_length=report_length,
+        channel=0,
     )
 
 

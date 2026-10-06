@@ -69,6 +69,7 @@ def _boot_entries(descriptor_generation: int) -> list[MapEntryPayload]:
         "logical_minimum": -127,
         "logical_maximum": 127,
         "report_length": FW_REPORT_LENGTH,
+        "channel": 0,
     }
     x = MapEntryPayload(
         entry_index=0,

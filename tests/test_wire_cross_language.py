@@ -304,7 +304,7 @@ _VECTORS: list[tuple[str, bytes, str]] = [
     ("bad CRC", _corrupt_crc(_VALID_RELATIVE), "REJECT"),
     ("length 27", _crc_slot(bytes((0x68, INJ_TYPE_RELATIVE, 3, 27)), b""), "REJECT"),
     # Length is per-type EXACT, not a maximum, and the type must be one of the
-    # 15 the contract assigns. All four carry a correct CRC, so the only thing
+    # 16 the contract assigns. All four carry a correct CRC, so the only thing
     # that can reject them is the rule under test.
     (
         "RELATIVE with length 20",
@@ -654,6 +654,9 @@ _MAP_ENTRY_VALUES = {
     "logical_minimum": -2048,
     "logical_maximum": 2047,
     "report_length": 0x06,
+    # Nonzero on purpose: byte 25 was `reserved` (never written by either end)
+    # and is now `channel`; 0 here would pass with the old struct too.
+    "channel": 0x05,
 }
 
 _STRUCT_HARNESS = """

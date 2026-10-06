@@ -186,9 +186,11 @@ def render_python(path: Path) -> str:
         ]
     relative = _golden_payload(schema, "RELATIVE", schema["goldens"]["relative"])
     map_entry = _golden_payload(schema, "MAP_ENTRY", schema["goldens"]["map_entry"])
+    absolute = _golden_payload(schema, "ABSOLUTE", schema["goldens"]["absolute"])
     lines += [
         f"RELATIVE_GOLDEN_PAYLOAD = bytes.fromhex({relative.hex()!r})",
         f"MAP_ENTRY_GOLDEN_PAYLOAD = bytes.fromhex({map_entry.hex()!r})",
+        f"ABSOLUTE_GOLDEN_PAYLOAD = bytes.fromhex({absolute.hex()!r})",
         "",
         "class FrameError(ValueError):",
         '    """A malformed or unsupported slot."""',
@@ -505,7 +507,11 @@ def render_c(path: Path) -> str:
         "}",
         "",
     ]
-    for golden_name, payload_name in (("relative", "RELATIVE"), ("map_entry", "MAP_ENTRY")):
+    for golden_name, payload_name in (
+        ("relative", "RELATIVE"),
+        ("map_entry", "MAP_ENTRY"),
+        ("absolute", "ABSOLUTE"),
+    ):
         payload = _golden_payload(schema, payload_name, schema["goldens"][golden_name])
         lines += [
             f"static const uint8_t inj_golden_{golden_name}_payload[INJ_FRAME_PAYLOAD_SIZE] = {{",

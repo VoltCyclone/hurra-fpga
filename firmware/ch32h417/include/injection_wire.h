@@ -36,11 +36,20 @@
 #define INJ_TYPE_PHYSICAL_MASK 0x86u
 #define INJ_TYPE_CLEAR 0x87u
 #define INJ_TYPE_TELEMETRY_CONFIG 0x88u
+#define INJ_TYPE_ABSOLUTE 0x89u
+#define INJ_ABSOLUTE_FLAG_LX 1u
+#define INJ_ABSOLUTE_FLAG_LY 2u
+#define INJ_ABSOLUTE_FLAG_RX 4u
+#define INJ_ABSOLUTE_FLAG_RY 8u
+#define INJ_ABSOLUTE_FLAG_LT 16u
+#define INJ_ABSOLUTE_FLAG_RT 32u
+#define INJ_ABSOLUTE_FLAG_HAT 64u
 #define INJ_CLEAR_FLAG_MOTION 1u
 #define INJ_CLEAR_FLAG_BUTTONS 2u
 #define INJ_CLEAR_FLAG_PHYSICAL_MASKS 4u
 #define INJ_CLEAR_FLAG_QUEUED_TIMED 8u
-#define INJ_CLEAR_FLAG_ALL 15u
+#define INJ_CLEAR_FLAG_ABSOLUTE 16u
+#define INJ_CLEAR_FLAG_ALL 31u
 #define INJ_COMMAND_ACK_FLAG_LATE 1u
 #define INJ_COMMAND_ACK_FLAG_SYNTHESIZED 2u
 #define INJ_COMMAND_ACK_RESULT_SUCCESS 0u
@@ -60,6 +69,13 @@
 #define INJ_LINK_STATUS_FLAG_MAP_ACTIVE 2u
 #define INJ_LINK_STATUS_FLAG_INJECTION_ENABLED 4u
 #define INJ_LINK_STATUS_FLAG_RELAY_READY 8u
+#define INJ_MAP_ENTRY_CHANNEL_LX 0u
+#define INJ_MAP_ENTRY_CHANNEL_LY 1u
+#define INJ_MAP_ENTRY_CHANNEL_RX 2u
+#define INJ_MAP_ENTRY_CHANNEL_RY 3u
+#define INJ_MAP_ENTRY_CHANNEL_LT 4u
+#define INJ_MAP_ENTRY_CHANNEL_RT 5u
+#define INJ_MAP_ENTRY_CHANNEL_HAT 6u
 #define INJ_MAP_ENTRY_FLAG_SIGNED 1u
 #define INJ_MAP_ENTRY_FLAG_RELATIVE 2u
 #define INJ_MAP_ENTRY_FLAG_BUTTON 4u
@@ -67,6 +83,7 @@
 #define INJ_MAP_ENTRY_FLAG_Y 16u
 #define INJ_MAP_ENTRY_FLAG_WHEEL 32u
 #define INJ_MAP_ENTRY_FLAG_PAN 64u
+#define INJ_MAP_FLAG_NATIVE_ONLY 1u
 #define INJ_MAP_STATUS_ERROR_NONE 0u
 #define INJ_MAP_STATUS_ERROR_DESCRIPTOR_GENERATION 1u
 #define INJ_MAP_STATUS_ERROR_MAP_GENERATION 2u
@@ -110,6 +127,21 @@
 #define INJ_COUNTER_REPORT_MAP_MAP_COMMIT 4u
 #define INJ_COUNTER_REPORT_MAP_MAP_REJECT 5u
 
+#define INJ_ABSOLUTE_LEASE_GENERATION_OFFSET 0u
+#define INJ_ABSOLUTE_MAP_GENERATION_OFFSET 2u
+#define INJ_ABSOLUTE_COMMAND_SEQUENCE_OFFSET 4u
+#define INJ_ABSOLUTE_HOLD_REPORTS_OFFSET 6u
+#define INJ_ABSOLUTE_INTERFACE_NUMBER_OFFSET 8u
+#define INJ_ABSOLUTE_ENDPOINT_NUMBER_OFFSET 9u
+#define INJ_ABSOLUTE_REPORT_ID_OFFSET 10u
+#define INJ_ABSOLUTE_FLAGS_OFFSET 11u
+#define INJ_ABSOLUTE_LX_OFFSET 12u
+#define INJ_ABSOLUTE_LY_OFFSET 14u
+#define INJ_ABSOLUTE_RX_OFFSET 16u
+#define INJ_ABSOLUTE_RY_OFFSET 18u
+#define INJ_ABSOLUTE_LT_OFFSET 20u
+#define INJ_ABSOLUTE_RT_OFFSET 22u
+#define INJ_ABSOLUTE_HAT_OFFSET 24u
 #define INJ_BUTTON_STATE_LEASE_GENERATION_OFFSET 0u
 #define INJ_BUTTON_STATE_MAP_GENERATION_OFFSET 2u
 #define INJ_BUTTON_STATE_COMMAND_SEQUENCE_OFFSET 4u
@@ -187,6 +219,7 @@
 #define INJ_MAP_ENTRY_LOGICAL_MINIMUM_OFFSET 16u
 #define INJ_MAP_ENTRY_LOGICAL_MAXIMUM_OFFSET 20u
 #define INJ_MAP_ENTRY_REPORT_LENGTH_OFFSET 24u
+#define INJ_MAP_ENTRY_CHANNEL_OFFSET 25u
 #define INJ_MAP_STATUS_DESCRIPTOR_GENERATION_OFFSET 0u
 #define INJ_MAP_STATUS_MAP_GENERATION_OFFSET 2u
 #define INJ_MAP_STATUS_ACTIVE_MAP_GENERATION_OFFSET 4u
@@ -261,6 +294,26 @@ static inline void inj_store_u64_le(uint8_t *data, uint64_t value) {
     inj_store_u32_le(data, (uint32_t)value);
     inj_store_u32_le(data + 4, (uint32_t)(value >> 32));
 }
+
+typedef struct __attribute__((packed)) {
+    uint16_t lease_generation;
+    uint16_t map_generation;
+    uint16_t command_sequence;
+    uint16_t hold_reports;
+    uint8_t interface_number;
+    uint8_t endpoint_number;
+    uint8_t report_id;
+    uint8_t flags;
+    int16_t lx;
+    int16_t ly;
+    int16_t rx;
+    int16_t ry;
+    int16_t lt;
+    int16_t rt;
+    int16_t hat;
+} inj_absolute_payload_t;
+_Static_assert(sizeof(inj_absolute_payload_t) == INJ_FRAME_PAYLOAD_SIZE,
+               "absolute payload must fill one slot payload");
 
 typedef struct __attribute__((packed)) {
     uint16_t lease_generation;
@@ -393,7 +446,7 @@ typedef struct __attribute__((packed)) {
     int32_t logical_minimum;
     int32_t logical_maximum;
     uint8_t report_length;
-    uint8_t reserved;
+    uint8_t channel;
 } inj_map_entry_payload_t;
 _Static_assert(sizeof(inj_map_entry_payload_t) == INJ_FRAME_PAYLOAD_SIZE,
                "map_entry payload must fill one slot payload");
@@ -471,6 +524,36 @@ typedef struct __attribute__((packed)) {
 _Static_assert(sizeof(inj_telemetry_config_payload_t) == INJ_FRAME_PAYLOAD_SIZE,
                "telemetry_config payload must fill one slot payload");
 
+_Static_assert(offsetof(inj_absolute_payload_t, lease_generation) == INJ_ABSOLUTE_LEASE_GENERATION_OFFSET,
+               "inj_absolute_payload_t.lease_generation must sit at its wire offset");
+_Static_assert(offsetof(inj_absolute_payload_t, map_generation) == INJ_ABSOLUTE_MAP_GENERATION_OFFSET,
+               "inj_absolute_payload_t.map_generation must sit at its wire offset");
+_Static_assert(offsetof(inj_absolute_payload_t, command_sequence) == INJ_ABSOLUTE_COMMAND_SEQUENCE_OFFSET,
+               "inj_absolute_payload_t.command_sequence must sit at its wire offset");
+_Static_assert(offsetof(inj_absolute_payload_t, hold_reports) == INJ_ABSOLUTE_HOLD_REPORTS_OFFSET,
+               "inj_absolute_payload_t.hold_reports must sit at its wire offset");
+_Static_assert(offsetof(inj_absolute_payload_t, interface_number) == INJ_ABSOLUTE_INTERFACE_NUMBER_OFFSET,
+               "inj_absolute_payload_t.interface_number must sit at its wire offset");
+_Static_assert(offsetof(inj_absolute_payload_t, endpoint_number) == INJ_ABSOLUTE_ENDPOINT_NUMBER_OFFSET,
+               "inj_absolute_payload_t.endpoint_number must sit at its wire offset");
+_Static_assert(offsetof(inj_absolute_payload_t, report_id) == INJ_ABSOLUTE_REPORT_ID_OFFSET,
+               "inj_absolute_payload_t.report_id must sit at its wire offset");
+_Static_assert(offsetof(inj_absolute_payload_t, flags) == INJ_ABSOLUTE_FLAGS_OFFSET,
+               "inj_absolute_payload_t.flags must sit at its wire offset");
+_Static_assert(offsetof(inj_absolute_payload_t, lx) == INJ_ABSOLUTE_LX_OFFSET,
+               "inj_absolute_payload_t.lx must sit at its wire offset");
+_Static_assert(offsetof(inj_absolute_payload_t, ly) == INJ_ABSOLUTE_LY_OFFSET,
+               "inj_absolute_payload_t.ly must sit at its wire offset");
+_Static_assert(offsetof(inj_absolute_payload_t, rx) == INJ_ABSOLUTE_RX_OFFSET,
+               "inj_absolute_payload_t.rx must sit at its wire offset");
+_Static_assert(offsetof(inj_absolute_payload_t, ry) == INJ_ABSOLUTE_RY_OFFSET,
+               "inj_absolute_payload_t.ry must sit at its wire offset");
+_Static_assert(offsetof(inj_absolute_payload_t, lt) == INJ_ABSOLUTE_LT_OFFSET,
+               "inj_absolute_payload_t.lt must sit at its wire offset");
+_Static_assert(offsetof(inj_absolute_payload_t, rt) == INJ_ABSOLUTE_RT_OFFSET,
+               "inj_absolute_payload_t.rt must sit at its wire offset");
+_Static_assert(offsetof(inj_absolute_payload_t, hat) == INJ_ABSOLUTE_HAT_OFFSET,
+               "inj_absolute_payload_t.hat must sit at its wire offset");
 _Static_assert(offsetof(inj_button_state_payload_t, lease_generation) == INJ_BUTTON_STATE_LEASE_GENERATION_OFFSET,
                "inj_button_state_payload_t.lease_generation must sit at its wire offset");
 _Static_assert(offsetof(inj_button_state_payload_t, map_generation) == INJ_BUTTON_STATE_MAP_GENERATION_OFFSET,
@@ -625,6 +708,8 @@ _Static_assert(offsetof(inj_map_entry_payload_t, logical_maximum) == INJ_MAP_ENT
                "inj_map_entry_payload_t.logical_maximum must sit at its wire offset");
 _Static_assert(offsetof(inj_map_entry_payload_t, report_length) == INJ_MAP_ENTRY_REPORT_LENGTH_OFFSET,
                "inj_map_entry_payload_t.report_length must sit at its wire offset");
+_Static_assert(offsetof(inj_map_entry_payload_t, channel) == INJ_MAP_ENTRY_CHANNEL_OFFSET,
+               "inj_map_entry_payload_t.channel must sit at its wire offset");
 _Static_assert(offsetof(inj_map_status_payload_t, descriptor_generation) == INJ_MAP_STATUS_DESCRIPTOR_GENERATION_OFFSET,
                "inj_map_status_payload_t.descriptor_generation must sit at its wire offset");
 _Static_assert(offsetof(inj_map_status_payload_t, map_generation) == INJ_MAP_STATUS_MAP_GENERATION_OFFSET,
@@ -740,6 +825,7 @@ static inline int inj_type_is_known(uint8_t type) {
     case INJ_TYPE_PHYSICAL_MASK:
     case INJ_TYPE_CLEAR:
     case INJ_TYPE_TELEMETRY_CONFIG:
+    case INJ_TYPE_ABSOLUTE:
         return 1;
     default:
         return 0;
@@ -752,6 +838,10 @@ static const uint8_t inj_golden_relative_payload[INJ_FRAME_PAYLOAD_SIZE] = {
 
 static const uint8_t inj_golden_map_entry_payload[INJ_FRAME_PAYLOAD_SIZE] = {
     0x34u, 0x12u, 0x78u, 0x56u, 0x9Au, 0x02u, 0x03u, 0x01u, 0x01u, 0x00u, 0x30u, 0x00u, 0x08u, 0x00u, 0x0Cu, 0x1Bu, 0x00u, 0xF8u, 0xFFu, 0xFFu, 0xFFu, 0x07u, 0x00u, 0x00u, 0x04u, 0x00u,
+};
+
+static const uint8_t inj_golden_absolute_payload[INJ_FRAME_PAYLOAD_SIZE] = {
+    0x22u, 0x11u, 0x44u, 0x33u, 0x66u, 0x55u, 0x88u, 0x77u, 0x09u, 0x0Au, 0x0Bu, 0x7Fu, 0xFEu, 0xFFu, 0x34u, 0x12u, 0xCCu, 0xEDu, 0xFFu, 0x7Fu, 0x00u, 0x80u, 0x01u, 0x00u, 0x08u, 0x00u,
 };
 
 #endif /* INJECTION_WIRE_H */

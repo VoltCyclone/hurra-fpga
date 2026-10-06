@@ -57,6 +57,9 @@ uint8_t inj_map_build_entries(const hid_mouse_layout_t *layout, const inj_map_ta
         e->logical_minimum = field->logical_minimum;
         e->logical_maximum = field->logical_maximum;
         e->report_length = target->report_length;
+        // Mouse entries never name a pad channel; the memset above already
+        // zeroed byte 25, but the wire now gives it a meaning, so say so.
+        e->channel = 0u;
     }
     return count;
 }
