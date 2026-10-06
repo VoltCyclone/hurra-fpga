@@ -31,13 +31,16 @@ from pathlib import Path
 import pytest
 
 from hurra_cynthion.injection_wire import (
+    ABSOLUTE_GOLDEN_PAYLOAD,
     CRC_INIT,
+    INJ_TYPE_ABSOLUTE,
     INJ_TYPE_IDLE,
     INJ_TYPE_MAP_ENTRY,
     INJ_TYPE_RELATIVE,
     MAP_ENTRY_GOLDEN_PAYLOAD,
     MESSAGE_TYPES,
     RELATIVE_GOLDEN_PAYLOAD,
+    AbsolutePayload,
     FrameError,
     MapEntryPayload,
     RelativePayload,
@@ -176,6 +179,8 @@ int main(void)
                                     INJ_FRAME_PAYLOAD_SIZE));
     printf("%u\\n", spi_frame_crc16(inj_golden_map_entry_payload,
                                     INJ_FRAME_PAYLOAD_SIZE));
+    printf("%u\\n", spi_frame_crc16(inj_golden_absolute_payload,
+                                    INJ_FRAME_PAYLOAD_SIZE));
     return 0;
 }}
 """
@@ -191,11 +196,12 @@ def test_c_crc16_matches_python_reference(tmp_path: Path) -> None:
     expected.extend(crc16_ccitt_false(CRC_PATTERN[:used]) for used in range(len(CRC_PATTERN) + 1))
     expected.append(crc16_ccitt_false(RELATIVE_GOLDEN_PAYLOAD))
     expected.append(crc16_ccitt_false(MAP_ENTRY_GOLDEN_PAYLOAD))
+    expected.append(crc16_ccitt_false(ABSOLUTE_GOLDEN_PAYLOAD))
 
     source = _CRC_HARNESS.format(pattern=_c_bytes(CRC_PATTERN))
     observed = [int(line) for line in _run_c_harness(tmp_path, source, name="crc16").split()]
 
-    assert len(observed) == len(expected) == 290
+    assert len(observed) == len(expected) == 291
     divergences = [
         f"case {index}: c=0x{got:04X} python=0x{want:04X}"
         for index, (got, want) in enumerate(zip(observed, expected, strict=True))
@@ -291,6 +297,11 @@ def _replace_sof(slot: bytes, sof: int) -> bytes:
 _VALID_IDLE = pack_slot(INJ_TYPE_IDLE, 0, b"")
 _VALID_RELATIVE = pack_slot(INJ_TYPE_RELATIVE, 1, RELATIVE_GOLDEN_PAYLOAD)
 _VALID_MAP_ENTRY = pack_slot(INJ_TYPE_MAP_ENTRY, 2, MAP_ENTRY_GOLDEN_PAYLOAD)
+_VALID_ABSOLUTE = pack_slot(INJ_TYPE_ABSOLUTE, 8, ABSOLUTE_GOLDEN_PAYLOAD)
+# The golden carries flags 0x7F (every channel held); bit 7 is the one bit the
+# Python transmit mask (field_masks.ABSOLUTE.flags = 127) refuses.
+_ABSOLUTE_FLAG_BIT7 = bytearray(ABSOLUTE_GOLDEN_PAYLOAD)
+_ABSOLUTE_FLAG_BIT7[11] |= 0x80
 
 # (name, slot bytes, expected admissibility) where expected is one of
 # "REJECT" / "IDLE" / "DELIVER". Later changes to the codec's admission rules
@@ -318,6 +329,25 @@ _VECTORS: list[tuple[str, bytes, str]] = [
         "REJECT",
     ),
     ("RELATIVE with length 0", _crc_slot(bytes((0x68, INJ_TYPE_RELATIVE, 7, 0)), b""), "REJECT"),
+    # ABSOLUTE (0x89) is admitted by the same three length rules as every other
+    # non-IDLE type - "IDLE -> 0, else 26" - so no C or FPGA edit was needed once
+    # it entered message_types. Pin that.
+    ("well-formed ABSOLUTE", _VALID_ABSOLUTE, "DELIVER"),
+    (
+        "ABSOLUTE with length 25",
+        _crc_slot(bytes((0x68, INJ_TYPE_ABSOLUTE, 9, 25)), ABSOLUTE_GOLDEN_PAYLOAD[:25]),
+        "REJECT",
+    ),
+    # DELIVER, not REJECT: field masks are the *transmit* side's rule (pack_slot
+    # refuses this payload, which is why it is laid out with _crc_slot). They are
+    # not part of valid_return, spi_frame_unpack never reads the payload, and
+    # ABSOLUTE has no receive_reject_mask, so all three ends admit the frame and
+    # the engine decides what an undefined flag bit means.
+    (
+        "ABSOLUTE with flags bit 7",
+        _crc_slot(bytes((0x68, INJ_TYPE_ABSOLUTE, 10, 26)), bytes(_ABSOLUTE_FLAG_BIT7)),
+        "DELIVER",
+    ),
 ]
 _VECTORS.extend(
     (f"IDLE with sequence {sequence}", pack_slot(INJ_TYPE_IDLE, sequence, b""), "IDLE")
@@ -658,6 +688,23 @@ _MAP_ENTRY_VALUES = {
     # and is now `channel`; 0 here would pass with the old struct too.
     "channel": 0x05,
 }
+_ABSOLUTE_VALUES = {
+    "lease_generation": 0x3210,
+    "map_generation": 0x7654,
+    "command_sequence": 0xBA98,
+    "hold_reports": 0x0FED,
+    "interface_number": 0x02,
+    "endpoint_number": 0x03,
+    "report_id": 0x01,
+    "flags": 0x55,
+    "lx": -32768,
+    "ly": 32767,
+    "rx": -2,
+    "ry": 3,
+    "lt": -255,
+    "rt": 256,
+    "hat": 8,
+}
 
 _STRUCT_HARNESS = """
 #include <stdint.h>
@@ -679,6 +726,7 @@ int main(void)
     uint8_t raw[INJ_FRAME_PAYLOAD_SIZE];
     inj_relative_payload_t relative;
     inj_map_entry_payload_t entry;
+    inj_absolute_payload_t absolute;
 
     memset(&relative, 0, sizeof(relative));
 {relative_fields}
@@ -690,8 +738,14 @@ int main(void)
     memcpy(raw, &entry, sizeof(raw));
     emit(raw);
 
+    memset(&absolute, 0, sizeof(absolute));
+{absolute_fields}
+    memcpy(raw, &absolute, sizeof(raw));
+    emit(raw);
+
     emit(inj_golden_relative_payload);
     emit(inj_golden_map_entry_payload);
+    emit(inj_golden_absolute_payload);
     return 0;
 }}
 """
@@ -714,16 +768,26 @@ def test_c_payload_structs_match_the_python_packer(tmp_path: Path) -> None:
     source = _STRUCT_HARNESS.format(
         relative_fields=_c_assignments("relative", _RELATIVE_VALUES),
         entry_fields=_c_assignments("entry", _MAP_ENTRY_VALUES),
+        absolute_fields=_c_assignments("absolute", _ABSOLUTE_VALUES),
     )
     observed = _run_c_harness(tmp_path, source, name="structs").split()
 
     expected = [
         RelativePayload(**_RELATIVE_VALUES).to_bytes().hex(),
         MapEntryPayload(**_MAP_ENTRY_VALUES).to_bytes().hex(),
+        AbsolutePayload(**_ABSOLUTE_VALUES).to_bytes().hex(),
         RELATIVE_GOLDEN_PAYLOAD.hex(),
         MAP_ENTRY_GOLDEN_PAYLOAD.hex(),
+        ABSOLUTE_GOLDEN_PAYLOAD.hex(),
     ]
-    labels = ["RELATIVE struct", "MAP_ENTRY struct", "RELATIVE golden", "MAP_ENTRY golden"]
+    labels = [
+        "RELATIVE struct",
+        "MAP_ENTRY struct",
+        "ABSOLUTE struct",
+        "RELATIVE golden",
+        "MAP_ENTRY golden",
+        "ABSOLUTE golden",
+    ]
 
     divergences = [
         f"{label}: c={got} python={want}"
