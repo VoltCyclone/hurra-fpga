@@ -611,6 +611,21 @@ static void test_silent_release_does_not_emit(void)
     assert(g_mask_writes[g_mask_count - 1u] == KMCMD_BUTTON_RIGHT);
 }
 
+// State 2 only cleared our copy of the mask; the engine still holds the
+// button. The explicit release that follows must therefore reach the sink,
+// even though kmcmd's own state already reads "released".
+static void test_release_after_silent_release_still_emits(void)
+{
+    setup();
+    line("km.left(1)");
+    line("km.left(2)");
+    const uint32_t before = g_mask_count;
+    assert(line("km.left(0)") == KMCMD_HANDLED);
+    assert(g_mask_count == before + 1u);
+    assert(g_mask_writes[g_mask_count - 1u] == 0u);
+    assert(strstr(g_reply, "(!") == NULL);
+}
+
 // A bare getter. MAKCU returns a lock indicator here; we answer with what we
 // actually know -- our own injected state -- and must not emit a frame.
 static void test_button_query_does_not_emit(void)
@@ -962,6 +977,7 @@ int main(void)
     test_unchanged_button_state_is_acked_without_a_frame();
     test_unchanged_button_lock_is_acked_without_a_frame();
     test_silent_release_does_not_emit();
+    test_release_after_silent_release_still_emits();
     test_button_query_does_not_emit();
     test_click_presses_and_releases();
     test_click_delay_becomes_hold_reports();

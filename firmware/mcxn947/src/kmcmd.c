@@ -26,6 +26,11 @@ static uint32_t s_reports_per_ms;
 // leave that one held, so each command edits the mask and re-sends the whole
 // thing.
 static uint32_t s_buttons;
+// The mask the sink last received. Diverges from s_buttons after a MAKCU
+// silent release (state 2 clears our copy without a frame) and after a timed
+// click whose hold the engine released itself; "unchanged" is judged against
+// this, not against s_buttons, so an explicit release still goes out.
+static uint32_t s_buttons_sent;
 static uint32_t s_physical;
 
 // Pending displacement. Held as int32 because a host may legitimately ask for
@@ -583,9 +588,9 @@ static void handle_button(reply_t *reply, const char *name, uint32_t bit, const 
     } else {
         s_buttons &= ~bit;
     }
-    if (s_buttons == previous) {
-        // Already in that state. The engine can only ack an unchanged
-        // BUTTON_STATE with a redundant report; ack it here instead.
+    if (s_buttons == s_buttons_sent) {
+        // The sink already holds exactly this mask. The engine can only ack an
+        // unchanged BUTTON_STATE with a redundant report; ack it here instead.
         note_accepted();
         emit_ack(reply, name, args, count);
         return;
@@ -599,6 +604,7 @@ static void handle_button(reply_t *reply, const char *name, uint32_t bit, const 
         emit_refusal(reply, name, "busy");
         return;
     }
+    s_buttons_sent = s_buttons;
     note_accepted();
     emit_ack(reply, name, args, count);
 }
@@ -814,6 +820,7 @@ bool kmcmd_step(void)
                 return false;
             }
             s_buttons = mask;
+            s_buttons_sent = mask;
             s_click_release_pending = false;
             return true;
         }
@@ -823,13 +830,17 @@ bool kmcmd_step(void)
             return false;
         }
         s_buttons = mask;
+        s_buttons_sent = mask;
         s_click_remaining--;
         // With an explicit hold the engine's hold_reports drives the release
         // (injection.py arms a click-release target from it), so queueing one
         // here would cut the press short. Without one we owe the release.
         s_click_release_pending = (s_click_hold == 0u);
         if (s_click_hold != 0u) {
+            // The engine restores the pre-click mask when the hold expires, so
+            // that is what the sink will be holding.
             s_buttons &= ~s_click_mask;
+            s_buttons_sent = s_buttons;
         }
         return true;
     }
@@ -909,6 +920,7 @@ void kmcmd_set_link(bool up)
     s_click_hold = 0u;
     s_click_release_pending = false;
     s_buttons = 0u;
+    s_buttons_sent = 0u;
     s_physical = 0u;
 }
 
@@ -936,6 +948,7 @@ void kmcmd_init(const kmcmd_ops_t *ops)
     // integrator on a Full Speed link should set 1.
     s_reports_per_ms = 8u;
     s_buttons = 0u;
+    s_buttons_sent = 0u;
     s_physical = 0u;
     s_pend_x = 0;
     s_pend_y = 0;
