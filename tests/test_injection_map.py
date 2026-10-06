@@ -9,6 +9,8 @@ from amaranth.sim import Simulator
 
 from hurra_cynthion.injection_map import InjectionMapStore, MapError, _crc32_byte
 from hurra_cynthion.injection_wire import (
+    INJ_MAP_ENTRY_CHANNEL_HAT,
+    INJ_MAP_ENTRY_CHANNEL_LY,
     INJ_MAP_ENTRY_FLAG_BUTTON,
     INJ_MAP_ENTRY_FLAG_RELATIVE,
     INJ_MAP_ENTRY_FLAG_SIGNED,
@@ -755,7 +757,17 @@ def test_rejects_invalid_layouts_crc_generations_and_unsupported_fields() -> Non
                 MapError.ENDPOINT,
             ),
             (
-                {"entries": [field("x", 0, 8, flags=0)]},
+                # BUTTON and RELATIVE together name no class.
+                {
+                    "entries": [
+                        field(
+                            "x",
+                            0,
+                            8,
+                            flags=INJ_MAP_ENTRY_FLAG_BUTTON | INJ_MAP_ENTRY_FLAG_RELATIVE,
+                        )
+                    ]
+                },
                 MapError.UNSUPPORTED_FIELD,
             ),
             (
@@ -799,6 +811,64 @@ def test_rejects_invalid_layouts_crc_generations_and_unsupported_fields() -> Non
             )
             assert result.error == error
             assert result.active_generation == 0
+
+    simulated_store(bench)
+
+
+def test_absolute_entries_are_class_three_with_bounded_channels_and_widths() -> None:
+    # Neither BUTTON nor RELATIVE nor an axis flag (SIGNED tolerated) is the
+    # absolute class a pad's sticks, triggers and hat map to. The channel byte
+    # names which ABSOLUTE value lands in the field and must be 0 on every other
+    # class. Rejections reuse existing codes: commit_error is 4 bits and the
+    # map_validation debug field is 4 bits, so there is no room for a new one.
+    async def bench(ctx, store) -> None:
+        accepted = [
+            [field("x", 0, 8, flags=0)],
+            [
+                field(
+                    "x",
+                    0,
+                    16,
+                    flags=INJ_MAP_ENTRY_FLAG_SIGNED,
+                    channel=INJ_MAP_ENTRY_CHANNEL_HAT,
+                )
+            ],
+            [
+                field(
+                    "x",
+                    0,
+                    4,
+                    flags=0,
+                    channel=INJ_MAP_ENTRY_CHANNEL_LY,
+                    logical_minimum=0,
+                    logical_maximum=7,
+                )
+            ],
+        ]
+        for generation, entries in enumerate(accepted, start=1):
+            result = await commit_candidate(ctx, store, generation=generation, entries=entries)
+            assert result.error == MapError.NONE, entries
+            assert result.active_generation == generation
+        last_accepted = len(accepted)
+
+        rejected = [
+            # A 16-bit held value sign-extends through the 32-bit emitted_field;
+            # a wider unsigned field would be corrupted, so widths stop at 16.
+            ([field("x", 0, 17, flags=0)], MapError.FIELD_WIDTH),
+            (
+                [field("x", 0, 8, flags=0, channel=INJ_MAP_ENTRY_CHANNEL_HAT + 1)],
+                MapError.UNSUPPORTED_FIELD,
+            ),
+            ([field("button", 8, 1, channel=1)], MapError.UNSUPPORTED_FIELD),
+            ([field("x", 0, 8, channel=1)], MapError.UNSUPPORTED_FIELD),
+            # An axis flag without RELATIVE is still no class at all.
+            ([field("x", 0, 8, flags=INJ_MAP_ENTRY_FLAG_X)], MapError.UNSUPPORTED_FIELD),
+        ]
+        for generation, (entries, error) in enumerate(rejected, start=last_accepted + 1):
+            result = await commit_candidate(ctx, store, generation=generation, entries=entries)
+            assert result.error == error, entries
+            assert result.error_entry_index == 0
+            assert result.active_generation == last_accepted
 
     simulated_store(bench)
 

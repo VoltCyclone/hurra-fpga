@@ -13,6 +13,7 @@ from .injection_wire import (
     CRC32_INIT,
     CRC32_POLY,
     CRC32_XOROUT,
+    INJ_MAP_ENTRY_CHANNEL_HAT,
     INJ_MAP_ENTRY_FLAG_BUTTON,
     INJ_MAP_ENTRY_FLAG_PAN,
     INJ_MAP_ENTRY_FLAG_RELATIVE,
@@ -501,11 +502,24 @@ class InjectionMapStore(Elaboratable):
         has_signed = (validation_entry_q.flags & INJ_MAP_ENTRY_FLAG_SIGNED) != 0
         has_relative = (validation_entry_q.flags & INJ_MAP_ENTRY_FLAG_RELATIVE) != 0
         has_button = (validation_entry_q.flags & INJ_MAP_ENTRY_FLAG_BUTTON) != 0
-        supported_button = has_button & ~has_relative & ~has_signed & (axis_flags == 0)
-        supported_axis = has_relative & ~has_button & axis_one_hot
+        # The channel byte names the ABSOLUTE value an absolute entry carries and
+        # is meaningless -- so must be 0 -- on a button or relative one.
+        has_channel = validation_entry_q.channel != 0
+        supported_button = (
+            has_button & ~has_relative & ~has_signed & (axis_flags == 0) & ~has_channel
+        )
+        supported_axis = has_relative & ~has_button & axis_one_hot & ~has_channel
+        # Class 3, absolute: neither BUTTON nor RELATIVE nor an axis flag. SIGNED
+        # may be set and the engine ignores it; a held value is written to the
+        # field masked to bit_width, never clamped, so no range is needed.
+        is_absolute = ~has_button & ~has_relative & (axis_flags == 0)
+        supported_absolute = is_absolute & (validation_entry_q.channel <= INJ_MAP_ENTRY_CHANNEL_HAT)
+        # A 16-bit held value sign-extends through the engine's 32-bit
+        # emitted_field; writing it into a wider unsigned field would corrupt it.
+        absolute_too_wide = is_absolute & (validation_entry_q.bit_width > 16)
         unsupported_field = (
             ((validation_entry_q.flags & ~_ALLOWED_FLAGS) != 0)
-            | ~(supported_button | supported_axis)
+            | ~(supported_button | supported_axis | supported_absolute)
             | (validation_entry_q.logical_minimum > validation_entry_q.logical_maximum)
         )
 
@@ -717,6 +731,12 @@ class InjectionMapStore(Elaboratable):
                 with m.Elif(unsupported_field):
                     m.d.usb += [
                         pending_error.eq(MapError.UNSUPPORTED_FIELD),
+                        pending_error_entry_index.eq(validation_index),
+                    ]
+                    m.next = "REJECT"
+                with m.Elif(absolute_too_wide):
+                    m.d.usb += [
+                        pending_error.eq(MapError.FIELD_WIDTH),
                         pending_error_entry_index.eq(validation_index),
                     ]
                     m.next = "REJECT"
