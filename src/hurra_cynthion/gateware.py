@@ -349,6 +349,8 @@ class ReportInjectionDataPlane(Elaboratable):
 
         m.d.comb += [
             map_store.begin.eq(begin_accept),
+            # MAP_BEGIN.flags; MAP_COMMIT's copy is never looked at.
+            map_store.begin_flags.eq(rx_staged_payload[48:64]),
             map_store.entry_valid.eq(entry_accept),
             map_store.entry.as_value().eq(rx_staged_payload),
             map_store.commit.eq(commit_accept),

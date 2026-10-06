@@ -21,6 +21,7 @@ from .injection_wire import (
     INJ_MAP_ENTRY_FLAG_WHEEL,
     INJ_MAP_ENTRY_FLAG_X,
     INJ_MAP_ENTRY_FLAG_Y,
+    INJ_MAP_FLAG_NATIVE_ONLY,
     INJ_MAP_STATUS_ERROR_BIT_OFFSET,
     INJ_MAP_STATUS_ERROR_CRC,
     INJ_MAP_STATUS_ERROR_DESCRIPTOR_GENERATION,
@@ -152,6 +153,10 @@ class InjectionMapStore(Elaboratable):
         self.candidate_entry_count = Signal(8)
         self.candidate_layout_count = Signal(8)
         self.candidate_entries_crc32 = Signal(32)
+        #: MAP_BEGIN.flags, sampled on the same cycle as ``begin``. Bit 0 is
+        #: MAP_FLAG.NATIVE_ONLY; undefined bits are ignored (the sender's
+        #: transmit mask refuses them). MAP_COMMIT's flags are never read.
+        self.begin_flags = Signal(16)
 
         self.busy = Signal()
         self.commit_ack = Signal()
@@ -166,6 +171,11 @@ class InjectionMapStore(Elaboratable):
         self.active_layout_count = Signal(5)
         #: Pulses on the first cycle ``active_*`` describe a newly committed map.
         self.activated = Signal()
+        #: The active map was begun with MAP_FLAG.NATIVE_ONLY: the engine commits
+        #: commands to its layouts' records and acks with nothing on the wire. A
+        #: plain register written at ACCEPT, the same edge as the bank flip --
+        #: cheaper than and equivalent to ``Array(bank_flags)[active_bank]``.
+        self.active_native_only = Signal()
 
         #: The active bank's layout directory entry at ``directory_index``, one
         #: cycle behind it. The engine walks a new map's layouts through this.
@@ -255,6 +265,7 @@ class InjectionMapStore(Elaboratable):
         latched_entry_count = Signal(8)
         latched_layout_count = Signal(8)
         latched_entries_crc32 = Signal(32)
+        latched_native_only = Signal()
 
         validation_index = Signal(range(self.max_fields))
         crc_byte_index = Signal(range(MAX_PAYLOAD))
@@ -549,6 +560,7 @@ class InjectionMapStore(Elaboratable):
                         latched_entry_count.eq(self.candidate_entry_count),
                         latched_layout_count.eq(self.candidate_layout_count),
                         latched_entries_crc32.eq(self.candidate_entries_crc32),
+                        latched_native_only.eq((self.begin_flags & INJ_MAP_FLAG_NATIVE_ONLY) != 0),
                     ]
                     m.next = "RECEIVE"
 
@@ -882,6 +894,7 @@ class InjectionMapStore(Elaboratable):
                             ]
                     m.d.usb += [
                         self.active_bank.eq(inactive_bank),
+                        self.active_native_only.eq(latched_native_only),
                         validation_active.eq(0),
                         self.commit_ack.eq(1),
                         self.commit_error.eq(MapError.NONE),
@@ -909,5 +922,6 @@ class InjectionMapStore(Elaboratable):
         with m.If(self.invalidate | invalidation_latched):
             for valid in bank_valid:
                 m.d.usb += valid.eq(0)
+            m.d.usb += self.active_native_only.eq(0)
 
         return m

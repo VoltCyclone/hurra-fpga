@@ -12,6 +12,7 @@ from hurra_cynthion.injection_wire import (
     INJ_MAP_ENTRY_FLAG_RELATIVE,
     INJ_MAP_ENTRY_FLAG_SIGNED,
     INJ_MAP_ENTRY_FLAG_X,
+    INJ_MAP_FLAG_NATIVE_ONLY,
     INJ_MAP_STATUS_ERROR_NONE,
     INJ_MAP_STATUS_STATUS_COMMIT_ACCEPTED,
     INJ_RELATIVE_FLAG_X,
@@ -109,43 +110,55 @@ async def send_rx(ctx, plane, type_: int, payload: bytes, *, sequence: int = 0) 
     raise AssertionError(f"RX type 0x{type_:02x} was not accepted")
 
 
-async def commit_map(
+async def commit_entries(
     ctx,
     harness,
-    entry: MapEntryPayload,
+    entries: list[MapEntryPayload],
     *,
     sequence_start: int = 1,
+    begin_flags: int = 0,
+    commit_flags: int | None = None,
 ) -> None:
+    """MAP_BEGIN -> MAP_ENTRY* -> MAP_COMMIT through the real decode path.
+
+    The MCU mirrors begin metadata into commit, so ``commit_flags`` defaults to
+    ``begin_flags``; pass it explicitly to prove the commit copy is ignored.
+    """
     plane = harness.plane
-    canonical = entry.to_bytes()
+    canonical = b"".join(entry.to_bytes() for entry in entries)
+    layouts = {
+        (entry.interface_number, entry.endpoint_number, entry.report_id) for entry in entries
+    }
     metadata = {
-        "descriptor_generation": entry.descriptor_generation,
-        "map_generation": entry.map_generation,
-        "entry_count": 1,
-        "layout_count": 1,
-        "flags": 0,
+        "descriptor_generation": entries[0].descriptor_generation,
+        "map_generation": entries[0].map_generation,
+        "entry_count": len(entries),
+        "layout_count": len(layouts),
         "entries_crc32": zlib.crc32(canonical),
     }
     await send_rx(
         ctx,
         plane,
         INJ_TYPE_MAP_BEGIN,
-        MapBeginPayload(**metadata).to_bytes(),
+        MapBeginPayload(flags=begin_flags, **metadata).to_bytes(),
         sequence=sequence_start,
     )
-    await send_rx(
-        ctx,
-        plane,
-        INJ_TYPE_MAP_ENTRY,
-        canonical,
-        sequence=(sequence_start + 1) & 0xFF,
-    )
+    for index, entry in enumerate(entries):
+        await send_rx(
+            ctx,
+            plane,
+            INJ_TYPE_MAP_ENTRY,
+            entry.to_bytes(),
+            sequence=(sequence_start + 1 + index) & 0xFF,
+        )
     await send_rx(
         ctx,
         plane,
         INJ_TYPE_MAP_COMMIT,
-        MapCommitPayload(**metadata).to_bytes(),
-        sequence=(sequence_start + 2) & 0xFF,
+        MapCommitPayload(
+            flags=begin_flags if commit_flags is None else commit_flags, **metadata
+        ).to_bytes(),
+        sequence=(sequence_start + 1 + len(entries)) & 0xFF,
     )
     for _ in range(8_000):
         await ctx.tick("usb")
@@ -154,6 +167,25 @@ async def commit_map(
             assert ctx.get(plane.map_store.active_valid)
             return
     raise AssertionError("decoded map commit did not complete")
+
+
+async def commit_map(
+    ctx,
+    harness,
+    entry: MapEntryPayload,
+    *,
+    sequence_start: int = 1,
+    begin_flags: int = 0,
+    commit_flags: int | None = None,
+) -> None:
+    await commit_entries(
+        ctx,
+        harness,
+        [entry],
+        sequence_start=sequence_start,
+        begin_flags=begin_flags,
+        commit_flags=commit_flags,
+    )
 
 
 async def commit_empty_map(
@@ -1206,5 +1238,35 @@ def test_a_command_for_a_boot_protocol_endpoint_is_dropped_not_left_blocking_the
         await drive_relative(ctx, plane, x=10, sequence=0x22)
         await push_report(ctx, plane, bytes([5]))
         assert await drain_output(ctx, plane, 1) == bytes([15])
+
+    run_simulation(bench)
+
+
+def test_map_begin_flags_reach_the_store_and_commit_flags_are_ignored() -> None:
+    async def bench(ctx, harness) -> None:
+        plane = harness.plane
+        await initialize(ctx, plane)
+        entry = relative_x_entry(descriptor_generation=ctx.get(harness.store.descriptor_generation))
+        await commit_map(
+            ctx,
+            harness,
+            entry,
+            begin_flags=INJ_MAP_FLAG_NATIVE_ONLY,
+            commit_flags=INJ_MAP_FLAG_NATIVE_ONLY,
+        )
+        assert ctx.get(plane.map_store.active_native_only) == 1
+
+        # Only MAP_BEGIN's flags count: a commit that claims NATIVE_ONLY for a
+        # map begun without it changes nothing.
+        await commit_map(
+            ctx,
+            harness,
+            replace(entry, map_generation=2),
+            sequence_start=4,
+            begin_flags=0,
+            commit_flags=INJ_MAP_FLAG_NATIVE_ONLY,
+        )
+        assert ctx.get(plane.map_store.active_generation) == 2
+        assert ctx.get(plane.map_store.active_native_only) == 0
 
     run_simulation(bench)

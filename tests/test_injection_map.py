@@ -16,6 +16,7 @@ from hurra_cynthion.injection_wire import (
     INJ_MAP_ENTRY_FLAG_SIGNED,
     INJ_MAP_ENTRY_FLAG_X,
     INJ_MAP_ENTRY_FLAG_Y,
+    INJ_MAP_FLAG_NATIVE_ONLY,
     MapEntryPayload,
 )
 
@@ -154,6 +155,7 @@ async def commit_candidate(
     commit_generation: int | None = None,
     commit_descriptor_generation: int | None = None,
     after_commit=None,
+    begin_flags: int = 0,
 ) -> CommitResult:
     entries = [
         with_candidate_metadata(
@@ -180,9 +182,12 @@ async def commit_candidate(
     ctx.set(store.candidate_entry_count, declared_entry_count)
     ctx.set(store.candidate_layout_count, declared_layout_count)
     ctx.set(store.candidate_entries_crc32, entries_crc32)
+    ctx.set(store.begin_flags, begin_flags)
     ctx.set(store.begin, 1)
     await ctx.tick("usb")
     ctx.set(store.begin, 0)
+    # Sampled with begin: a value presented later, commit included, is ignored.
+    ctx.set(store.begin_flags, 0)
 
     for entry in entries:
         ctx.set(store.entry.as_value(), int.from_bytes(entry.to_bytes(), "little"))
@@ -1116,3 +1121,53 @@ def test_module_elaborates_to_two_banks_of_sixty_four_packed_entries() -> None:
     assert netlist.count("memory width 16 size 512") == 1
     assert netlist.count("memory width 31 size 32") == 1
     assert "layout_interface_0_0" not in netlist
+
+
+def test_map_begin_native_only_flag_is_published_with_the_bank_flip() -> None:
+    # MAP_BEGIN.flags bit 0 is NATIVE_ONLY. It is latched with the other begin
+    # metadata and published as a plain register on the ACCEPT edge, so the
+    # engine reads the active map's flag with no bank select in front of it.
+    async def bench(ctx, store) -> None:
+        assert ctx.get(store.active_native_only) == 0
+        result = await commit_candidate(ctx, store, generation=1, entries=[field("x", 0, 8)])
+        assert result.error == MapError.NONE
+        assert ctx.get(store.active_native_only) == 0
+
+        result = await commit_candidate(
+            ctx,
+            store,
+            generation=2,
+            entries=[field("x", 0, 8)],
+            begin_flags=INJ_MAP_FLAG_NATIVE_ONLY,
+        )
+        assert result.error == MapError.NONE
+        assert ctx.get(store.active_native_only) == 1
+
+        # A rejected candidate leaves the active map alone, flag included.
+        result = await commit_candidate(
+            ctx, store, generation=3, entries=[field("x", 0, 8)], entries_crc32=0x12345678
+        )
+        assert result.error == MapError.CRC
+        assert ctx.get(store.active_native_only) == 1
+
+        # Flipping to a map begun without the flag clears it.
+        result = await commit_candidate(ctx, store, generation=4, entries=[field("x", 0, 8)])
+        assert result.error == MapError.NONE
+        assert ctx.get(store.active_native_only) == 0
+
+        # Invalidation clears it with the banks.
+        result = await commit_candidate(
+            ctx,
+            store,
+            generation=5,
+            entries=[field("x", 0, 8)],
+            begin_flags=INJ_MAP_FLAG_NATIVE_ONLY,
+        )
+        assert ctx.get(store.active_native_only) == 1
+        ctx.set(store.invalidate, 1)
+        await ctx.tick("usb")
+        ctx.set(store.invalidate, 0)
+        await ctx.tick("usb")
+        assert ctx.get(store.active_native_only) == 0
+
+    simulated_store(bench)
