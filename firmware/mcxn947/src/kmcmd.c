@@ -36,11 +36,12 @@ static uint32_t s_physical;
 
 // Held pad vector: the mirror of s_buttons for ABSOLUTE. Bit k of the mask
 // holds channel k at s_abs_values[k]; every edit re-sends the whole vector,
-// a refusal rolls it back. There is no silent release here -- the FPGA holds
-// exactly what was last sent, and the mirror must agree with it or an
-// "unchanged" setter would be acked for a value the FPGA never got.
+// a refusal rolls it back. During pad.hold's window the cleared mirror is
+// ahead of the FPGA, so the next explicit ABSOLUTE must reach the sink and
+// supersede the pending timed release even when the mirror is unchanged.
 static int16_t s_abs_values[KMCMD_PAD_CHANNELS];
 static uint8_t s_abs_mask;
+static bool s_abs_hold_pending;
 
 // Reply prefix for the line being handled: "km." or "pad.". Set by
 // kmcmd_line() before dispatch so every handler frames its answer in the
@@ -643,17 +644,24 @@ static void handle_button(reply_t *reply, const char *name, uint32_t bit, const 
         return;
     }
 
+    if (args[0] != 0 && args[0] != 1 && args[0] != 2) {
+        emit_refusal(reply, name, "badstate");
+        return;
+    }
+
     // MAKCU state 2 is "silent_release": zero the state without emitting a
     // frame, so the change rides out on the next real report instead of
-    // provoking one.
+    // provoking one. It still belongs to km.*, so a pad or non-injectable
+    // device must refuse it before the shared button mirror can be changed.
     if (args[0] == 2) {
+        const kmcmd_device_class_t cls = device_class();
+        if (cls == KMCMD_DEVICE_PAD || cls == KMCMD_DEVICE_NONE) {
+            emit_refusal(reply, name, "nomouse");
+            return;
+        }
         s_buttons &= ~bit;
         note_accepted();
         emit_ack(reply, name, args, count);
-        return;
-    }
-    if (args[0] != 0 && args[0] != 1) {
-        emit_refusal(reply, name, "badstate");
         return;
     }
 
@@ -803,7 +811,7 @@ static void handle_lock_button(reply_t *reply, const char *name, uint32_t bit, c
 static bool send_absolute(reply_t *reply, const char *name, const int32_t *args, uint32_t count,
                           uint8_t previous_mask, const int16_t previous_values[KMCMD_PAD_CHANNELS])
 {
-    if (s_abs_mask == previous_mask &&
+    if (!s_abs_hold_pending && s_abs_mask == previous_mask &&
         memcmp(s_abs_values, previous_values, sizeof(s_abs_values)) == 0) {
         note_accepted();
         emit_ack(reply, name, args, count);
@@ -816,6 +824,7 @@ static bool send_absolute(reply_t *reply, const char *name, const int32_t *args,
         emit_refusal(reply, name, "busy");
         return false;
     }
+    s_abs_hold_pending = false;
     note_accepted();
     emit_ack(reply, name, args, count);
     return true;
@@ -965,6 +974,7 @@ static void handle_pad_hold(reply_t *reply, const char *name, const int32_t *arg
         return;
     }
     s_abs_mask = 0u;
+    s_abs_hold_pending = true;
     note_accepted();
     emit_ack(reply, name, args, count);
 }
@@ -1192,6 +1202,7 @@ void kmcmd_set_link(bool up)
     s_buttons_sent = 0u;
     s_physical = 0u;
     s_abs_mask = 0u;
+    s_abs_hold_pending = false;
     memset(s_abs_values, 0, sizeof(s_abs_values));
 }
 
@@ -1222,6 +1233,7 @@ void kmcmd_init(const kmcmd_ops_t *ops)
     s_buttons_sent = 0u;
     s_physical = 0u;
     s_abs_mask = 0u;
+    s_abs_hold_pending = false;
     memset(s_abs_values, 0, sizeof(s_abs_values));
     s_pend_x = 0;
     s_pend_y = 0;

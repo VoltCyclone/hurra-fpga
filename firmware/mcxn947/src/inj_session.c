@@ -491,6 +491,7 @@ bool inj_session_request_absolute(inj_session_t *s, uint8_t mask,
     if (!request_slot_free(s)) {
         return false;
     }
+    s->abs_release_slots = 0u;
     // layout.axes is the bitmask of channels the map carries (a pad kind IS
     // its channel). A held channel with no entry would be harmless to the
     // FPGA and a lie to the caller, so it is dropped and counted here.

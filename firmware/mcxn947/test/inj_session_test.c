@@ -1136,7 +1136,7 @@ static void test_absolute_drops_unmapped_channels_and_refuses_on_a_mouse(void)
 }
 
 // pad.hold: release_in(3) emits ABSOLUTE flags 0 on the third fill, with no
-// request occupying the slot; a pending request takes its slot first.
+// request occupying the slot.
 static void test_release_timer_emits_mask_zero_when_it_expires(void)
 {
     inj_session_t s;
@@ -1157,17 +1157,6 @@ static void test_release_timer_emits_mask_zero_when_it_expires(void)
     assert(s.abs_release_slots == 0u);
     tick(&s, 4u);  // disarmed: nothing more
 
-    // A request landing on the expiry slot goes first; the release follows.
-    assert(inj_session_request_absolute_release_in(&s, 1u));
-    const int16_t values[INJ_SESSION_PAD_CHANNELS] = {9, 0, 0, 0, 0, 0, 0};
-    assert(inj_session_request_absolute(&s, INJ_ABSOLUTE_FLAG_LX, values));
-    (void)next_frame(&s, &type, p);
-    memcpy(&abs, p, sizeof(abs));
-    assert(abs.flags == INJ_ABSOLUTE_FLAG_LX);
-    (void)next_frame(&s, &type, p);
-    memcpy(&abs, p, sizeof(abs));
-    assert(abs.flags == 0u);
-
     // release_in(0) disarms; a link drop disarms too.
     assert(inj_session_request_absolute_release_in(&s, 5u));
     assert(inj_session_request_absolute_release_in(&s, 0u));
@@ -1175,6 +1164,29 @@ static void test_release_timer_emits_mask_zero_when_it_expires(void)
     assert(inj_session_request_absolute_release_in(&s, 5u));
     inj_session_set_link(&s, false);
     assert(s.abs_release_slots == 0u);
+}
+
+// A newly accepted explicit vector owns the ABSOLUTE state, so it supersedes
+// an older timed release instead of being cleared a few fills later.
+static void test_explicit_absolute_supersedes_pending_release_timer(void)
+{
+    inj_session_t s;
+    reach_injecting_pad(&s);
+    assert(inj_session_request_absolute_release_in(&s, 3u));
+
+    const int16_t values[INJ_SESSION_PAD_CHANNELS] = {9, 0, 0, 0, 0, 0, 0};
+    assert(inj_session_request_absolute(&s, INJ_ABSOLUTE_FLAG_LX, values));
+    uint8_t type = 0u;
+    uint8_t p[INJ_FRAME_PAYLOAD_SIZE];
+    (void)next_frame(&s, &type, p);
+    inj_absolute_payload_t abs;
+    memcpy(&abs, p, sizeof(abs));
+    assert(type == INJ_TYPE_ABSOLUTE && abs.flags == INJ_ABSOLUTE_FLAG_LX);
+    assert(abs.lx == 9);
+
+    tick(&s, 4u);
+    assert(s.requests_sent == 1u);
+    assert(s.absolute_releases == 0u);
 }
 
 // inj_session_device_class in every phase: UNKNOWN with the link down or no
@@ -1242,6 +1254,7 @@ int main(void)
     test_requested_absolute_emits_absolute();
     test_absolute_drops_unmapped_channels_and_refuses_on_a_mouse();
     test_release_timer_emits_mask_zero_when_it_expires();
+    test_explicit_absolute_supersedes_pending_release_timer();
     test_device_class_follows_the_verdict();
 
     printf("inj_session_test: ok\n");

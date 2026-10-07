@@ -1112,7 +1112,16 @@ static void test_pad_hold_arms_the_sink_timer_and_clears_the_mirror(void)
     assert(line("pad.hold(250)") == KMCMD_HANDLED);
     assert(g_abs_hold_count == 1u && g_abs_hold_ms == 250u);
     assert(g_abs_count == 1u);  // the release is the sink's, not a frame from here
-    // The mirror says released, so re-holding lx is a change and goes out.
+    // Even though the mirror says released, an explicit release must reach the
+    // sink so it can supersede the pending timed release.
+    assert(line("pad.release()") == KMCMD_HANDLED);
+    assert(g_abs_count == 2u);
+    assert(g_abs_masks[1] == 0u);
+
+    pad_setup();
+    line("pad.lx(300)");
+    assert(line("pad.hold(250)") == KMCMD_HANDLED);
+    // Re-holding the same value during the hold window must also reach the sink.
     assert(line("pad.lx(300)") == KMCMD_HANDLED);
     assert(g_abs_count == 2u);
     assert(g_abs_masks[1] == (1u << KMCMD_PAD_LX));
@@ -1150,6 +1159,12 @@ static void test_pad_and_mouse_refusal_matrix(void)
     assert(replied("nomouse"));
     assert(line("km.left(1)") == KMCMD_HANDLED);
     assert(replied("nomouse"));
+    assert(line("pad.btn(1,1)") == KMCMD_HANDLED);
+    assert(g_mask_count == 1u && g_mask_writes[0] == 0x1u);
+    assert(line("km.left(2)") == KMCMD_HANDLED);
+    assert(replied("nomouse"));
+    assert(line("pad.btn(2,1)") == KMCMD_HANDLED);
+    assert(g_mask_count == 2u && g_mask_writes[1] == 0x3u);
     assert(!kmcmd_pending());
 
     setup();
