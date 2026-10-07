@@ -320,7 +320,27 @@ REQUIRED_NEXTPNR_FLAG = "--placer-heap-timingweight"
 #: control endpoint -> a relay IN endpoint's tx_manager buffer read (the G5
 #: family); 2 in map_store.active_bank -> engine.layout_state data / its
 #: write enable (the bank -> commit family), both at +13%. Pin 10 -> 4.
-DEFAULT_PLACER_SEED = 4
+#:
+#: Pad injection: class-3 absolute map entries with a channel byte, the
+#: ABSOLUTE command, a separate 16 x 119-bit ``pad_state`` memory beside the
+#: state record (written a cycle late from a registered enable), NATIVE_ONLY
+#: suppressed transactions that ack with nothing on the wire, a one-hot
+#: registered RX type decode, the ``pad_hold`` register. About 1,600 LUTs
+#: (the estimate was 300-500). Netlist sha 0c032ea195269285 (native),
+#: 21,824 LUTs = 89%:
+#:
+#:     2: 73.92   1: 73.19   10: 73.18  3: 72.91   4: 72.86   12: 72.53
+#:     9: 72.14   11: 72.08  5: 72.01   8: 70.63   7: 69.97   6: 69.56
+#:
+#: Median 72.3, worst 69.56 (+15.9%) -- the best floor on record, and per
+#: the placement-spread caveat above not evidence the logic got faster. 6 of
+#: 12 seeds end in map_store.active_bank / bank_descriptor_generation ->
+#: engine.layout_state (the state-record memory; pad_state was kept off this
+#: cone on purpose); 4 in the clone (setup decoder, tx_manager, current_speed)
+#: -> descriptor_store.device_lookup_found / shared_payload_read addr; 2 in
+#: device.reset_sequencer.current_speed -> translator.phy_ready. None in the
+#: new logic. Pin 4 -> 2.
+DEFAULT_PLACER_SEED = 2
 
 #: The full option, including the weight and seed that were actually measured.
 #: A caller-supplied ``--seed`` is composed after this one and wins, because
