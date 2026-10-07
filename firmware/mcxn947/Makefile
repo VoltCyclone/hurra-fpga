@@ -36,6 +36,9 @@ SIZE    := $(CROSS_COMPILE)size
 HOST_CC ?= cc
 
 DEMO ?= 0
+ifeq ($(filter 0 1,$(DEMO)),)
+$(error DEMO must be 0 or 1, got '$(DEMO)')
+endif
 DEMO_CFLAGS := $(if $(filter 1,$(DEMO)),-DHURRA_DEMO=1)
 DEMO_CONFIG_STAMP := build/.demo-config
 

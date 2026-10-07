@@ -57,7 +57,8 @@
 //
 // This also answers the 8 kHz hazard from the other direction. A SUSTAINED
 // per-report delta accumulates at delta x 8000 counts/s, which is why
-// inj_session.c paces its steady drift at ~40 injections/s. A drained budget is
+// inj_session.c paces the DEMO=1 build's steady drift at ~40 injections/s (the
+// shipping image has no drift). A drained budget is
 // not sustained: it is a fixed number of counts that stops when it is spent, so
 // `km.move(300,0)` moves 300 counts and then stops, regardless of how fast the
 // steps are issued. Rate only decides how long the move takes.
