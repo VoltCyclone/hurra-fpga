@@ -1440,9 +1440,10 @@ def test_an_absolute_for_a_boot_protocol_endpoint_is_dropped_as_stale() -> None:
 
 def test_an_absolute_with_a_stale_map_generation_is_dropped_not_queued() -> None:
     # command_fresh fails on the generation mismatch, so the frame drains as
-    # invalid_rx instead of waiting for an ack no layout would ever give. (A
-    # FRESH command for a layout the map lacks is a different, pre-existing
-    # hazard shared by every command type; see the plan's "Flagged" section.)
+    # invalid_rx instead of waiting for an ack no layout would ever give. A FRESH
+    # command for a layout the active map lacks is a different, pre-existing hazard
+    # shared by every command type: command_fresh checks only link/session/map-generation,
+    # so such a frame waits in command_ready for an ack no record will give.
     async def bench(ctx, harness) -> None:
         plane = harness.plane
         await initialize(ctx, plane)

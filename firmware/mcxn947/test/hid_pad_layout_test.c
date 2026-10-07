@@ -210,6 +210,15 @@ static void test_too_many_fields_is_unsupported_not_truncated(void)
 static void test_real_ds4_compiles_like_the_shaped_fixture(void)
 {
     assert(sizeof(HID_FIXTURE_DS4) == 507u);
+    bool any_nonzero = false;
+    for (size_t i = 0u; i < sizeof(HID_FIXTURE_DS4); ++i) {
+        if (HID_FIXTURE_DS4[i] != 0u) {
+            any_nonzero = true;
+            break;
+        }
+    }
+    const bool captured = HID_FIXTURE_DS4_CAPTURED != 0;
+    assert(captured == any_nonzero);
 #if HID_FIXTURE_DS4_CAPTURED
     hid_layout_t l;
     assert(hid_pad_compile(HID_FIXTURE_DS4, sizeof(HID_FIXTURE_DS4), &l) == HID_PAD_OK);

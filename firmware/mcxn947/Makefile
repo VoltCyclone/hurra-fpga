@@ -520,7 +520,7 @@ build/core0/usb_console.o: src/usb_console.c src/usb_console.h src/console.h \
 		src/fault.h src/kmcmd.h src/core1_release.h src/inj_session.h src/hid_layout.h \
 		src/dbg_uart.h src/link.h src/link_retire.h src/platform.h \
 		src/reset_cause.h src/shared_window.h src/link_snapshot.h \
-		src/tusb_config.h | build/core0
+		src/tusb_config.h include/injection_wire.h | build/core0
 	$(CC) $(COMMON_CFLAGS) $(GLUE_WARNINGS) -c $< -o $@
 
 # --- vendored TinyUSB ------------------------------------------------------

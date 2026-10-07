@@ -33,8 +33,8 @@ typedef enum {
 } hid_mouse_kind_t;
 
 // A pad axis kind equals its MAP_ENTRY channel (injection_wire.h
-// INJ_MAP_ENTRY_CHANNEL_*); usb_console.c static-asserts the two agree, since
-// this header must not include the wire contract (kmcmd.h shares the numbers).
+// INJ_MAP_ENTRY_CHANNEL_*); inj_map_build.c pins the HID_PAD_KIND side and
+// usb_console.c the kmcmd side, since this header must not include the wire contract.
 typedef enum {
     HID_PAD_KIND_LX = 0,
     HID_PAD_KIND_LY = 1,

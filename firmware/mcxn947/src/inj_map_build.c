@@ -6,6 +6,22 @@
 
 #include "inj_command.h"
 
+// field->kind is written directly to .channel, so pin the independently defined enums.
+_Static_assert((unsigned)HID_PAD_KIND_LX == (unsigned)INJ_MAP_ENTRY_CHANNEL_LX,
+               "HID pad LX kind must match its wire channel");
+_Static_assert((unsigned)HID_PAD_KIND_LY == (unsigned)INJ_MAP_ENTRY_CHANNEL_LY,
+               "HID pad LY kind must match its wire channel");
+_Static_assert((unsigned)HID_PAD_KIND_RX == (unsigned)INJ_MAP_ENTRY_CHANNEL_RX,
+               "HID pad RX kind must match its wire channel");
+_Static_assert((unsigned)HID_PAD_KIND_RY == (unsigned)INJ_MAP_ENTRY_CHANNEL_RY,
+               "HID pad RY kind must match its wire channel");
+_Static_assert((unsigned)HID_PAD_KIND_LT == (unsigned)INJ_MAP_ENTRY_CHANNEL_LT,
+               "HID pad LT kind must match its wire channel");
+_Static_assert((unsigned)HID_PAD_KIND_RT == (unsigned)INJ_MAP_ENTRY_CHANNEL_RT,
+               "HID pad RT kind must match its wire channel");
+_Static_assert((unsigned)HID_PAD_KIND_HAT == (unsigned)INJ_MAP_ENTRY_CHANNEL_HAT,
+               "HID pad HAT kind must match its wire channel");
+
 // A pad axis is the ABSOLUTE class: neither RELATIVE nor BUTTON set. SIGNED is
 // informational there (the engine ignores it for class 3) and is set for a
 // negative logical minimum as it is for a mouse axis.
