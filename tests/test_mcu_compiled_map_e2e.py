@@ -504,6 +504,7 @@ def test_absolute_sets_a_still_pad_and_the_next_native_carries_it(tmp_path: Path
         await ctx.tick("usb")
         ctx.set(plane.sof_tick, 0)
         for _ in range(20_000):
+            assert not ctx.get(plane.output_valid), "a report was offered on a NATIVE_ONLY map"
             if ctx.get(plane.engine.held_mask) == held:
                 break
             await ctx.tick("usb")
@@ -529,6 +530,7 @@ def test_absolute_sets_a_still_pad_and_the_next_native_carries_it(tmp_path: Path
         await ctx.tick("usb")
         ctx.set(plane.sof_tick, 0)
         for _ in range(20_000):
+            assert not ctx.get(plane.output_valid), "a report was offered on a NATIVE_ONLY map"
             if ctx.get(plane.command_commit_count) == 2:
                 break
             await ctx.tick("usb")
