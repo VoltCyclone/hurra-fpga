@@ -111,6 +111,19 @@ bool link_slot_is_inert_idle(const uint8_t slot[INJ_FRAME_SIZE]);
 // Successor bank in the ring.
 uint8_t link_next_bank(uint8_t bank);
 
+// Pad channels in an ABSOLUTE, indexed by MAP_ENTRY_CHANNEL; link.c holds this
+// to inj_session.h's figure.
+#define LINK_PAD_CHANNELS 7u
+
+// Map a host-side normalized position (-32768..32767) onto a field's logical
+// range, linearly, rounded to nearest, and return the FIELD BIT PATTERN as the
+// wire's i16: an unsigned 16-bit field's 40000 travels as 0x9C40 (-25536), and
+// the FPGA writes only `bit_width` bits, so the pattern is what matters. The
+// result never leaves [logical_min, logical_max]: the offset is 0..65535 and
+// (offset * span + 32767) / 65535 is 0..span. A degenerate range yields its
+// minimum. Pure; host-tested by link_test.c.
+int16_t link_scale_absolute(int16_t normalized, int32_t logical_min, int32_t logical_max);
+
 // --- Diagnostics the FPGA cannot see ---------------------------------------
 //
 // The counters in link_retire.h mirror the FPGA's own by name and are the
@@ -184,6 +197,23 @@ bool link_inject_request_relative(int16_t x, int16_t y, int16_t wheel, int16_t p
 // motion step refuses a button request and vice versa -- the queue is one deep.
 bool link_inject_request_buttons(uint64_t mask, uint16_t hold_reports);
 bool link_inject_request_physical_mask(uint64_t button_mask);
+
+// Queue the held pad vector. `mask` bit k holds channel k; normalized[k] is
+// -32768..32767 for the six axes and the raw 0..7 / 8 (null) for the hat. The
+// scaling to each field's logical range happens HERE, with the retirement
+// interrupt masked, because only this side has the adopted layout and the ISR
+// zeroes it on a new descriptor generation. kmcmd never sees the layout or the
+// wire header.
+bool link_inject_request_absolute(uint8_t mask, const int16_t normalized[LINK_PAD_CHANNELS]);
+
+// pad.hold: after `ms` the session emits an ABSOLUTE with mask 0 by itself.
+// 125 us slots, so ms x 8; 0 disarms.
+bool link_inject_request_absolute_hold(uint32_t ms);
+
+// What is attached, as inj_session_device_class() reports it (an
+// inj_device_class_t value): UNKNOWN until a verdict or while mcu_ready is
+// low, NONE for a keyboard, MOUSE or PAD once a layout is adopted.
+uint8_t link_inject_device_class(void);
 
 // True while the FPGA would honour an injection command: the MCU-side mirror of
 // gateware.py's command_fresh (link up, session active, map committed and the

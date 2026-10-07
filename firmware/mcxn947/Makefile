@@ -318,6 +318,7 @@ CORE0_OBJECTS := \
 	build/core0/hid_item.o \
 	build/core0/hid_fields.o \
 	build/core0/hid_mouse_layout.o \
+	build/core0/hid_pad_layout.o \
 	build/core0/inj_map_build.o \
 	build/core0/usb_descriptors.o \
 	build/core0/usb_console.o \
@@ -423,7 +424,7 @@ build/core0/link.o: src/link.c src/link.h src/link_retire.h src/link_recovery.h 
 		src/spi_frame.h src/platform.h src/dbg_uart.h src/shared_window.h \
 		src/link_snapshot.h src/inj_command.h src/inj_session.h src/reset_cause.h \
 		src/hid_descriptor_set.h src/hid_descriptor_reassembly.h src/hid_mouse_layout.h \
-		src/hid_layout.h \
+		src/hid_pad_layout.h src/hid_layout.h \
 		include/injection_wire.h | build/core0
 	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 

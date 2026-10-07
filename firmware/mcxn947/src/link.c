@@ -35,6 +35,18 @@ uint8_t link_next_bank(uint8_t bank)
     return (uint8_t)((bank + 1u) & (LINK_SLOT_BANKS - 1u));
 }
 
+int16_t link_scale_absolute(int16_t normalized, int32_t logical_min, int32_t logical_max)
+{
+    if (logical_max <= logical_min) {
+        return (int16_t)(uint16_t)((uint32_t)logical_min & 0xFFFFu);
+    }
+    const int64_t span = (int64_t)logical_max - (int64_t)logical_min;
+    const int64_t offset = (int64_t)normalized + 32768;  // 0..65535
+    const int64_t scaled = (offset * span + 32767) / 65535;  // round to nearest
+    const int64_t value = (int64_t)logical_min + scaled;
+    return (int16_t)(uint16_t)((uint64_t)value & 0xFFFFu);
+}
+
 #if defined(MCXN947)
 
 #include <string.h>
@@ -63,6 +75,7 @@ _Static_assert(SHARED_DESCRIPTOR_CAPACITY == INJ_MAX_DESCRIPTOR_BYTES_PER_INTERF
 // still links against nothing but spi_frame.c, as test/link_test.c does.
 #include "hid_descriptor_set.h"
 #include "hid_mouse_layout.h"
+#include "hid_pad_layout.h"
 #include "link_fault_classify.h"
 #include "link_recovery.h"
 #include "link_retire.h"
@@ -82,6 +95,9 @@ _Static_assert(SHARED_FAULT_MAX_SUSPECTS == LINK_FAULT_MAX_SUSPECTS,
 // against nothing but spi_frame.c (test/link_test.c).
 #include "inj_command.h"
 #include "inj_session.h"
+
+_Static_assert(LINK_PAD_CHANNELS == INJ_SESSION_PAD_CHANNELS,
+               "link.h's pad channel count must match the session's");
 
 // PLATFORM_CORE_HZ, for the FlexComm6 divider static assert below, and
 // platform_ticks() for the report cadence. Portable header; nothing in it is
@@ -254,15 +270,15 @@ static inj_session_t s_inj;
 // composite device the mouse is often not the first interface.
 static hid_descriptor_set_t s_descset;
 
-// Which descriptor the panel is showing, so a mouse interface can displace a
-// non-mouse one that completed first. Foreground only.
+// Which descriptor the panel is showing, so an injectable interface can
+// displace a non-injectable one that completed first. Foreground only.
 static uint16_t s_panel_generation;
 static bool s_panel_valid;
-static bool s_panel_is_mouse;
+static bool s_panel_is_injectable;
 
-// Compile workspace. Static rather than on the stack: core0's whole stack is
-// 2 KiB. Foreground only.
-static hid_mouse_layout_t s_compiled;
+// Compile workspace, shared by both compilers (they run in sequence). Static
+// rather than on the stack: core0's whole stack is 2 KiB. Foreground only.
+static hid_layout_t s_compiled;
 
 // Masks the retirement interrupt for a foreground critical section; defined
 // with the injection wrappers further down, declared here because
@@ -767,22 +783,31 @@ static void link_descriptor_service(void)
         return;
     }
 
+    // Mouse first, then pad on NOT_MOUSE -- both against the same snapshot and
+    // validated once below, so the verdict is about one set of bytes. Mouse
+    // first is the composite-device rule made explicit: a device declaring
+    // both is a mouse. NO_AXES/UNSUPPORTED mean it IS a mouse collection, just
+    // not an injectable one, so the pad compiler is not consulted.
     const hid_mouse_status_t verdict = hid_mouse_compile(snap.bytes, snap.length, &s_compiled);
+    bool injectable = verdict == HID_MOUSE_OK;
+    if (verdict == HID_MOUSE_NOT_MOUSE) {
+        injectable = hid_pad_compile(snap.bytes, snap.length, &s_compiled) == HID_PAD_OK;
+    }
 
     was_enabled = link_retire_irq_mask();
     if (hid_descriptor_set_snapshot_valid(&s_descset, &snap)) {
-        const bool is_mouse = verdict == HID_MOUSE_OK;
         inj_session_offer_layout(&s_inj, snap.generation, snap.slot, snap.interface_number,
-                                 is_mouse ? &s_compiled : NULL);
+                                 injectable ? &s_compiled : NULL);
 
-        // The panel shows the first descriptor of a generation, unless a mouse
-        // turns up later -- that is the one injection is working against.
+        // The panel shows the first descriptor of a generation, unless an
+        // injectable one turns up later -- that is the one injection is
+        // working against.
         if (!s_panel_valid || s_panel_generation != snap.generation ||
-            (is_mouse && !s_panel_is_mouse)) {
+            (injectable && !s_panel_is_injectable)) {
             link_descriptor_publish(&snap);
             s_panel_valid = true;
             s_panel_generation = snap.generation;
-            s_panel_is_mouse = is_mouse;
+            s_panel_is_injectable = injectable;
         }
     }
     link_retire_irq_restore(was_enabled);
@@ -1578,6 +1603,65 @@ bool link_inject_request_physical_mask(uint64_t button_mask)
     return queued;
 }
 
+// The adopted layout's field for a pad channel, or NULL. A pad kind IS its
+// channel (hid_layout.h), so this is a scan for `kind`.
+static const hid_layout_field_t *layout_channel(const hid_layout_t *layout, uint8_t channel)
+{
+    if (layout->device_class != HID_DEVICE_CLASS_PAD) {
+        return NULL;
+    }
+    for (uint8_t i = 0u; i < layout->field_count; ++i) {
+        if (layout->fields[i].kind == channel) {
+            return &layout->fields[i];
+        }
+    }
+    return NULL;
+}
+
+bool link_inject_request_absolute(uint8_t mask, const int16_t normalized[LINK_PAD_CHANNELS])
+{
+    int16_t scaled[LINK_PAD_CHANNELS];
+    const uint32_t was_enabled = link_retire_irq_mask();
+    // Scaled inside the mask: forget_device() zeroes s_inj.layout from the
+    // retirement ISR on a new descriptor generation, and a torn read would
+    // scale against half a layout. Seven multiplies against a 125 us slot.
+    for (uint8_t channel = 0u; channel < LINK_PAD_CHANNELS; ++channel) {
+        scaled[channel] = normalized[channel];
+        if (channel == INJ_MAP_ENTRY_CHANNEL_HAT || (mask & (1u << channel)) == 0u) {
+            continue;  // the hat is raw 0..7 / 8; a released channel's value is ignored
+        }
+        const hid_layout_field_t *field = layout_channel(&s_inj.layout, channel);
+        if (field != NULL) {
+            scaled[channel] = link_scale_absolute(normalized[channel], field->logical_minimum,
+                                                  field->logical_maximum);
+        }
+    }
+    const bool queued = inj_session_request_absolute(&s_inj, mask, scaled);
+    link_retire_irq_restore(was_enabled);
+    return queued;
+}
+
+bool link_inject_request_absolute_hold(uint32_t ms)
+{
+    // 125 us slots: 8 per millisecond. Capped so the multiply cannot wrap; a
+    // hold of 536,870 s is not a hold anyone meant.
+    const uint32_t capped = ms > (UINT32_MAX / 8u) ? (UINT32_MAX / 8u) : ms;
+    const uint32_t was_enabled = link_retire_irq_mask();
+    const bool armed = inj_session_request_absolute_release_in(&s_inj, capped * 8u);
+    link_retire_irq_restore(was_enabled);
+    return armed;
+}
+
+uint8_t link_inject_device_class(void)
+{
+    // One aligned read of ISR-owned state, like link_inject_ready(): a stale
+    // answer costs one wrongly worded refusal, which the next command corrects.
+    if (!s_ready) {
+        return (uint8_t)INJ_DEVICE_CLASS_UNKNOWN;
+    }
+    return (uint8_t)inj_session_device_class(&s_inj);
+}
+
 bool link_inject_no_mouse(void)
 {
     // One aligned read of ISR-owned state, like link_inject_ready(): a stale
@@ -1740,7 +1824,7 @@ void link_init(void)
     // One slot per interface; the retirement ISR that fills it is not armed yet.
     hid_descriptor_set_init(&s_descset);
     s_panel_valid = false;
-    s_panel_is_mouse = false;
+    s_panel_is_injectable = false;
 
     link_idle_slot_cache_init();
     for (uint8_t bank = 0u; bank < LINK_SLOT_BANKS; ++bank) {
