@@ -44,8 +44,14 @@ static uint32_t g_mask_count;
 static uint32_t g_physical_masks[SINK_MAX];
 static uint32_t g_physical_count;
 
+static uint8_t g_abs_masks[SINK_MAX];
+static int16_t g_abs_values[SINK_MAX][KMCMD_PAD_CHANNELS];
+static uint32_t g_abs_count;
+static uint32_t g_abs_hold_ms;
+static uint32_t g_abs_hold_count;
+
 static bool g_ready;
-static bool g_no_mouse;
+static kmcmd_device_class_t g_device_class;
 // Number of further sink calls that will be refused. The sink is allowed to
 // refuse, exactly as the console's writer is: the FPGA has a one-deep command
 // queue, so "not now" is a normal answer and must not be retried in a spin.
@@ -93,10 +99,37 @@ static bool sink_ready(void *ctx)
     return g_ready;
 }
 
-static bool sink_no_mouse(void *ctx)
+static bool sink_absolute(void *ctx, uint8_t mask, const int16_t normalized[KMCMD_PAD_CHANNELS])
 {
     (void)ctx;
-    return g_no_mouse;
+    if (g_refuse_after == 0u) {
+        return false;
+    }
+    g_refuse_after--;
+    if (g_abs_count < SINK_MAX) {
+        g_abs_masks[g_abs_count] = mask;
+        memcpy(g_abs_values[g_abs_count], normalized, sizeof(g_abs_values[0]));
+        g_abs_count++;
+    }
+    return true;
+}
+
+static bool sink_absolute_hold(void *ctx, uint32_t ms)
+{
+    (void)ctx;
+    if (g_refuse_after == 0u) {
+        return false;
+    }
+    g_refuse_after--;
+    g_abs_hold_ms = ms;
+    g_abs_hold_count++;
+    return true;
+}
+
+static kmcmd_device_class_t sink_device_class(void *ctx)
+{
+    (void)ctx;
+    return g_device_class;
 }
 
 static char g_reply[KMCMD_REPLY_MAX];
@@ -110,8 +143,13 @@ static void setup(void)
     g_mask_count = 0u;
     memset(g_physical_masks, 0, sizeof(g_physical_masks));
     g_physical_count = 0u;
+    memset(g_abs_masks, 0, sizeof(g_abs_masks));
+    memset(g_abs_values, 0, sizeof(g_abs_values));
+    g_abs_count = 0u;
+    g_abs_hold_ms = 0u;
+    g_abs_hold_count = 0u;
     g_ready = true;
-    g_no_mouse = false;
+    g_device_class = KMCMD_DEVICE_MOUSE;
     g_refuse_after = 0xFFFFFFFFu;
     memset(g_reply, 0, sizeof(g_reply));
 
@@ -119,8 +157,10 @@ static void setup(void)
         .relative = sink_relative,
         .buttons = sink_buttons,
         .physical_mask = sink_physical_mask,
+        .absolute = sink_absolute,
+        .absolute_hold = sink_absolute_hold,
         .ready = sink_ready,
-        .no_mouse = sink_no_mouse,
+        .device_class = sink_device_class,
         .ctx = NULL,
     };
     kmcmd_init(&ops);
@@ -357,7 +397,7 @@ static void test_move_is_refused_when_only_buttons_are_wired(void)
 static void test_mouse_commands_are_refused_on_a_device_with_no_mouse(void)
 {
     setup();
-    g_no_mouse = true;
+    g_device_class = KMCMD_DEVICE_NONE;
     g_ready = false;
 
     const char *commands[] = {
@@ -380,15 +420,15 @@ static void test_nosink_beats_nomouse(void)
     const kmcmd_ops_t buttons_only = {
         .buttons = sink_buttons,
         .ready = sink_ready,
-        .no_mouse = sink_no_mouse,
+        .device_class = sink_device_class,
     };
-    g_no_mouse = true;
+    g_device_class = KMCMD_DEVICE_NONE;
     kmcmd_init(&buttons_only);
     kmcmd_set_mode(KMCMD_MODE_MAKCU);
     memset(reply, 0, sizeof(reply));
     assert(kmcmd_line("km.move(10,10)", reply, sizeof(reply)) == KMCMD_HANDLED);
     assert(strstr(reply, "nosink") != NULL);
-    g_no_mouse = false;
+    g_device_class = KMCMD_DEVICE_MOUSE;
 }
 
 // kmcmd_pending() answers yes/no, which cannot distinguish a budget that is
@@ -931,6 +971,266 @@ static void test_reply_buffer_is_never_overrun(void)
     (void)kmcmd_line("km.move(1,1)", small, 0u);
 }
 
+// --- pad.* --------------------------------------------------------------------
+//
+// The pad namespace drives ABSOLUTE through the `absolute` op. The vector is
+// state, as the button mask is: a setter edits one channel and the sink sees
+// the whole mask and all seven values every time.
+
+static void pad_setup(void)
+{
+    setup();
+    g_device_class = KMCMD_DEVICE_PAD;
+}
+
+static void test_pad_axis_setters_hold_one_channel_and_resend_the_vector(void)
+{
+    pad_setup();
+    assert(line("pad.lx(1000)") == KMCMD_HANDLED);
+    assert(g_abs_count == 1u);
+    assert(g_abs_masks[0] == (1u << KMCMD_PAD_LX));
+    assert(g_abs_values[0][KMCMD_PAD_LX] == 1000);
+    assert(replied("pad.lx(1000)") && replied(">>>"));
+
+    assert(line("pad.ry(-32768)") == KMCMD_HANDLED);
+    assert(g_abs_count == 2u);
+    // lx stays held: the mask is state, not an event.
+    assert(g_abs_masks[1] == ((1u << KMCMD_PAD_LX) | (1u << KMCMD_PAD_RY)));
+    assert(g_abs_values[1][KMCMD_PAD_LX] == 1000);
+    assert(g_abs_values[1][KMCMD_PAD_RY] == -32768);
+
+    assert(line("pad.rt(32767)") == KMCMD_HANDLED);
+    assert(g_abs_values[2][KMCMD_PAD_RT] == 32767);
+    assert(g_abs_masks[2] == ((1u << KMCMD_PAD_LX) | (1u << KMCMD_PAD_RY) | (1u << KMCMD_PAD_RT)));
+
+    // Out of the normalized range: refused, nothing sent, mirror untouched.
+    assert(line("pad.lx(32768)") == KMCMD_HANDLED);
+    assert(replied("badargs"));
+    assert(g_abs_count == 3u);
+    assert(line("pad.ly(-32769)") == KMCMD_HANDLED);
+    assert(replied("badargs"));
+    assert(g_abs_count == 3u);
+}
+
+static void test_pad_hat_accepts_0_to_8_only(void)
+{
+    pad_setup();
+    assert(line("pad.hat(3)") == KMCMD_HANDLED);
+    assert(g_abs_count == 1u);
+    assert(g_abs_masks[0] == (1u << KMCMD_PAD_HAT));
+    assert(g_abs_values[0][KMCMD_PAD_HAT] == 3);
+
+    assert(line("pad.hat(8)") == KMCMD_HANDLED);  // the null (centred) value is a held value too
+    assert(g_abs_count == 2u);
+    assert(g_abs_values[1][KMCMD_PAD_HAT] == KMCMD_PAD_HAT_NULL);
+
+    assert(line("pad.hat(9)") == KMCMD_HANDLED);
+    assert(replied("badstate"));
+    assert(line("pad.hat(-1)") == KMCMD_HANDLED);
+    assert(replied("badstate"));
+    assert(g_abs_count == 2u);
+}
+
+// A setter that changes nothing is acked but sends no frame, as km.left(1)
+// twice does: the FPGA already holds exactly this.
+static void test_pad_unchanged_setter_is_acked_without_a_frame(void)
+{
+    pad_setup();
+    line("pad.lx(5)");
+    assert(g_abs_count == 1u);
+    assert(line("pad.lx(5)") == KMCMD_HANDLED);
+    assert(g_abs_count == 1u);
+    assert(strstr(g_reply, "(!") == NULL);
+    assert(line("pad.lx(6)") == KMCMD_HANDLED);  // a new value is a change
+    assert(g_abs_count == 2u);
+
+    // pad.release() with nothing held is likewise acked silently.
+    pad_setup();
+    assert(line("pad.release()") == KMCMD_HANDLED);
+    assert(g_abs_count == 0u);
+    assert(strstr(g_reply, "(!") == NULL);
+}
+
+static void test_pad_release_sends_mask_zero_and_keeps_the_values(void)
+{
+    pad_setup();
+    line("pad.lx(700)");
+    line("pad.hat(2)");
+    assert(line("pad.release()") == KMCMD_HANDLED);
+    assert(g_abs_count == 3u);
+    assert(g_abs_masks[2] == 0u);
+    // Re-holding one channel does not resurrect the other.
+    assert(line("pad.lx(700)") == KMCMD_HANDLED);
+    assert(g_abs_masks[3] == (1u << KMCMD_PAD_LX));
+    assert(g_abs_values[3][KMCMD_PAD_LX] == 700);
+}
+
+// A refusing sink rolls the edit back, as handle_button does: the mirror must
+// never run ahead of what the FPGA holds.
+static void test_pad_refused_setter_rolls_back(void)
+{
+    pad_setup();
+    line("pad.lx(100)");
+    g_refuse_after = 0u;
+    assert(line("pad.ly(200)") == KMCMD_HANDLED);
+    assert(replied("busy"));
+    assert(kmcmd_dropped() == 1u);
+    g_refuse_after = 0xFFFFFFFFu;
+    // The next edit carries the rolled-back vector: lx held, ly not.
+    assert(line("pad.rx(1)") == KMCMD_HANDLED);
+    assert(g_abs_masks[g_abs_count - 1u] == ((1u << KMCMD_PAD_LX) | (1u << KMCMD_PAD_RX)));
+    assert(g_abs_values[g_abs_count - 1u][KMCMD_PAD_LY] == 0);
+}
+
+static void test_pad_btn_reuses_the_button_mask(void)
+{
+    pad_setup();
+    assert(line("pad.btn(1,1)") == KMCMD_HANDLED);
+    assert(g_mask_count == 1u && g_mask_writes[0] == 0x1u);
+    assert(line("pad.btn(14,1)") == KMCMD_HANDLED);
+    assert(g_mask_writes[1] == (0x1u | (1u << 13)));
+    assert(line("pad.btn(1,0)") == KMCMD_HANDLED);
+    assert(g_mask_writes[2] == (1u << 13));
+    assert(line("pad.btn(32,1)") == KMCMD_HANDLED);
+    assert(g_mask_writes[3] == ((1u << 13) | 0x80000000u));
+
+    assert(line("pad.btn(0,1)") == KMCMD_HANDLED);
+    assert(replied("nobutton"));
+    assert(line("pad.btn(33,1)") == KMCMD_HANDLED);
+    assert(replied("nobutton"));
+    assert(line("pad.btn(2,2)") == KMCMD_HANDLED);
+    assert(replied("badstate"));
+    assert(line("pad.btn(2)") == KMCMD_HANDLED);
+    assert(replied("badargs"));
+    assert(g_mask_count == 4u);
+}
+
+static void test_pad_hold_arms_the_sink_timer_and_clears_the_mirror(void)
+{
+    pad_setup();
+    line("pad.lx(300)");
+    assert(line("pad.hold(250)") == KMCMD_HANDLED);
+    assert(g_abs_hold_count == 1u && g_abs_hold_ms == 250u);
+    assert(g_abs_count == 1u);  // the release is the sink's, not a frame from here
+    // The mirror says released, so re-holding lx is a change and goes out.
+    assert(line("pad.lx(300)") == KMCMD_HANDLED);
+    assert(g_abs_count == 2u);
+    assert(g_abs_masks[1] == (1u << KMCMD_PAD_LX));
+
+    assert(line("pad.hold(0)") == KMCMD_HANDLED);
+    assert(replied("badargs"));
+    assert(line("pad.hold()") == KMCMD_HANDLED);
+    assert(replied("badargs"));
+}
+
+static void test_pad_getters_answer_the_held_state(void)
+{
+    pad_setup();
+    assert(line("pad.lx()") == KMCMD_HANDLED);
+    assert(replied("pad.lx(0)"));
+    assert(line("pad.hat()") == KMCMD_HANDLED);
+    assert(replied("pad.hat(8)"));  // released: centred
+    line("pad.lx(-7)");
+    line("pad.hat(5)");
+    const uint32_t before = g_abs_count;
+    assert(line("pad.lx()") == KMCMD_HANDLED);
+    assert(replied("pad.lx(-7)"));
+    assert(line("pad.hat()") == KMCMD_HANDLED);
+    assert(replied("pad.hat(5)"));
+    assert(g_abs_count == before);  // a query emits nothing
+}
+
+// The refusal matrix. km.* on a pad and pad.* on a mouse are refused by class,
+// ahead of `notready`; NONE refuses both; UNKNOWN defers to `ready`.
+static void test_pad_and_mouse_refusal_matrix(void)
+{
+    setup();
+    g_device_class = KMCMD_DEVICE_PAD;
+    assert(line("km.move(1,1)") == KMCMD_HANDLED);
+    assert(replied("nomouse"));
+    assert(line("km.left(1)") == KMCMD_HANDLED);
+    assert(replied("nomouse"));
+    assert(!kmcmd_pending());
+
+    setup();
+    g_device_class = KMCMD_DEVICE_MOUSE;
+    assert(line("pad.lx(1)") == KMCMD_HANDLED);
+    assert(replied("nopad"));
+    assert(line("pad.btn(1,1)") == KMCMD_HANDLED);
+    assert(replied("nopad"));
+    assert(line("pad.release()") == KMCMD_HANDLED);
+    assert(replied("nopad"));
+    assert(g_abs_count == 0u && g_mask_count == 0u);
+
+    setup();
+    g_device_class = KMCMD_DEVICE_NONE;
+    assert(line("pad.lx(1)") == KMCMD_HANDLED);
+    assert(replied("nopad"));
+    assert(line("km.move(1,1)") == KMCMD_HANDLED);
+    assert(replied("nomouse"));
+
+    setup();
+    g_device_class = KMCMD_DEVICE_UNKNOWN;
+    g_ready = false;
+    assert(line("pad.lx(1)") == KMCMD_HANDLED);
+    assert(replied("notready"));
+    assert(line("km.move(1,1)") == KMCMD_HANDLED);
+    assert(replied("notready"));
+
+    // An absent `absolute` op is a build problem and the more specific answer.
+    const kmcmd_ops_t no_abs = {
+        .buttons = sink_buttons,
+        .ready = sink_ready,
+        .device_class = sink_device_class,
+    };
+    g_device_class = KMCMD_DEVICE_PAD;
+    kmcmd_init(&no_abs);
+    kmcmd_set_mode(KMCMD_MODE_MAKCU);
+    assert(line("pad.lx(1)") == KMCMD_HANDLED);
+    assert(replied("nosink"));
+}
+
+// pad.* obeys the km mode gate and reply framing: OFF -> NOT_MINE, KMBOX ->
+// silent acks, unknown pad name -> refused here (it is addressed to us).
+static void test_pad_namespace_framing_and_mode_gate(void)
+{
+    pad_setup();
+    kmcmd_set_mode(KMCMD_MODE_OFF);
+    assert(line("pad.lx(1)") == KMCMD_NOT_MINE);
+    assert(g_abs_count == 0u);
+
+    kmcmd_set_mode(KMCMD_MODE_KMBOX);
+    assert(line("pad.lx(1)") == KMCMD_HANDLED);
+    assert(g_reply[0] == '\0');
+    assert(g_abs_count == 1u);
+    assert(line("pad.hat(9)") == KMCMD_HANDLED);  // refusals are audible in every mode
+    assert(replied("pad.hat(!badstate)"));
+
+    kmcmd_set_mode(KMCMD_MODE_MAKCU);
+    assert(line("pad.nosuch(1)") == KMCMD_HANDLED);
+    assert(replied("pad.nosuch(!unknown)"));
+    // The pad namespace does not leak km names, nor km the pad ones.
+    assert(line("pad.move(1,1)") == KMCMD_HANDLED);
+    assert(replied("!unknown"));
+    assert(line("km.lx(1)") == KMCMD_HANDLED);
+    assert(replied("km.lx(!unknown)"));
+    // And a bare `lx(1)` is not ours at all.
+    assert(line("lx(1)") == KMCMD_NOT_MINE);
+}
+
+// The link dropping voids the held vector exactly as it voids the button mask.
+static void test_pad_link_loss_clears_the_held_vector(void)
+{
+    pad_setup();
+    line("pad.lx(9)");
+    kmcmd_set_link(false);
+    kmcmd_set_link(true);
+    assert(line("pad.lx()") == KMCMD_HANDLED);
+    assert(replied("pad.lx(0)"));
+    assert(line("pad.lx(9)") == KMCMD_HANDLED);  // a change again: it goes out
+    assert(g_abs_count == 2u);
+}
+
 // --- counters -----------------------------------------------------------------
 
 static void test_counters_separate_accepted_from_refused(void)
@@ -1002,6 +1302,17 @@ int main(void)
 
     test_no_sink_is_survivable();
     test_reply_buffer_is_never_overrun();
+    test_pad_axis_setters_hold_one_channel_and_resend_the_vector();
+    test_pad_hat_accepts_0_to_8_only();
+    test_pad_unchanged_setter_is_acked_without_a_frame();
+    test_pad_release_sends_mask_zero_and_keeps_the_values();
+    test_pad_refused_setter_rolls_back();
+    test_pad_btn_reuses_the_button_mask();
+    test_pad_hold_arms_the_sink_timer_and_clears_the_mirror();
+    test_pad_getters_answer_the_held_state();
+    test_pad_and_mouse_refusal_matrix();
+    test_pad_namespace_framing_and_mode_gate();
+    test_pad_link_loss_clears_the_held_vector();
     test_counters_separate_accepted_from_refused();
 
     printf("kmcmd_test: all cases passed\n");

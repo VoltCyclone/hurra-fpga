@@ -220,9 +220,4 @@ uint8_t link_inject_device_class(void);
 // active generation matching). Leaving this state voids any queued budget.
 bool link_inject_ready(void);
 
-// True once the attached device is known to have nothing a mouse command could
-// land in: every descriptor it exported was judged not a mouse (a keyboard, a
-// game pad). The console answers `nomouse` instead of `notready`.
-bool link_inject_no_mouse(void);
-
 #endif  // HURRA_MCXN947_LINK_H

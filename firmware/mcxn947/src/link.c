@@ -1662,13 +1662,6 @@ uint8_t link_inject_device_class(void)
     return (uint8_t)inj_session_device_class(&s_inj);
 }
 
-bool link_inject_no_mouse(void)
-{
-    // One aligned read of ISR-owned state, like link_inject_ready(): a stale
-    // answer costs one wrongly worded refusal, which the next command corrects.
-    return s_ready && inj_session_no_mouse(&s_inj);
-}
-
 bool link_inject_ready(void)
 {
     // Two aligned single-word reads of state the ISR owns. Masking would not

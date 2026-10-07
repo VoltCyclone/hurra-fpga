@@ -40,6 +40,12 @@
 //     the motion". A host cannot get end-to-end confirmation from this link,
 //     and no framing choice here can invent one.
 //
+// A game pad is driven through the `pad.` namespace: `pad.lx(v)`…`pad.rt(v)`
+// (-32768..32767), `pad.hat(0..7|8)`, `pad.btn(n,0|1)`, `pad.release()`,
+// `pad.hold(ms)`. These SET the field (the FPGA's ABSOLUTE class) instead of
+// adding to it, so `moveto`'s objection does not apply to them; they obey the
+// same mode gate and framing as `km.*`.
+//
 // --- Why a move is a budget and not a delta ---------------------------------
 //
 // `km.move(300,450)` is a one-shot displacement. The injected X/Y field is the
@@ -91,6 +97,31 @@ typedef enum {
     KMCMD_BUTTON_SIDE2 = 1u << 4,
 } kmcmd_button_t;
 
+// What the attached device is, as the sink knows it. Mirrors inj_session.h's
+// inj_device_class_t value for value (usb_console.c static-asserts it) without
+// this header having to include it.
+typedef enum {
+    KMCMD_DEVICE_UNKNOWN = 0,  // no verdict yet: wait
+    KMCMD_DEVICE_NONE,         // judged: nothing injectable (a keyboard)
+    KMCMD_DEVICE_MOUSE,
+    KMCMD_DEVICE_PAD,
+} kmcmd_device_class_t;
+
+// Pad channels, as indices into the `absolute` op's value vector and as bits
+// of its mask. Equal by construction to the wire's MAP_ENTRY_CHANNEL numbering
+// (usb_console.c static-asserts it); kmcmd itself never sees the wire header.
+typedef enum {
+    KMCMD_PAD_LX = 0,
+    KMCMD_PAD_LY = 1,
+    KMCMD_PAD_RX = 2,
+    KMCMD_PAD_RY = 3,
+    KMCMD_PAD_LT = 4,
+    KMCMD_PAD_RT = 5,
+    KMCMD_PAD_HAT = 6,
+} kmcmd_pad_channel_t;
+#define KMCMD_PAD_CHANNELS 7u
+#define KMCMD_PAD_HAT_NULL 8
+
 // Reply framing. This is the one place the two protocols genuinely conflict and
 // cannot be reconciled in a single parser, so it is a mode rather than a
 // guess:
@@ -120,7 +151,7 @@ typedef enum {
 // usb_console.c binds these to link.c's link_inject_* wrappers, which mask the
 // retirement interrupt around inj_session's one-deep request slot. `ready` is
 // `inj_session_phase(s) == INJ_PHASE_INJECTING`, the MCU-side mirror of
-// gateware.py's command_fresh; `no_mouse` is inj_session's NO_MOUSE verdict.
+// gateware.py's command_fresh; `device_class` is inj_session_device_class().
 // Bind the ops with NULL callbacks and the parser stays fully exercised while
 // every motion command is refused with `!nosink` -- a truthful answer rather
 // than a silent no-op.
@@ -138,16 +169,24 @@ typedef struct {
     // are suppressed on the way to the PC.
     bool (*physical_mask)(void *ctx, uint32_t mask);
 
+    // Replace the held pad vector (ABSOLUTE): bit k of `mask` holds channel k at
+    // normalized[k], a clear bit releases it. Values are -32768..32767 for the
+    // six axes and the raw 0..7 / KMCMD_PAD_HAT_NULL for the hat; the sink
+    // scales to each field's logical range, because only it has the layout.
+    bool (*absolute)(void *ctx, uint8_t mask, const int16_t normalized[KMCMD_PAD_CHANNELS]);
+
+    // Arm the sink's release timer: after `ms` it sends mask 0 by itself.
+    bool (*absolute_hold)(void *ctx, uint32_t ms);
+
     // True once the FPGA would honour a command: link up, session active, field
     // map committed and the active generation matching. A NULL `ready` is NOT
     // treated as ready -- it means nothing is wired yet.
     bool (*ready)(void *ctx);
 
-    // True once the attached device is KNOWN to have nothing a mouse command
-    // could land in -- a keyboard or a game pad (inj_session NO_MOUSE). Refused
-    // as `nomouse` rather than `notready`, because waiting will not help. NULL
-    // means the question is never answered, which is the old behaviour.
-    bool (*no_mouse)(void *ctx);
+    // What is attached. `km.*` is refused on a pad (`nomouse`), `pad.*` on a
+    // mouse (`nopad`), both on NONE; UNKNOWN defers to `ready`. NULL means the
+    // question is never answered, so only `ready` gates.
+    kmcmd_device_class_t (*device_class)(void *ctx);
 
     void *ctx;
 } kmcmd_ops_t;
