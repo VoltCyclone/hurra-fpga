@@ -3,12 +3,13 @@
 # Ruff's context-manager simplification obscures nested Amaranth control-flow DSL structure.
 # ruff: noqa: SIM117
 
-from amaranth import Cat, Const, Elaboratable, Module, Mux, Signal, signed
-from amaranth.lib.data import StructLayout, unsigned
+from amaranth import Array, Cat, Const, Elaboratable, Module, Mux, Signal, signed
+from amaranth.lib.data import ArrayLayout, StructLayout, unsigned
 from amaranth.lib.memory import Memory
 
 from .descriptors import MAX_ENDPOINT_NUMBER
 from .injection_wire import (
+    INJ_CLEAR_FLAG_ABSOLUTE,
     INJ_CLEAR_FLAG_BUTTONS,
     INJ_CLEAR_FLAG_MOTION,
     INJ_CLEAR_FLAG_PHYSICAL_MASKS,
@@ -53,6 +54,17 @@ STATE_LAYOUT = StructLayout(
 
 #: Channels an ABSOLUTE command can hold, indexed by MAP_ENTRY_CHANNEL (LX .. HAT).
 ABSOLUTE_CHANNELS = INJ_MAP_ENTRY_CHANNEL_HAT + 1
+
+# Held absolute values, one record per layout slot, in a memory of their own
+# beside STATE_LAYOUT rather than widening it: that record's write enable is
+# commit_allowed <- snapshot_matches <- store.active_bank, a failing cone family
+# on 2 of 12 seeds, and 119 more bits of fan-out there is the wrong place.
+PAD_STATE_LAYOUT = StructLayout(
+    {
+        "held_mask": unsigned(ABSOLUTE_CHANNELS),
+        "held_values": ArrayLayout(signed(16), ABSOLUTE_CHANNELS),
+    }
+)
 
 
 class ReportInjectionEngine(Elaboratable):
@@ -194,6 +206,7 @@ class ReportInjectionEngine(Elaboratable):
         self._entry_usage_q = Signal(16)
         self._entry_signed_q = Signal()
         self._entry_axis_q = Signal(2)
+        self._entry_channel_q = Signal(3)
         self._entry_logical_minimum_q = Signal(signed(32))
         self._entry_logical_maximum_q = Signal(signed(32))
         self._field_total_q = Signal(signed(34))
@@ -249,6 +262,7 @@ class ReportInjectionEngine(Elaboratable):
         state_motion_live = Signal(layout_count, name="state_motion_live")
         state_buttons_live = Signal(layout_count, name="state_buttons_live")
         state_masks_live = Signal(layout_count, name="state_masks_live")
+        state_absolute_live = Signal(layout_count, name="state_absolute_live")
         selected_state = Signal(range(layout_count))
         selected_state_available = Signal()
         stationary_prefetch_index = Signal(range(layout_count))
@@ -267,6 +281,7 @@ class ReportInjectionEngine(Elaboratable):
         stationary_predicate_button_q = Signal()
         stationary_predicate_mask_q = Signal()
         stationary_predicate_click_q = Signal()
+        stationary_predicate_absolute_q = Signal()
         stationary_predicate_last_q = Signal()
         stationary_predicate_index_q = Signal(range(layout_count))
         stationary_predicate_interface_q = Signal(8)
@@ -295,6 +310,25 @@ class ReportInjectionEngine(Elaboratable):
             & (state_record.descriptor_generation == snapshot_descriptor_generation)
             & (state_record.map_generation == snapshot_map_generation)
         )
+
+        pad_memory = Memory(
+            shape=PAD_STATE_LAYOUT,
+            depth=layout_count,
+            init=[],
+            attrs={"ram_style": "distributed"},
+        )
+        m.submodules.pad_state = pad_memory
+        pad_memory_read = pad_memory.read_port(domain="usb")
+        pad_memory_write = pad_memory.write_port(domain="usb")
+        pad_record = pad_memory_read.data
+        # Written one cycle after the handshake that writes the state record,
+        # from a registered enable, so the commit's own cone grows by nothing.
+        # Nothing reads a pad record until the next transaction's STATE_READ_WAIT
+        # (>= 4 cycles later), and the scan predicate never reads held values,
+        # so the delay is invisible. (A write landing in the same cycle as the
+        # scan's slot-0 read is not transparent, and that read ignores pad_record.)
+        pad_write_pending = Signal()
+        m.d.usb += pad_write_pending.eq(0)
 
         # One byte per address rather than a whole report per address.
         #
@@ -374,12 +408,21 @@ class ReportInjectionEngine(Elaboratable):
             & (self.mask_endpoint == state_record.endpoint_number)
             & (self.mask_report_id == state_record.report_id)
         )
+        # Deliberately not compared against the held state either: a redundant
+        # ABSOLUTE still needs a transaction to be acked.
+        scan_incoming_absolute = (
+            self.absolute_valid
+            & (self.absolute_interface == state_record.interface_number)
+            & (self.absolute_endpoint == state_record.endpoint_number)
+            & (self.absolute_report_id == state_record.report_id)
+        )
         scan_motion_pending = scan_record_matches & (
             (scan_x != 0) | (scan_y != 0) | (scan_wheel != 0) | (scan_pan != 0)
         )
         scan_relative_pending = scan_record_matches & scan_incoming_relative
         scan_button_pending = scan_record_matches & scan_incoming_button
         scan_mask_pending = scan_record_matches & scan_incoming_mask
+        scan_absolute_pending = scan_record_matches & scan_incoming_absolute
         scan_click_pending = scan_click_active & ~scan_release_delta[-1]
 
         relative_targets_report = (
@@ -400,6 +443,12 @@ class ReportInjectionEngine(Elaboratable):
             & (self.mask_endpoint == captured_endpoint)
             & (self.mask_report_id == selected_report_id)
         )
+        absolute_targets_report = (
+            self.absolute_valid
+            & (self.absolute_interface == captured_interface)
+            & (self.absolute_endpoint == captured_endpoint)
+            & (self.absolute_report_id == selected_report_id)
+        )
 
         working_x = Signal(signed(32))
         working_y = Signal(signed(32))
@@ -417,10 +466,19 @@ class ReportInjectionEngine(Elaboratable):
         captured_raw_click_active = Signal()
         captured_raw_click_release_target = Signal(32)
         captured_raw_click_restore = Signal(64)
+        working_held_mask = Signal(ABSOLUTE_CHANNELS)
+        working_held_values = [
+            Signal(signed(16), name=f"working_held_value{k}") for k in range(ABSOLUTE_CHANNELS)
+        ]
+        captured_raw_held_mask = Signal(ABSOLUTE_CHANNELS)
+        captured_raw_held_values = [
+            Signal(signed(16), name=f"captured_raw_held_value{k}") for k in range(ABSOLUTE_CHANNELS)
+        ]
         transaction_relative = Signal()
         transaction_button = Signal()
         transaction_mask = Signal()
         transaction_clear = Signal()
+        transaction_absolute = Signal()
         transaction_relative_admitted = Signal()
         transaction_relative_overflow = Signal()
         transaction_click_release = Signal()
@@ -455,6 +513,7 @@ class ReportInjectionEngine(Elaboratable):
         captured_motion_live = transaction_button
         captured_buttons_live = transaction_mask
         captured_masks_live = transaction_clear
+        captured_absolute_live = transaction_absolute
         captured_x = Mux(captured_state_matches & captured_motion_live, captured_raw_x, 0)
         captured_y = Mux(captured_state_matches & captured_motion_live, captured_raw_y, 0)
         captured_wheel = Mux(
@@ -471,6 +530,11 @@ class ReportInjectionEngine(Elaboratable):
         captured_mask = Mux(
             captured_state_matches & captured_masks_live,
             captured_raw_mask,
+            0,
+        )
+        captured_held_mask = Mux(
+            captured_state_matches & captured_absolute_live,
+            captured_raw_held_mask,
             0,
         )
         captured_sequence = Mux(captured_state_matches, captured_raw_sequence, 0)
@@ -507,10 +571,16 @@ class ReportInjectionEngine(Elaboratable):
         command_y_q = Signal.like(self.relative_y)
         command_wheel_q = Signal.like(self.relative_wheel)
         command_pan_q = Signal.like(self.relative_pan)
+        absolute_targets_q = Signal()
+        absolute_mask_q = Signal.like(self.absolute_mask)
+        absolute_values_q = [
+            Signal(signed(16), name=f"absolute_value_q{k}") for k in range(ABSOLUTE_CHANNELS)
+        ]
 
         clear_motion = clear_valid_q & ((clear_flags_q & INJ_CLEAR_FLAG_MOTION) != 0)
         clear_buttons = clear_valid_q & ((clear_flags_q & INJ_CLEAR_FLAG_BUTTONS) != 0)
         clear_masks = clear_valid_q & ((clear_flags_q & INJ_CLEAR_FLAG_PHYSICAL_MASKS) != 0)
+        clear_absolute = clear_valid_q & ((clear_flags_q & INJ_CLEAR_FLAG_ABSOLUTE) != 0)
 
         command_x = Mux(
             relative_targets_report & ((self.relative_flags & INJ_RELATIVE_FLAG_X) != 0),
@@ -543,7 +613,6 @@ class ReportInjectionEngine(Elaboratable):
                 captured_click_active & ~captured_click_release_delta[-1]
             ),
         ]
-
         candidate_x = Signal(signed(33))
         candidate_y = Signal(signed(33))
         candidate_wheel = Signal(signed(33))
@@ -578,6 +647,23 @@ class ReportInjectionEngine(Elaboratable):
                 )
             ),
         ]
+        # The command replaces the whole held set; a clear releases it; else the
+        # record's set carries. Mirrors candidate_buttons, command over clear.
+        candidate_held_mask = Signal(ABSOLUTE_CHANNELS)
+        candidate_held_values = [
+            Signal(signed(16), name=f"candidate_held_value{k}") for k in range(ABSOLUTE_CHANNELS)
+        ]
+        m.d.comb += candidate_held_mask.eq(
+            Mux(absolute_targets_q, absolute_mask_q, Mux(clear_absolute, 0, captured_held_mask))
+        )
+        for channel in range(ABSOLUTE_CHANNELS):
+            m.d.comb += candidate_held_values[channel].eq(
+                Mux(
+                    absolute_targets_q,
+                    absolute_values_q[channel],
+                    captured_raw_held_values[channel],
+                )
+            )
         relative_overflow = relative_targets_q & (
             (
                 ((relative_flags_q & INJ_RELATIVE_FLAG_X) != 0)
@@ -622,6 +708,15 @@ class ReportInjectionEngine(Elaboratable):
             state_memory_write.data.click_release_target.eq(state_write_click_release_target),
             state_memory_write.data.click_restore.eq(state_write_click_restore),
         ]
+        m.d.comb += [
+            # Same address as the state record: read beside it in STATE_READ_WAIT.
+            pad_memory_read.addr.eq(state_memory_read_address),
+            pad_memory_write.addr.eq(selected_state),
+            pad_memory_write.en.eq(pad_write_pending),
+            pad_memory_write.data.held_mask.eq(working_held_mask),
+        ]
+        for channel in range(ABSOLUTE_CHANNELS):
+            m.d.comb += pad_memory_write.data.held_values[channel].eq(working_held_values[channel])
 
         entry_index = Signal(range(LIMITS["fields"]))
         bit_index = Signal(range(33))
@@ -638,6 +733,7 @@ class ReportInjectionEngine(Elaboratable):
         entry_usage_q = self._entry_usage_q
         entry_signed_q = self._entry_signed_q
         entry_axis_q = self._entry_axis_q
+        entry_channel_q = self._entry_channel_q
         entry_logical_minimum_q = self._entry_logical_minimum_q
         entry_logical_maximum_q = self._entry_logical_maximum_q
         field_total_q = self._field_total_q
@@ -651,10 +747,12 @@ class ReportInjectionEngine(Elaboratable):
         )
         entry_snapshot_is_button = (entry.flags & INJ_MAP_ENTRY_FLAG_BUTTON) != 0
         entry_snapshot_is_relative = (entry.flags & INJ_MAP_ENTRY_FLAG_RELATIVE) != 0
+        # 1 button, 2 relative, 3 absolute (neither flag; the store admits
+        # nothing else, so there is no "none").
         entry_snapshot_class = Mux(
             entry_snapshot_is_button,
             1,
-            Mux(entry_snapshot_is_relative, 2, 0),
+            Mux(entry_snapshot_is_relative, 2, 3),
         )
         entry_snapshot_axis = Mux(
             (entry.flags & INJ_MAP_ENTRY_FLAG_X) != 0,
@@ -725,6 +823,11 @@ class ReportInjectionEngine(Elaboratable):
             ),
             residual_wide.eq(field_total_q - clamped_wide),
         ]
+
+        # The held value an absolute entry writes. Sign-extended into the
+        # 32-bit emitted_field; insertion writes exactly bit_width (<= 16) bits.
+        held_value_selected = Array(working_held_values)[entry_channel_q]
+        entry_channel_held = working_held_mask.bit_select(entry_channel_q, 1)
 
         button_usage_index = (entry_usage_q + bit_index - 1).as_unsigned()
         physical_button = template_bit
@@ -876,6 +979,8 @@ class ReportInjectionEngine(Elaboratable):
                         working_pan.eq(0),
                         working_buttons.eq(0),
                         working_mask.eq(0),
+                        working_held_mask.eq(0),
+                        *[value.eq(0) for value in working_held_values],
                         transaction_sequence.eq(0),
                         transaction_click_release.eq(0),
                         state_write_click_release_target.eq(0),
@@ -900,6 +1005,9 @@ class ReportInjectionEngine(Elaboratable):
                         state_motion_live.eq(state_motion_live | selected_state_mask),
                         state_buttons_live.eq(state_buttons_live | selected_state_mask),
                         state_masks_live.eq(state_masks_live | selected_state_mask),
+                        state_absolute_live.eq(state_absolute_live | selected_state_mask),
+                        # The pad record follows a cycle later, released.
+                        pad_write_pending.eq(1),
                         seed_index.eq(seed_index + 1),
                         cache_copy_index.eq(0),
                     ]
@@ -928,6 +1036,7 @@ class ReportInjectionEngine(Elaboratable):
                     stationary_predicate_button_q.eq(scan_button_pending),
                     stationary_predicate_mask_q.eq(scan_mask_pending),
                     stationary_predicate_click_q.eq(scan_click_pending),
+                    stationary_predicate_absolute_q.eq(scan_absolute_pending),
                     stationary_predicate_last_q.eq(scan_last),
                     stationary_predicate_index_q.eq(stationary_scan_index),
                     stationary_predicate_interface_q.eq(state_record.interface_number),
@@ -948,6 +1057,7 @@ class ReportInjectionEngine(Elaboratable):
                             | stationary_predicate_button_q
                             | stationary_predicate_mask_q
                             | stationary_predicate_click_q
+                            | stationary_predicate_absolute_q
                         )
                         # A report-layout template must not be synthesised
                         # onto an endpoint sending boot-layout reports.
@@ -1149,10 +1259,16 @@ class ReportInjectionEngine(Elaboratable):
                         captured_raw_click_active.eq(state_record.click_active),
                         captured_raw_click_release_target.eq(state_record.click_release_target),
                         captured_raw_click_restore.eq(state_record.click_restore),
+                        captured_raw_held_mask.eq(pad_record.held_mask),
+                        *[
+                            captured_raw_held_values[k].eq(pad_record.held_values[k])
+                            for k in range(ABSOLUTE_CHANNELS)
+                        ],
                         transaction_relative.eq(state_record_matches),
                         transaction_button.eq(state_motion_live.bit_select(selected_state, 1)),
                         transaction_mask.eq(state_buttons_live.bit_select(selected_state, 1)),
                         transaction_clear.eq(state_masks_live.bit_select(selected_state, 1)),
+                        transaction_absolute.eq(state_absolute_live.bit_select(selected_state, 1)),
                         relative_targets_q.eq(relative_targets_report),
                         relative_flags_q.eq(self.relative_flags),
                         command_x_q.eq(command_x),
@@ -1161,6 +1277,12 @@ class ReportInjectionEngine(Elaboratable):
                         command_pan_q.eq(command_pan),
                         button_targets_q.eq(button_targets_report),
                         mask_targets_q.eq(mask_targets_report),
+                        absolute_targets_q.eq(absolute_targets_report),
+                        absolute_mask_q.eq(self.absolute_mask),
+                        *[
+                            absolute_values_q[k].eq(self.absolute_values[k])
+                            for k in range(ABSOLUTE_CHANNELS)
+                        ],
                         clear_valid_q.eq(self.clear_valid),
                         clear_flags_q.eq(self.clear_flags),
                     ]
@@ -1179,12 +1301,18 @@ class ReportInjectionEngine(Elaboratable):
                     working_pan.eq(Mux(relative_overflow, captured_pan, candidate_pan)),
                     working_buttons.eq(candidate_buttons),
                     working_mask.eq(candidate_mask),
+                    working_held_mask.eq(candidate_held_mask),
+                    *[
+                        working_held_values[k].eq(candidate_held_values[k])
+                        for k in range(ABSOLUTE_CHANNELS)
+                    ],
                     transaction_relative.eq(relative_targets_q),
                     transaction_relative_admitted.eq(relative_admitted),
                     transaction_relative_overflow.eq(relative_overflow),
                     transaction_button.eq(button_targets_q),
                     transaction_mask.eq(mask_targets_q),
                     transaction_clear.eq(clear_valid_q),
+                    transaction_absolute.eq(absolute_targets_q),
                     transaction_click_release.eq(
                         Mux(
                             button_targets_q,
@@ -1234,9 +1362,13 @@ class ReportInjectionEngine(Elaboratable):
                                     button_targets_q,
                                     self.button_command_sequence,
                                     Mux(
-                                        relative_admitted,
-                                        self.relative_command_sequence,
-                                        captured_sequence,
+                                        absolute_targets_q,
+                                        self.absolute_command_sequence,
+                                        Mux(
+                                            relative_admitted,
+                                            self.relative_command_sequence,
+                                            captured_sequence,
+                                        ),
                                     ),
                                 ),
                             ),
@@ -1275,6 +1407,7 @@ class ReportInjectionEngine(Elaboratable):
                         entry_usage_q.eq(entry.usage),
                         entry_signed_q.eq((entry.flags & INJ_MAP_ENTRY_FLAG_SIGNED) != 0),
                         entry_axis_q.eq(entry_snapshot_axis),
+                        entry_channel_q.eq(entry.channel[:3]),
                         entry_logical_minimum_q.eq(entry.logical_minimum),
                         entry_logical_maximum_q.eq(entry.logical_maximum),
                     ]
@@ -1291,6 +1424,17 @@ class ReportInjectionEngine(Elaboratable):
                     with m.Elif(entry_matches_q & (entry_class_q == 2)):
                         m.d.usb += [bit_index.eq(0), raw_field.eq(0)]
                         m.next = "EXTRACT_FIELD_READ"
+                    with m.Elif(entry_matches_q & (entry_class_q == 3) & entry_channel_held):
+                        # Held: write the value straight in, skipping EXTRACT /
+                        # CALCULATE / COMMIT -- so no adder and no clamp. A
+                        # released channel falls through: the working lane
+                        # already holds the native bytes, so the physical value
+                        # passes for free.
+                        m.d.usb += [
+                            bit_index.eq(0),
+                            emitted_field.eq(held_value_selected),
+                        ]
+                        m.next = "INSERT_FIELD_READ"
                     with m.Else():
                         m.next = "NEXT_ENTRY"
 
@@ -1443,6 +1587,7 @@ class ReportInjectionEngine(Elaboratable):
                         transaction_button.eq(0),
                         transaction_mask.eq(0),
                         transaction_clear.eq(0),
+                        transaction_absolute.eq(0),
                         transaction_click_release.eq(0),
                         transaction_stationary.eq(0),
                         transaction_mapped.eq(0),
@@ -1460,6 +1605,7 @@ class ReportInjectionEngine(Elaboratable):
                         transaction_button.eq(0),
                         transaction_mask.eq(0),
                         transaction_clear.eq(0),
+                        transaction_absolute.eq(0),
                         transaction_click_release.eq(0),
                         transaction_mapped.eq(0),
                         transaction_invalidated.eq(0),
@@ -1489,6 +1635,7 @@ class ReportInjectionEngine(Elaboratable):
                     self.button_ready.eq(final_accept & commit_allowed & transaction_button),
                     self.mask_ready.eq(final_accept & commit_allowed & transaction_mask),
                     self.clear_ready.eq(final_accept & commit_allowed & transaction_clear),
+                    self.absolute_ready.eq(final_accept & commit_allowed & transaction_absolute),
                     state_memory_write_enable.eq(
                         final_accept & commit_allowed & selected_state_available
                     ),
@@ -1530,12 +1677,24 @@ class ReportInjectionEngine(Elaboratable):
                                     )
                                     | selected_state_mask
                                 ),
+                                state_absolute_live.eq(
+                                    Mux(
+                                        transaction_clear
+                                        & ((self.clear_flags & INJ_CLEAR_FLAG_ABSOLUTE) != 0),
+                                        0,
+                                        state_absolute_live,
+                                    )
+                                    | selected_state_mask
+                                ),
                                 self.pending_x.eq(working_x),
                                 self.pending_y.eq(working_y),
                                 self.pending_wheel.eq(working_wheel),
                                 self.pending_pan.eq(working_pan),
                                 self.injected_buttons.eq(working_buttons),
                                 self.physical_mask.eq(working_mask),
+                                self.held_mask.eq(working_held_mask),
+                                # The pad record lands next cycle (see pad_write_pending).
+                                pad_write_pending.eq(1),
                                 self.last_committed_command_sequence.eq(transaction_sequence),
                             ]
                         with m.If(
@@ -1551,9 +1710,12 @@ class ReportInjectionEngine(Elaboratable):
                                 | transaction_button
                                 | transaction_mask
                                 | transaction_clear
+                                | transaction_absolute
                             )
                         ):
                             m.d.usb += self.command_committed.eq(1)
+                        with m.If(commit_allowed & transaction_absolute):
+                            m.d.usb += self.absolute_commit_pulse.eq(1)
                         m.d.usb += [
                             transaction_relative.eq(0),
                             transaction_relative_admitted.eq(0),
@@ -1561,6 +1723,7 @@ class ReportInjectionEngine(Elaboratable):
                             transaction_button.eq(0),
                             transaction_mask.eq(0),
                             transaction_clear.eq(0),
+                            transaction_absolute.eq(0),
                             transaction_click_release.eq(0),
                             transaction_stationary.eq(0),
                             transaction_mapped.eq(0),
@@ -1623,6 +1786,7 @@ class ReportInjectionEngine(Elaboratable):
                 state_motion_live.eq(0),
                 state_buttons_live.eq(0),
                 state_masks_live.eq(0),
+                state_absolute_live.eq(0),
                 seed_pending.eq(0),
             ]
 

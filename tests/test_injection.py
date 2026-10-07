@@ -6,10 +6,18 @@ from amaranth import Elaboratable, Module
 from amaranth.back import rtlil
 from amaranth.sim import Simulator
 
-from hurra_cynthion.injection import STATE_LAYOUT, ReportInjectionEngine
+from hurra_cynthion.injection import PAD_STATE_LAYOUT, STATE_LAYOUT, ReportInjectionEngine
 from hurra_cynthion.injection_map import InjectionMapStore, MapError
 from hurra_cynthion.injection_wire import (
+    INJ_ABSOLUTE_FLAG_HAT,
+    INJ_ABSOLUTE_FLAG_LX,
+    INJ_ABSOLUTE_FLAG_LY,
+    INJ_CLEAR_FLAG_ABSOLUTE,
+    INJ_CLEAR_FLAG_ALL,
     INJ_CLEAR_FLAG_MOTION,
+    INJ_MAP_ENTRY_CHANNEL_HAT,
+    INJ_MAP_ENTRY_CHANNEL_LX,
+    INJ_MAP_ENTRY_CHANNEL_LY,
     INJ_MAP_ENTRY_FLAG_BUTTON,
     INJ_MAP_ENTRY_FLAG_RELATIVE,
     INJ_MAP_ENTRY_FLAG_SIGNED,
@@ -2322,3 +2330,320 @@ def test_overlapping_timed_clicks_release_to_the_pre_click_baseline() -> None:
 
     simulation.add_testbench(bench)
     simulation.run()
+
+
+# --- Absolute "set" (pads) -------------------------------------------------------
+#
+# A pad-shaped layout: a button run, two unsigned 8-bit sticks and a 4-bit hat
+# whose logical range is 0..7 with 8 as the null (centred) value. Held channels
+# replace the physical value; released ones pass it through; nothing is clamped.
+
+PAD_REPORT_LENGTH = 4
+
+
+def _absolute_entries(*, report_id: int = 0) -> list[MapEntryPayload]:
+    prefix = 8 if report_id else 0
+    common = {"report_length": PAD_REPORT_LENGTH + prefix // 8, "report_id": report_id}
+    return [
+        map_entry(
+            entry_index=0,
+            bit_offset=prefix,
+            bit_width=8,
+            flags=INJ_MAP_ENTRY_FLAG_BUTTON,
+            logical_minimum=0,
+            logical_maximum=1,
+            usage=1,
+            **common,
+        ),
+        map_entry(
+            entry_index=1,
+            bit_offset=prefix + 8,
+            bit_width=8,
+            flags=0,
+            logical_minimum=0,
+            logical_maximum=255,
+            usage=0x30,
+            channel=INJ_MAP_ENTRY_CHANNEL_LX,
+            **common,
+        ),
+        map_entry(
+            entry_index=2,
+            bit_offset=prefix + 16,
+            bit_width=8,
+            flags=0,
+            logical_minimum=0,
+            logical_maximum=255,
+            usage=0x31,
+            channel=INJ_MAP_ENTRY_CHANNEL_LY,
+            **common,
+        ),
+        map_entry(
+            entry_index=3,
+            bit_offset=prefix + 24,
+            bit_width=4,
+            flags=0,
+            logical_minimum=0,
+            logical_maximum=7,
+            usage=0x39,
+            channel=INJ_MAP_ENTRY_CHANNEL_HAT,
+            **common,
+        ),
+    ]
+
+
+def _set_absolute(
+    ctx,
+    engine,
+    *,
+    mask: int,
+    values: dict[int, int] | None = None,
+    sequence: int,
+    report_id: int = 0,
+) -> None:
+    """Offer one ABSOLUTE command; ``values`` is keyed by MAP_ENTRY_CHANNEL."""
+    values = values or {}
+    ctx.set(engine.absolute_valid, 1)
+    ctx.set(engine.absolute_interface, 0)
+    ctx.set(engine.absolute_endpoint, 1)
+    ctx.set(engine.absolute_report_id, report_id)
+    ctx.set(engine.absolute_mask, mask)
+    for channel, value in enumerate(engine.absolute_values):
+        ctx.set(value, values.get(channel, 0))
+    ctx.set(engine.absolute_command_sequence, sequence)
+
+
+def test_absolute_command_sets_a_still_layout_before_any_native_report() -> None:
+    harness = InjectionHarness()
+    engine = harness.engine
+    simulation = Simulator(harness)
+    simulation.add_clock(1e-6, domain="usb")
+
+    async def bench(ctx) -> None:
+        await commit_map(ctx, harness.map_store, _absolute_entries())
+        _set_absolute(
+            ctx,
+            engine,
+            mask=INJ_ABSOLUTE_FLAG_LX | INJ_ABSOLUTE_FLAG_HAT,
+            values={INJ_MAP_ENTRY_CHANNEL_LX: 200, INJ_MAP_ENTRY_CHANNEL_HAT: 8},
+            sequence=0x91,
+        )
+
+        await pulse_sof(ctx, engine)
+        await wait_for_output(ctx, engine)
+        emitted, acknowledgements = await drain_report(ctx, engine, PAD_REPORT_LENGTH)
+        ctx.set(engine.absolute_valid, 0)
+        # LX held at 200; the hat carries its null value 8, unclamped, in a 0..7
+        # field; LY, released, passes the (seeded, zero) physical value.
+        assert emitted == bytes([0x00, 200, 0x00, 0x08])
+        assert acknowledgements == {"absolute"}
+        assert ctx.get(engine.absolute_commit_pulse) == 1
+        assert ctx.get(engine.command_committed) == 1
+        assert ctx.get(engine.held_mask) == INJ_ABSOLUTE_FLAG_LX | INJ_ABSOLUTE_FLAG_HAT
+        assert ctx.get(engine.last_committed_command_sequence) == 0x91
+
+        # A held value is not a residual: nothing is drained on later frames.
+        await pulse_sof(ctx, engine)
+        for _ in range(64):
+            await ctx.tick("usb")
+            assert not ctx.get(engine.output_valid)
+            assert not ctx.get(engine.absolute_commit_pulse)
+
+    simulation.add_testbench(bench)
+    simulation.run()
+
+
+def test_redundant_absolute_is_acked_on_a_still_device() -> None:
+    harness = InjectionHarness()
+    engine = harness.engine
+    simulation = Simulator(harness)
+    simulation.add_clock(1e-6, domain="usb")
+
+    async def bench(ctx) -> None:
+        await commit_map(ctx, harness.map_store, _absolute_entries())
+        for sequence in (0x92, 0x93):
+            _set_absolute(
+                ctx,
+                engine,
+                mask=INJ_ABSOLUTE_FLAG_LX,
+                values={INJ_MAP_ENTRY_CHANNEL_LX: 200},
+                sequence=sequence,
+            )
+            await pulse_sof(ctx, engine)
+            await wait_for_output(ctx, engine)
+            emitted, acknowledgements = await drain_report(ctx, engine, PAD_REPORT_LENGTH)
+            ctx.set(engine.absolute_valid, 0)
+            assert emitted == bytes([0x00, 200, 0x00, 0x00])
+            assert acknowledgements == {"absolute"}
+            assert ctx.get(engine.last_committed_command_sequence) == sequence
+
+    simulation.add_testbench(bench)
+    simulation.run()
+
+
+def test_native_reports_carry_held_channels_and_released_channels_pass_physical() -> None:
+    harness = InjectionHarness()
+    engine = harness.engine
+    simulation = Simulator(harness)
+    simulation.add_clock(1e-6, domain="usb")
+
+    async def bench(ctx) -> None:
+        await commit_map(ctx, harness.map_store, _absolute_entries())
+        _set_absolute(
+            ctx,
+            engine,
+            mask=INJ_ABSOLUTE_FLAG_LX,
+            values={INJ_MAP_ENTRY_CHANNEL_LX: 200},
+            sequence=0x94,
+        )
+        await pulse_sof(ctx, engine)
+        await wait_for_output(ctx, engine)
+        await drain_report(ctx, engine, PAD_REPORT_LENGTH)
+        ctx.set(engine.absolute_valid, 0)
+
+        await push_report(ctx, engine, bytes([0x01, 50, 60, 0x02]))
+        emitted, acknowledgements = await drain_report(ctx, engine, PAD_REPORT_LENGTH)
+        assert emitted == bytes([0x01, 200, 60, 0x02])
+        assert not acknowledgements
+
+        # pad.release(): the full held set is now empty. Synthesised from the
+        # last native template, so LX passes its physical 50.
+        _set_absolute(ctx, engine, mask=0, sequence=0x95)
+        await pulse_sof(ctx, engine)
+        await wait_for_output(ctx, engine)
+        emitted, acknowledgements = await drain_report(ctx, engine, PAD_REPORT_LENGTH)
+        ctx.set(engine.absolute_valid, 0)
+        assert emitted == bytes([0x01, 50, 60, 0x02])
+        assert acknowledgements == {"absolute"}
+        assert ctx.get(engine.held_mask) == 0
+
+        await push_report(ctx, engine, bytes([0x01, 70, 60, 0x02]))
+        emitted, acknowledgements = await drain_report(ctx, engine, PAD_REPORT_LENGTH)
+        assert emitted == bytes([0x01, 70, 60, 0x02])
+        assert not acknowledgements
+
+    simulation.add_testbench(bench)
+    simulation.run()
+
+
+def test_clear_absolute_releases_every_layout_atomically() -> None:
+    # Two report-ID layouts hold different channels. CLEAR(ABSOLUTE) commits on
+    # a transaction of the first; the live mask makes the second's record stale
+    # too, so its next report passes physical without a transaction of its own.
+    entries = _absolute_entries(report_id=1) + [
+        replace(entry, entry_index=entry.entry_index + 4)
+        for entry in _absolute_entries(report_id=2)
+    ]
+    harness = InjectionHarness()
+    engine = harness.engine
+    simulation = Simulator(harness)
+    simulation.add_clock(1e-6, domain="usb")
+    length = PAD_REPORT_LENGTH + 1
+
+    async def bench(ctx) -> None:
+        await commit_map(ctx, harness.map_store, entries)
+        for report_id, mask, values, expected in (
+            (1, INJ_ABSOLUTE_FLAG_LX, {INJ_MAP_ENTRY_CHANNEL_LX: 200}, bytes([1, 0, 200, 0, 0])),
+            (2, INJ_ABSOLUTE_FLAG_LY, {INJ_MAP_ENTRY_CHANNEL_LY: 100}, bytes([2, 0, 0, 100, 0])),
+        ):
+            _set_absolute(
+                ctx,
+                engine,
+                mask=mask,
+                values=values,
+                sequence=0x90 + report_id,
+                report_id=report_id,
+            )
+            await pulse_sof(ctx, engine)
+            await wait_for_output(ctx, engine)
+            emitted, acknowledgements = await drain_report(ctx, engine, length)
+            ctx.set(engine.absolute_valid, 0)
+            assert emitted == expected
+            assert acknowledgements == {"absolute"}
+
+        ctx.set(engine.clear_valid, 1)
+        ctx.set(engine.clear_flags, INJ_CLEAR_FLAG_ABSOLUTE)
+        ctx.set(engine.clear_command_sequence, 0x98)
+        await push_report(ctx, engine, bytes([1, 0x00, 50, 60, 0x00]))
+        emitted, acknowledgements = await drain_report(ctx, engine, length)
+        ctx.set(engine.clear_valid, 0)
+        assert emitted == bytes([1, 0x00, 50, 60, 0x00])
+        assert acknowledgements == {"clear"}
+        assert ctx.get(engine.held_mask) == 0
+
+        await push_report(ctx, engine, bytes([2, 0x00, 50, 60, 0x00]))
+        emitted, acknowledgements = await drain_report(ctx, engine, length)
+        assert emitted == bytes([2, 0x00, 50, 60, 0x00])
+        assert not acknowledgements
+
+        await pulse_sof(ctx, engine)
+        for _ in range(64):
+            await ctx.tick("usb")
+            assert not ctx.get(engine.output_valid)
+
+    simulation.add_testbench(bench)
+    simulation.run()
+
+
+def test_clear_all_releases_held_absolute_channels_too() -> None:
+    # Link recovery sends CLEAR(ALL), not a list of flags. ALL is 31 now and
+    # carries the ABSOLUTE bit, so a held stick lets go with everything else.
+    harness = InjectionHarness()
+    engine = harness.engine
+    simulation = Simulator(harness)
+    simulation.add_clock(1e-6, domain="usb")
+
+    async def bench(ctx) -> None:
+        await commit_map(ctx, harness.map_store, _absolute_entries())
+        _set_absolute(
+            ctx,
+            engine,
+            mask=INJ_ABSOLUTE_FLAG_LX,
+            values={INJ_MAP_ENTRY_CHANNEL_LX: 200},
+            sequence=0x96,
+        )
+        await pulse_sof(ctx, engine)
+        await wait_for_output(ctx, engine)
+        await drain_report(ctx, engine, PAD_REPORT_LENGTH)
+        ctx.set(engine.absolute_valid, 0)
+        assert ctx.get(engine.held_mask) == INJ_ABSOLUTE_FLAG_LX
+
+        ctx.set(engine.clear_valid, 1)
+        ctx.set(engine.clear_flags, INJ_CLEAR_FLAG_ALL)
+        ctx.set(engine.clear_command_sequence, 0x97)
+        await push_report(ctx, engine, bytes([0x00, 50, 60, 0x00]))
+        emitted, acknowledgements = await drain_report(ctx, engine, PAD_REPORT_LENGTH)
+        ctx.set(engine.clear_valid, 0)
+        assert emitted == bytes([0x00, 50, 60, 0x00])
+        assert acknowledgements == {"clear"}
+        assert ctx.get(engine.held_mask) == 0
+
+        await push_report(ctx, engine, bytes([0x00, 70, 60, 0x00]))
+        emitted, _ = await drain_report(ctx, engine, PAD_REPORT_LENGTH)
+        assert emitted == bytes([0x00, 70, 60, 0x00])
+
+    simulation.add_testbench(bench)
+    simulation.run()
+
+
+def test_pad_state_is_one_bounded_synchronous_memory_beside_the_state_record() -> None:
+    harness = InjectionHarness()
+    converted = rtlil.convert(
+        harness,
+        ports=[
+            harness.engine.report_valid,
+            harness.engine.report_ready,
+            harness.engine.output_valid,
+            harness.engine.output_ready,
+            harness.engine.sof_tick,
+        ],
+    )
+
+    # The state record is untouched (its write enable sits on the map store's
+    # bank select, a failing cone family) ...
+    assert converted.count(f"memory width {STATE_LAYOUT.size} size 16") == 1
+    # ... and the held values are a second memory of their own width, not a
+    # register per slot.
+    assert f"memory width {PAD_STATE_LAYOUT.size} size 16 \\pad_state" in converted
+    assert PAD_STATE_LAYOUT.size == 119
+    assert "held_mask_0" not in converted
+    assert "held_value0_0" not in converted
