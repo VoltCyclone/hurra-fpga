@@ -11,7 +11,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_PATH = ROOT / "protocol/report_injection_wire.json"
 PYTHON_PATH = ROOT / "src/hurra_cynthion/injection_wire.py"
-C_HEADER_PATH = ROOT / "firmware/ch32h417/include/injection_wire.h"
+# Both controllers consume the same contract header. The MCXN947 copy used to be
+# a hand copy guarded only by `make -C firmware/mcxn947 check-copies`, which is in
+# neither CI nor `make verify`; writing both here is what keeps them identical.
+C_HEADER_PATHS = (
+    ROOT / "firmware/ch32h417/include/injection_wire.h",
+    ROOT / "firmware/mcxn947/include/injection_wire.h",
+)
 
 TYPE_INFO = {
     "u8": (1, "uint8_t", "int"),
@@ -180,9 +186,11 @@ def render_python(path: Path) -> str:
         ]
     relative = _golden_payload(schema, "RELATIVE", schema["goldens"]["relative"])
     map_entry = _golden_payload(schema, "MAP_ENTRY", schema["goldens"]["map_entry"])
+    absolute = _golden_payload(schema, "ABSOLUTE", schema["goldens"]["absolute"])
     lines += [
         f"RELATIVE_GOLDEN_PAYLOAD = bytes.fromhex({relative.hex()!r})",
         f"MAP_ENTRY_GOLDEN_PAYLOAD = bytes.fromhex({map_entry.hex()!r})",
+        f"ABSOLUTE_GOLDEN_PAYLOAD = bytes.fromhex({absolute.hex()!r})",
         "",
         "class FrameError(ValueError):",
         '    """A malformed or unsupported slot."""',
@@ -499,7 +507,11 @@ def render_c(path: Path) -> str:
         "}",
         "",
     ]
-    for golden_name, payload_name in (("relative", "RELATIVE"), ("map_entry", "MAP_ENTRY")):
+    for golden_name, payload_name in (
+        ("relative", "RELATIVE"),
+        ("map_entry", "MAP_ENTRY"),
+        ("absolute", "ABSOLUTE"),
+    ):
         payload = _golden_payload(schema, payload_name, schema["goldens"][golden_name])
         lines += [
             f"static const uint8_t inj_golden_{golden_name}_payload[INJ_FRAME_PAYLOAD_SIZE] = {{",
@@ -513,7 +525,9 @@ def render_c(path: Path) -> str:
 
 def main() -> None:
     PYTHON_PATH.write_text(render_python(SCHEMA_PATH))
-    C_HEADER_PATH.write_text(render_c(SCHEMA_PATH))
+    header = render_c(SCHEMA_PATH)
+    for path in C_HEADER_PATHS:
+        path.write_text(header)
     subprocess.run(["ruff", "format", str(PYTHON_PATH)], check=True)
 
 

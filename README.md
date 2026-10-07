@@ -1,182 +1,202 @@
 # hurra-cynthion
 
-USB HID relay gateware for a [Cynthion](https://greatscottgadgets.com/cynthion/)
-r1.4 (Lattice ECP5 LFE5U-12F, CABGA256), written in Amaranth on top of LUNA.
+hurra-cynthion is gateware for a [Cynthion](https://greatscottgadgets.com/cynthion/) r1.4
+that sits between a USB HID device and a PC. The Cynthion enumerates the device on its
+TARGET-A port and presents a clone of it to the PC on AUX, with the device's own VID/PID and
+descriptors, at the same link speed. Reports pass through as they arrive. The PC's HID class
+requests and interrupt-OUT reports, such as rumble or keyboard LEDs, reach the real device.
+An optional NXP FRDM-MCXN947 on PMOD-A can add motion and clicks to a mouse's reports or set
+a gamepad's sticks, driven by the `km.*` and `pad.*` serial commands that KMBox and MAKCU host
+tooling already sends.
 
-It acts as a USB *host* on the TARGET-A port — powering the port, resetting,
-enumerating an attached HID device (a mouse, keyboard or HID gamepad) and polling
-its interrupt-IN endpoints — and presents a clone of that device to a PC on the
-AUX port, relaying its reports and optionally mutating them in flight. Both links
-negotiate High Speed (480 Mb/s) through a host-side chirp handshake. Debug
-registers are read over JTAG with Apollo.
+## Hardware
 
-## How it works
+You need a Cynthion r1.4 and a USB HID device that runs at Full or High Speed (check it
+against [Supported devices](#supported-devices)). AUX goes to the PC and CONTROL to a build
+machine. The board and the device on TARGET-A both draw power from CONTROL. Injection adds an
+NXP FRDM-MCXN947 and some jumper wires.
 
 ```
-mouse / receiver ──> TARGET-A  [ Cynthion r1.4 ]  AUX ──> PC
-                                  CONTROL ──> build machine (apollo, regdebug)
-                                  PMOD-A  ──> injection-control MCU (optional)
+HID device ──> TARGET-A  [ Cynthion r1.4 ]  AUX ──> PC
+                            CONTROL ──> build machine (power and apollo)
+                            PMOD-A  ──> FRDM-MCXN947 (optional)
+                                          J11 ──> host running KMBox/MAKCU tooling
 ```
 
-`enumerator.py` owns the TARGET side: it drives TARGET-A power itself
-(`aux_vbus_en`) rather than sensing VBUS, resets the bus, runs the host half of
-the USB 2.0 §7.1.7.5 chirp handshake, and walks the standard descriptor
-sequence. Enumeration is deliberately bounded — at most 4 interfaces and 4
-interrupt-IN endpoints (any numbers 1..15, no two alike), max packet size 64,
-alternate setting 0 only — and it commits a capture for any HID device (`bInterfaceClass
-== 3`, whatever its protocol) with at least one interrupt-IN endpoint, failing
-with `UNSUPPORTED_TOPOLOGY` otherwise. A failed attempt re-resets and retries, up
-to six times.
+### Wiring
 
-Captured descriptors land in a `DescriptorStore`, copied verbatim into the AUX
-clone's private store, so LUNA's `USBDevice` serves the PC the same VID/PID,
-configuration, HID and report descriptors the real device gave us. One
-`InterruptInPoller` runs per captured endpoint; they share a single
-`USBHostTransactionEngine` round-robin through an arbiter, with SOF and
-enumeration control transfers holding strict priority. `bInterval` is stored in
-the device's own encoding and decoded against the negotiated speed — frames at
-Full Speed, `2**(bInterval-1)` microframes at High Speed — because the clone
-hands the PC the original byte. AUX mirrors whatever TARGET negotiated
-(`device.full_speed_only` is driven from `~host.high_speed`), so the clone is
-transparent in speed as well as in descriptors.
+The FPGA is the SPI master and runs SPI mode 0 at 15 MHz. It clocks one 32-byte slot every
+125 µs. PMOD-A numbers are physical connector pins. J5 and J6 are the two rows of the MCXN947
+board's mikroBUS socket.
 
-Reports from all pollers merge into one interface- and endpoint-tagged byte
-stream, pass through `ReportInjectionEngine`, and are relayed to the matching AUX
-endpoint. The injection engine mutates complete reports against a field map
-uploaded at runtime by an external MCU over the SPI control link (see
-[Report injection](#report-injection)). With no MCU attached (`link_ready = 0`)
-no map is ever active and every report passes through unmodified.
+| Signal | Driven by | Cynthion PMOD-A | FRDM-MCXN947 |
+|---|---|---|---|
+| `sck` | FPGA | 1 | J6 pin 4 (P3_21) |
+| `mosi` | FPGA | 2 | J6 pin 6 (P3_20) |
+| `miso` | MCU | 3 | J6 pin 5 (P3_22) |
+| `cs_n` | FPGA | 4 | J6 pin 3 (P3_23) |
+| `mcu_ready` | MCU | 7 | J5 pin 2 (P5_7) |
+| `usb_sync` | FPGA | 8 | J3 pin 3 (P1_22) |
+| GND | | 5 or 11 | J6 pin 8 |
 
-The PC's traffic reaches the real device too. HID class control requests on EP0
-— GET/SET_REPORT, SET_IDLE and SET_PROTOCOL included — are forwarded verbatim
-through `control_relay.py`, and one HID interrupt-OUT endpoint (rumble, lightbar,
-keyboard LEDs) is relayed by `out_writer.py`. A device the PC puts in boot
-protocol (a BIOS) sends boot-layout reports the field map does not describe, so
-`boot_protocol.py` tracks it per endpoint, injection stands aside there, and a PC
-bus reset or SET_CONFIGURATION on the clone replays SET_PROTOCOL(report) to the
-real device, which never sees either event itself. Either event also starts the
-clone's own endpoints over: every data toggle restarts at DATA0, and reports
-queued before it are discarded rather than served late. The host polls the real
-device from enumeration on, but the PC polls nothing until it configures the
-clone.
-
-Vendor-type control requests are not forwarded: the clone STALLs them, by
-design. Forwarding them would let the PC send arbitrary vendor writes —
-firmware-update commands included — to the real device; class requests already
-cross that boundary, and HID configuration tools mostly use class feature
-reports, which do work. A forwarded class response is limited to the relay's
-64-byte buffer; a longer one is STALLed. The clone captures no string `0xEE` or
-BOS descriptor, so Windows never asks for MS OS descriptors.
-
-## Requirements
-
-- A Cynthion r1.4 and a USB HID device: a mouse (or its wireless receiver), a
-  keyboard, or a HID gamepad such as a DS4.
-- Python 3.11 or newer. Runtime and dev dependencies are pinned in
-  `pyproject.toml` and installed by the command below.
-- An ECP5 toolchain — `yosys`, `nextpnr-ecp5`, `ecppack` — from a single, recent
-  OSS CAD Suite release. **Use yosys 0.60 or newer**; older releases do not close
-  timing on this design reliably. The tested release is oss-cad-suite 2026-09-01
-  (yosys 0.68). Check what is on your `PATH` before trusting a build:
-
-  ```sh
-  yosys -V && which yosys nextpnr-ecp5 ecppack
-  ```
-
-The `apollo` CLI is installed as a dependency of `cynthion` by the step below.
-
-```sh
-python3 -m venv .venv
-. .venv/bin/activate
-python3 -m pip install -e '.[dev]'
-```
+Join the grounds and keep the two 3.3 V rails apart. PMOD-A pins 9 and 10 are unused, and the
+current firmware does not read `usb_sync`. The FPGA pulls its inputs down, so an unplugged MCU
+reads as absent.
 
 ## Build
 
 ```sh
+python3 -m venv .venv && . .venv/bin/activate
+python3 -m pip install -e .
+yosys -V && which yosys nextpnr-ecp5 ecppack
 LUNA_PLATFORM=cynthion.gateware.platform:CynthionPlatformRev1D4 make build
 ```
 
-The Makefile refuses to run without `LUNA_PLATFORM` — LUNA resolves the board
-from that variable and there is no default. The bitstream is written to
-`build/hurra-cynthion.bit`. `make rtlil` writes the platform-independent host
-core to `build/host.il` and needs no platform or FPGA toolchain.
+The install needs Python 3.11 or newer and brings the pinned dependencies, including the
+`apollo` CLI. Bitstream builds also need `yosys`, `nextpnr-ecp5` and `ecppack` from a single
+OSS CAD Suite release, with yosys 0.60 or newer; the build refuses an older yosys, which rarely
+closes timing on this design. The tested release is oss-cad-suite 2026-09-01 (yosys 0.68). The
+third line shows what the build will find; if `YOSYS` is set, the build uses that binary instead
+of the one on `PATH`. The Makefile stops if `LUNA_PLATFORM` is unset. The bitstream lands in
+`build/hurra-cynthion.bit`, and it exists only if timing passed.
 
-nextpnr writes no bitstream when timing fails, so the existence of
-`build/hurra-cynthion.bit` is the pass signal — not a frequency parsed from the
-log. The 60 MHz ULPI domain closes with little margin and placement is
-seed-sensitive, so any RTL change should be validated with a seed sweep rather
-than a single build. `build_env.py` pins the placer seed and the solver thread
-counts so that builds are reproducible; a build whose composed nextpnr options
-lose the timing-weight flag aborts rather than emitting a marginal result.
-
-## Load
+## Flash
 
 ```sh
-apollo configure build/hurra-cynthion.bit
+apollo configure build/hurra-cynthion.bit       # SRAM; lost on reset or power cycle
+apollo flash-program build/hurra-cynthion.bit   # configuration flash
+apollo reconfigure                              # load from flash now
 ```
 
-That is a volatile SRAM load: a reset or power cycle reverts the FPGA to
-whatever is in configuration flash. To make it persistent:
+Use `configure` to try a build and the other two to keep one. With the bitstream in flash the
+board relays from power-up, and CONTROL can go to any USB supply.
+
+## Supported devices
+
+Any HID device with an interrupt-IN endpoint on a HID interface works, within these limits:
+
+| | Limit |
+|---|---|
+| Speed | High Speed or Full Speed. Low Speed devices are refused. AUX mirrors TARGET. |
+| Topology | One device, plugged straight into TARGET-A. A hub fails enumeration. |
+| Interfaces | Up to 4. Alternate settings other than 0 are skipped. |
+| Interrupt-IN endpoints | Up to 4 on HID interfaces, max packet 64 bytes. Numbers 1..15, each used once. |
+| Descriptors | Configuration up to 1024 bytes. Report descriptor up to 2048 bytes per interface. |
+| Audio interfaces | Tolerated, as on a DS4. Their endpoints are not relayed. |
+
+A device outside these limits, or one that fails enumeration six times running, lights LED 4.
+On the PC's side:
+
+- HID class requests on EP0 reach the device, SET_IDLE and SET_PROTOCOL included. A response
+  over 64 bytes is STALLed.
+- The first interrupt-OUT endpoint on a HID interface is relayed. Further ones get no handshake.
+- When a BIOS puts an interface in boot protocol, reports on that interface pass through
+  unmodified. A PC bus reset or SET_CONFIGURATION returns the device to report protocol and
+  discards queued reports.
+- Vendor requests are STALLed, which keeps the PC away from the device's firmware-update path.
+
+## Injection
+
+The FRDM-MCXN947 firmware compiles a field map from the device's report descriptors and
+uploads it to the Cynthion. Console commands then become injection requests. With no MCU
+attached no map is ever active and every report passes through unmodified.
+
+### Firmware
+
+Building needs `arm-none-eabi-gcc` and `python3` on `PATH`. Flashing needs NXP LinkServer and
+a cable to J17, the board's MCU-Link debug probe.
 
 ```sh
-apollo flash-program build/hurra-cynthion.bit
-apollo reconfigure
+make -C firmware/mcxn947 check    # build both core images, then inspect them
+make -C firmware/mcxn947 flash    # program both cores through the MCU-Link
+make -C firmware/mcxn947 probes   # list the probes LinkServer can see
 ```
 
-A flash-resident board comes up and relays with no debug connection attached.
+The Makefile looks for `/Applications/LinkServer_24.12.21/LinkServer`; set `LINKSERVER` to use
+another. J17 also
+carries a diagnostic UART at 115200 8N1. `firmware/ch32h417/` holds firmware for the earlier
+controller, a WCH CH32H417, on the same link contract.
 
-## Report injection
+### Console
 
-Report mutation is driven by an optional external MCU over a 32-byte fixed-slot
-SPI link on PMOD-A, one slot every 125 µs. The wire format is versioned in
-`protocol/report_injection_wire.json`, the single source of truth from which the
-Python and C bindings are generated. The MCU uploads a descriptor-derived field
-map and then issues motion, button and mask commands; the FPGA applies them to
-live reports transactionally.
+The console is USB CDC on the J11 Type-C connector (J17 is the probe), and it enumerates as
+`hurra-adapter` (VID:PID 1209:0001). It echoes input and prompts with `hurra> `. `help` lists
+the built-in commands, and `stats` prints link counters with the `km_*` tallies.
 
-Firmware is provided for two controllers, both speaking the same contract:
+`km.*` and `pad.*` input is off at every boot, so those lines get `unknown command; try help`.
+Turn it on with `kmmode makcu` or `kmmode kmbox`:
 
-- `firmware/mcxn947/` — NXP FRDM-MCXN947, the current controller.
-- `firmware/ch32h417/` — WCH CH32H417, the earlier controller.
+| Mode | Accepted command | Refused command |
+|---|---|---|
+| `makcu` | `km.move(10,0)`, then `>>>` on the next line | `km.moveto(!noabsolute)`, then `>>>` |
+| `kmbox` | no reply | `km.moveto(!noabsolute)` |
 
-With no MCU attached the relay is fully transparent.
+The `hurra> ` prompt follows every line in both modes. Replies use the command's namespace,
+`km.` or `pad.`. In `makcu` mode acknowledgements are on at boot; `km.echo(0)` silences them and
+`km.echo(1)` restores them. Refusals always print. A reply, or silence in `kmbox` mode, means
+the MCU accepted the command. Nothing on the link reports whether the PC saw the result.
 
-## Reading debug registers
+The MCU uploads the map after the device's first report, so move the mouse or press something
+on the pad once after plugging it in, and again after any link drop. Until then, and with
+nothing attached, motion and button commands answer `notready`. Once the descriptors are
+compiled, `km.*` on a gamepad answers `nomouse` and `pad.*` on a mouse answers `nopad`, whether
+or not the device has reported yet. A keyboard, or any device with neither layout, answers
+`nomouse` to `km.*` and `nopad` to `pad.*`. `km.version()`, `km.echo()` and the no-argument getters
+answer in any state. `busy` means the one-deep command slot was full, so retry. `badargs`,
+`badstate`, `nobutton` and `unknown` point at the command itself.
 
-The production top exposes `report_injection_register_map()` over LUNA's
-JTAG-tunnelled debug SPI. `regdebug` is the schema-aware reader:
+### Mouse commands
 
-```sh
-PYTHONPATH=src python3 -m hurra_cynthion.regdebug --no-force-offline \
-    --map report-injection dump
-PYTHONPATH=src python3 -m hurra_cynthion.regdebug --no-force-offline \
-    --map report-injection read usb_speed
-PYTHONPATH=src python3 -m hurra_cynthion.regdebug --no-force-offline \
-    --map report-injection watch native_reports polls_issued
-```
+A mouse qualifies when its report descriptor has a Generic Desktop Mouse collection with
+relative X and Y in one report, each able to hold ±127. Motion adds to what the mouse reports
+and works on a stationary mouse too. A leading `.` stands for `km.`.
 
-Subcommands are `magic`, `read`, `write`, `dump`, `mem` and `watch`.
-`--no-force-offline` matters: the default forces the FPGA offline before
-connecting, which stops the relay you are trying to observe.
+| Command | Effect |
+|---|---|
+| `km.move(dx,dy)`, `km.move(dx,dy,n)` | Adds `dx` and `dy` counts, at most 64 per axis per report, in at least `n` steps (up to 512) if given. Bezier control points after `n` are accepted and ignored. |
+| `km.left(s)`, and `right`, `middle`, `side1`, `side2` | `1` presses and `0` releases. `2` also releases, without sending a report of its own. With no argument, answers the injected state in `makcu` mode. |
+| `km.click(b)`, `km.click(b,n)` | Clicks button `b` once, or `n` times. Buttons are 1 left, 2 right, 3 middle, 4 side1, 5 side2. |
+| `km.click(b,1,ms)` | Holds `b` for `ms` milliseconds, counted at 8 reports per millisecond. The conversion assumes an 8 kHz mouse; on a 1 kHz mouse the hold lasts eight times longer than asked. A count above 1 with a hold answers `noclock`. |
+| `km.wheel(n)` | Scrolls `n` notches, one per report. |
+| `km.pan(n)`, `km.tilt(n)` | Scrolls horizontally, one notch per report. |
+| `km.lock_ml(s)`, and `lock_mr`, `lock_mm`, `lock_ms1`, `lock_ms2` | `1` hides that real button from the PC. `0` passes it again. |
+| `km.version()` | Answers `km.version(hurra-mcxn947 kmcmd 1)`. |
 
-Registers are 32 bits with fields packed LSB-first, allocated in declaration
-order and appended only — inserting one shifts every later address and silently
-invalidates readers built against the old map. Counters mostly saturate;
-`spi_slots`, `polls_issued` and `poll_naks` wrap mod 2**32 and are meant to be
-read as deltas over a window. That trio diagnoses a low report rate:
-`native_reports` counts reports *received*, so a poll that was never issued and a
-poll the device NAKed produce an identical number, while `polls_issued` against
-the free-running `spi_slots` reference separates a slow host from a quiet device.
+Injection adds to the mouse's own motion and has no motion mask, so absolute moves and axis
+locks are refused. Button locks work. The Cynthion clones keyboards but cannot type on them.
 
-`speed_policy` is the one writable register. Bit 0 forces AUX to Full Speed,
-bit 1 suppresses the TARGET chirp; AUX follows TARGET, so bit 1 alone returns the
-whole relay to Full Speed without building a second bitstream.
+| Refusal | Commands |
+|---|---|
+| `noabsolute` | `moveto`, `silent` |
+| `nopos` | `getpos`, `screen` |
+| `noaxismask` | `lock_mx`, `lock_my`, `lock_mw`, `lock_mx+`, `lock_mx-`, `lock_my+`, `lock_my-`, `lock_mw+`, `lock_mw-` |
+| `nocatch` | `catch_ml`, `catch_mr`, `catch_mm`, `catch_ms1`, `catch_ms2` |
+| `nokeyboard` | `press`, `down`, `up`, `string`, `isdown`, `disable`, `mask`, `remap`, `keyboard`, `init` |
+| `nostream` | `buttons`, `axis`, `mouse`, `mo` |
+| `nodevice` | `baud`, `bypass`, `turbo`, `remap_button`, `remap_axis`, `invert_x`, `invert_y`, `swap_xy`, `led`, `serial`, `log`, `hs`, `release`, `reboot`, `fault`, `device`, `info`, `help` |
 
-```sh
-PYTHONPATH=src python3 -m hurra_cynthion.regdebug --no-force-offline \
-    --map report-injection write speed_policy 2
-```
+### Gamepad commands
+
+A pad qualifies when its report descriptor has a Generic Desktop Game Pad or Joystick
+collection, or a Multi-axis Controller, with absolute X and Y in one report. Pad commands set
+the field to the value given, where mouse commands add to it.
+
+| Command | Effect |
+|---|---|
+| `pad.lx(v)`, `pad.ly(v)`, `pad.rx(v)`, `pad.ry(v)` | Holds a left or right stick axis at `v`. With no argument, answers the held value in `makcu` mode. |
+| `pad.lt(v)`, `pad.rt(v)` | Holds the left or right trigger at `v`. With no argument, answers as above. |
+| `pad.hat(d)` | Holds the hat at `d`, `0`..`7` clockwise from up, or `8` for centred. |
+| `pad.btn(n,s)` | Presses (`1`) or releases (`0`) button `n`, 1..32. |
+| `pad.release()` | Returns every held axis and the hat to the pad's own values. Buttons keep their state. |
+| `pad.hold(ms)` | Releases every held axis and the hat after `ms` milliseconds. A later axis or hat command cancels it. |
+
+`v` runs from -32768 to 32767 and is scaled to the field's logical range. -32768 is the field's
+minimum and 32767 its maximum, so 0 centres a stick. Channels map to HID usages as on a DS4:
+`lx` X, `ly` Y, `rx` Z, `ry` Rz, `lt` Rx, `rt` Ry. On a report without Rx and Ry, Accelerator
+becomes `lt` and Brake becomes `rt`. A channel the pad does not have is dropped.
+
+A pad command takes effect on the pad's next report. The MCU acknowledges it at once, and a pad
+that is not reporting shows nothing on the PC until it reports again.
 
 ## LEDs
 
@@ -189,26 +209,71 @@ PYTHONPATH=src python3 -m hurra_cynthion.regdebug --no-force-offline \
 | 4 | host error |
 | 5 | AUX clone configured by the PC |
 
-## Tests
+## Diagnostics
+
+`regdebug` reads the debug registers over JTAG through CONTROL. From the repository root:
 
 ```sh
-make lint    # ruff check + ruff format --check over src and tests
-make test    # pytest; Amaranth simulation only, no hardware needed
-make rtlil   # platform-independent host core; no FPGA toolchain
+alias regdebug='PYTHONPATH=src python3 -m hurra_cynthion.regdebug --no-force-offline --map report-injection'
+regdebug dump
+regdebug read usb_speed
+regdebug watch native_reports polls_issued
+regdebug write speed_policy 2
 ```
 
-`make verify` runs those plus the CH32H417 firmware build and its host-side unit
-tests, which need `riscv-none-elf-gcc` on `PATH`. The MCXN947 firmware has its
-own `make test` and `make check` under `firmware/mcxn947/`.
+Keep both flags. Without `--no-force-offline` regdebug forces the FPGA offline before
+connecting, which stops the relay you meant to watch. Without `--map` it decodes against the
+`capture` map, which does not match this bitstream.
+
+`speed_policy` is the one writable register, 0 after configuration. Bit 0 forces AUX to Full
+Speed. Bit 1 skips the TARGET chirp, so the device runs at Full Speed and AUX follows; writing
+2 does that from the next replug. `usb_speed.aux_speed` reads 0 at High Speed, 1 at Full.
+
+For a low report rate, `native_reports` alone cannot tell a poll never issued from one the
+device NAKed. Read `polls_issued` and `poll_naks` as deltas against `spi_slots`, which ticks
+every 125 µs; polls short of the device's interval point at the host, and NAKs filling the gap
+point at a device with nothing to send.
+
+`relay_drops` is the only record of a report the relay discarded. Its `unmatched` field counts
+reports for an endpoint the clone does not serve, and `congested` counts reports dropped on a
+full endpoint queue. Both should read 0.
+
+## Development
+
+```sh
+python3 -m pip install -e '.[dev]'
+make lint                      # ruff check and ruff format --check over src and tests
+make test                      # pytest; Amaranth simulation, no hardware
+make rtlil                     # host core to build/host.il; no FPGA toolchain
+make verify                    # lint, test, rtlil, CH32H417 firmware; needs riscv-none-elf-gcc
+make -C firmware/mcxn947 test  # MCXN947 host tests; a C compiler and python3 only
+make firmware-test             # CH32H417 host tests; a C compiler only
+```
+
+The MCU link's wire format lives in `protocol/report_injection_wire.json`. Edit the JSON and run
+`tools/generate_report_injection_wire.py` (it needs `ruff` on `PATH`), which rewrites
+`src/hurra_cynthion/injection_wire.py` and both firmware `injection_wire.h` headers. Never edit
+those by hand; `tests/test_injection_wire.py` fails when they drift.
+
+`make -C firmware/mcxn947 DEMO=1 check` builds the bench image instead of the shipping one. It
+drifts a mouse cursor up and left at about 80 counts per second. Twenty seconds after boot it
+breaks the SPI link on purpose, runs recovery, breaks it again and leaves the fault monitor to
+repair it. Rebuild without `DEMO=1` before flashing a board anyone else will use.
 
 ## Layout
 
-| Path | |
+| Path | Contents |
 |---|---|
-| `src/hurra_cynthion/` | Amaranth gateware and the host-side Python tools |
+| `src/hurra_cynthion/` | Amaranth gateware and the host-side Python tools, `regdebug` among them |
 | `tests/` | pytest simulation suite |
-| `protocol/` | `report_injection_wire.json`, the versioned wire contract for the MCU link |
-| `tools/` | `generate_report_injection_wire.py`, which emits the Python and C sides of that contract |
-| `firmware/mcxn947/` | MCXN947 controller firmware for the injection link |
-| `firmware/ch32h417/` | CH32H417 controller firmware for the injection link |
-| `firmware/teensy_hs_mouse/` | synthetic High Speed HID mouse used as a bench test instrument |
+| `protocol/` | `report_injection_wire.json`, the wire contract for the MCU link |
+| `tools/` | the wire-contract generator and a DS4 descriptor-to-fixture converter |
+| `firmware/mcxn947/` | FRDM-MCXN947 controller firmware |
+| `firmware/ch32h417/` | firmware for the earlier CH32H417 controller |
+| `firmware/mcxn947/include/injection_wire.h` | generated, like its CH32H417 twin and `src/hurra_cynthion/injection_wire.py` |
+| `firmware/teensy_hs_mouse/` | a synthetic High Speed mouse used as a bench instrument |
+| `docker/` | pinned ECP5 toolchain image for synthesis and seed sweeps; see `docker/README.md` |
+
+## Licence
+
+MIT. See `LICENSE`.

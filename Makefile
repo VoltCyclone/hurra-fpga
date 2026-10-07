@@ -7,7 +7,7 @@ OUT   ?= out
 SEEDS ?= 1 2 3 4 5 6 7 8 9 10 11 12
 
 build:
-	@test -n "$(LUNA_PLATFORM)" || { echo "Set LUNA_PLATFORM explicitly (see README.md)"; exit 2; }
+	@test -n "$(LUNA_PLATFORM)" || { echo "error: LUNA_PLATFORM is not set. For a Cynthion r1.4, run LUNA_PLATFORM=cynthion.gateware.platform:CynthionPlatformRev1D4 make build"; exit 2; }
 	mkdir -p build
 	PYTHONPATH=src python3 -m hurra_cynthion.gateware --output build/hurra-cynthion.bit
 

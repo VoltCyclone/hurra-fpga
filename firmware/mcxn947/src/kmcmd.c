@@ -1,6 +1,7 @@
 // KMBox / MAKCU serial command input. Portable; see kmcmd.h.
 
 #include <stddef.h>
+#include <string.h>
 
 #include "kmcmd.h"
 
@@ -26,7 +27,26 @@ static uint32_t s_reports_per_ms;
 // leave that one held, so each command edits the mask and re-sends the whole
 // thing.
 static uint32_t s_buttons;
+// The mask the sink last received. Diverges from s_buttons after a MAKCU
+// silent release (state 2 clears our copy without a frame) and after a timed
+// click whose hold the engine released itself; "unchanged" is judged against
+// this, not against s_buttons, so an explicit release still goes out.
+static uint32_t s_buttons_sent;
 static uint32_t s_physical;
+
+// Held pad vector: the mirror of s_buttons for ABSOLUTE. Bit k of the mask
+// holds channel k at s_abs_values[k]; every edit re-sends the whole vector,
+// a refusal rolls it back. During pad.hold's window the cleared mirror is
+// ahead of the FPGA, so the next explicit ABSOLUTE must reach the sink and
+// supersede the pending timed release even when the mirror is unchanged.
+static int16_t s_abs_values[KMCMD_PAD_CHANNELS];
+static uint8_t s_abs_mask;
+static bool s_abs_hold_pending;
+
+// Reply prefix for the line being handled: "km." or "pad.". Set by
+// kmcmd_line() before dispatch so every handler frames its answer in the
+// namespace the host used.
+static const char *s_prefix = "km.";
 
 // Pending displacement. Held as int32 because a host may legitimately ask for
 // more counts than one report can carry -- that is the whole reason a move is a
@@ -158,15 +178,27 @@ typedef enum {
     CMD_LOCK_BUTTON,
     CMD_VERSION,
     CMD_ECHO,
+    // pad.* namespace
+    CMD_PAD_AXIS,     // lx ly rx ry lt rt: `button` is the channel
+    CMD_PAD_HAT,
+    CMD_PAD_BTN,
+    CMD_PAD_RELEASE,
+    CMD_PAD_HOLD,
     // Recognised but not expressible on this link; each carries a reason.
     CMD_REFUSE,
 } cmd_kind_t;
 
 typedef struct {
     cmd_kind_t kind;
-    uint32_t button;      // CMD_BUTTON / CMD_LOCK_BUTTON: the bit
+    uint32_t button;      // CMD_BUTTON / CMD_LOCK_BUTTON: the bit; CMD_PAD_AXIS: the channel
     const char *reason;   // CMD_REFUSE: why
 } classified_t;
+
+typedef enum {
+    NS_NONE = 0,  // bare name: may be the console's
+    NS_KM,        // `km.` or a leading dot
+    NS_PAD,       // `pad.`
+} namespace_t;
 
 // Everything MAKCU documents that this device cannot do, with the reason it
 // cannot. Named individually rather than lumped into one "unsupported" so a
@@ -281,14 +313,44 @@ static classified_t classify(const char *name)
     return out;
 }
 
+static classified_t classify_pad(const char *name)
+{
+    classified_t out = {CMD_UNKNOWN, 0u, NULL};
+    static const struct {
+        const char *name;
+        kmcmd_pad_channel_t channel;
+    } axes[] = {
+        {"lx", KMCMD_PAD_LX}, {"ly", KMCMD_PAD_LY}, {"rx", KMCMD_PAD_RX},
+        {"ry", KMCMD_PAD_RY}, {"lt", KMCMD_PAD_LT}, {"rt", KMCMD_PAD_RT},
+    };
+    for (uint32_t i = 0u; i < sizeof(axes) / sizeof(axes[0]); ++i) {
+        if (streq(name, axes[i].name)) {
+            out.kind = CMD_PAD_AXIS;
+            out.button = (uint32_t)axes[i].channel;
+            return out;
+        }
+    }
+    if (streq(name, "hat")) {
+        out.kind = CMD_PAD_HAT;
+    } else if (streq(name, "btn")) {
+        out.kind = CMD_PAD_BTN;
+    } else if (streq(name, "release")) {
+        out.kind = CMD_PAD_RELEASE;
+    } else if (streq(name, "hold")) {
+        out.kind = CMD_PAD_HOLD;
+    }
+    return out;
+}
+
 // --- parsing ----------------------------------------------------------------
 
-// Splits `line` into a name and the offset of its argument text. Returns false
-// when the line is not shaped like a call at all. `had_prefix` records whether
-// the caller wrote `km.` or a bare leading dot, which decides what an unknown
-// name means: with a prefix it is a command for us that we do not support,
-// without one it may be an ordinary console command.
-static bool split_call(const char *line, char *name, bool *had_prefix, uint32_t *args_at)
+// Splits `line` into a namespace, a name and the offset of its argument text.
+// Returns false when the line is not shaped like a call at all. The namespace
+// decides what an unknown name means: with `km.`, a bare dot or `pad.` it is a
+// command for us that we do not support; without one it may be an ordinary
+// console command. `.` is not a name character, so `pad.lx(1)` can only reach
+// a handler through the prefix test here.
+static bool split_call(const char *line, char *name, namespace_t *ns, uint32_t *args_at)
 {
     uint32_t i = 0u;
 
@@ -296,13 +358,17 @@ static bool split_call(const char *line, char *name, bool *had_prefix, uint32_t 
         i++;
     }
 
-    *had_prefix = false;
+    *ns = NS_NONE;
     if (line[i] == 'k' && line[i + 1u] == 'm' && line[i + 2u] == '.') {
         i += 3u;
-        *had_prefix = true;
+        *ns = NS_KM;
+    } else if (line[i] == 'p' && line[i + 1u] == 'a' && line[i + 2u] == 'd' &&
+               line[i + 3u] == '.') {
+        i += 4u;
+        *ns = NS_PAD;
     } else if (line[i] == '.') {
         i += 1u;
-        *had_prefix = true;
+        *ns = NS_KM;
     }
 
     uint32_t n = 0u;
@@ -399,15 +465,34 @@ static bool sink_ready(void)
 // The distinction matters because kmcmd_step() bails per-op: a sink with
 // buttons but no relative would otherwise ACK a move and then never drain the
 // budget, reporting success for motion that can never be emitted.
-static const char *sink_blocked(bool required_op_present)
+static kmcmd_device_class_t device_class(void)
+{
+    // A NULL device_class() is not "unknown device": it means the question is
+    // not wired, so only `ready` gates -- the pre-class behaviour.
+    if (s_ops.device_class == NULL) {
+        return KMCMD_DEVICE_UNKNOWN;
+    }
+    return s_ops.device_class(s_ops.ctx);
+}
+
+// `wants_pad` is the namespace: km.* needs a mouse, pad.* needs a pad. The
+// class refusals come before `notready` because waiting will not turn a pad
+// into a mouse; UNKNOWN (no verdict yet) falls through to `ready`, which in
+// production is false until a layout is adopted and its map committed.
+static const char *sink_blocked(bool required_op_present, bool wants_pad)
 {
     if (!required_op_present) {
         return "nosink";
     }
-    // Before `notready`: a keyboard or a pad will never become ready, so the
-    // honest answer is that there is nothing to inject into.
-    if (s_ops.no_mouse != NULL && s_ops.no_mouse(s_ops.ctx)) {
+    const kmcmd_device_class_t cls = device_class();
+    if (cls == KMCMD_DEVICE_PAD && !wants_pad) {
         return "nomouse";
+    }
+    if (cls == KMCMD_DEVICE_MOUSE && wants_pad) {
+        return "nopad";
+    }
+    if (cls == KMCMD_DEVICE_NONE) {
+        return wants_pad ? "nopad" : "nomouse";
     }
     if (!sink_ready()) {
         return "notready";
@@ -441,7 +526,7 @@ static void emit_ack(reply_t *reply, const char *name, const int32_t *args, uint
         // echo(0) asks for the same silence explicitly.
         return;
     }
-    reply_put(reply, "km.");
+    reply_put(reply, s_prefix);
     reply_put(reply, name);
     reply_put(reply, "(");
     for (uint32_t i = 0u; i < count; ++i) {
@@ -453,12 +538,22 @@ static void emit_ack(reply_t *reply, const char *name, const int32_t *args, uint
     reply_put(reply, ")\r\n>>>");
 }
 
+// A bare getter's answer. The caller has already checked the mode and echo.
+static void emit_value(reply_t *reply, const char *name, int32_t value)
+{
+    reply_put(reply, s_prefix);
+    reply_put(reply, name);
+    reply_put(reply, "(");
+    reply_i32(reply, value);
+    reply_put(reply, ")\r\n>>>");
+}
+
 // Audible in every mode. Silence is only a correct answer for something that
 // worked, and `echo(0)` asks to drop acknowledgements, not errors.
 static void emit_refusal(reply_t *reply, const char *name, const char *reason)
 {
     s_refused++;
-    reply_put(reply, "km.");
+    reply_put(reply, s_prefix);
     reply_put(reply, name);
     reply_put(reply, "(!");
     reply_put(reply, reason);
@@ -474,7 +569,7 @@ static void handle_move(reply_t *reply, const char *name, const int32_t *args, u
         emit_refusal(reply, name, "badargs");
         return;
     }
-    const char *blocked = sink_blocked(s_ops.relative != NULL);
+    const char *blocked = sink_blocked(s_ops.relative != NULL, false);
     if (blocked != NULL) {
         emit_refusal(reply, name, blocked);
         return;
@@ -518,15 +613,11 @@ static void handle_scroll(reply_t *reply, const char *name, const int32_t *args,
         // the budget still waiting to be spent.
         note_accepted();
         if (s_mode == KMCMD_MODE_MAKCU && !s_echo_off) {
-            reply_put(reply, "km.");
-            reply_put(reply, name);
-            reply_put(reply, "(");
-            reply_i32(reply, is_pan ? s_pend_pan : s_pend_wheel);
-            reply_put(reply, ")\r\n>>>");
+            emit_value(reply, name, is_pan ? s_pend_pan : s_pend_wheel);
         }
         return;
     }
-    const char *blocked = sink_blocked(s_ops.relative != NULL);
+    const char *blocked = sink_blocked(s_ops.relative != NULL, false);
     if (blocked != NULL) {
         emit_refusal(reply, name, blocked);
         return;
@@ -548,30 +639,33 @@ static void handle_button(reply_t *reply, const char *name, uint32_t bit, const 
         // we actually know, which is our own injected state, and emit nothing.
         note_accepted();
         if (s_mode == KMCMD_MODE_MAKCU && !s_echo_off) {
-            reply_put(reply, "km.");
-            reply_put(reply, name);
-            reply_put(reply, "(");
-            reply_i32(reply, ((s_buttons & bit) != 0u) ? 1 : 0);
-            reply_put(reply, ")\r\n>>>");
+            emit_value(reply, name, ((s_buttons & bit) != 0u) ? 1 : 0);
         }
+        return;
+    }
+
+    if (args[0] != 0 && args[0] != 1 && args[0] != 2) {
+        emit_refusal(reply, name, "badstate");
         return;
     }
 
     // MAKCU state 2 is "silent_release": zero the state without emitting a
     // frame, so the change rides out on the next real report instead of
-    // provoking one.
+    // provoking one. It still belongs to km.*, so a pad or non-injectable
+    // device must refuse it before the shared button mirror can be changed.
     if (args[0] == 2) {
+        const kmcmd_device_class_t cls = device_class();
+        if (cls == KMCMD_DEVICE_PAD || cls == KMCMD_DEVICE_NONE) {
+            emit_refusal(reply, name, "nomouse");
+            return;
+        }
         s_buttons &= ~bit;
         note_accepted();
         emit_ack(reply, name, args, count);
         return;
     }
-    if (args[0] != 0 && args[0] != 1) {
-        emit_refusal(reply, name, "badstate");
-        return;
-    }
 
-    const char *blocked = sink_blocked(s_ops.buttons != NULL);
+    const char *blocked = sink_blocked(s_ops.buttons != NULL, false);
     if (blocked != NULL) {
         emit_refusal(reply, name, blocked);
         return;
@@ -583,6 +677,13 @@ static void handle_button(reply_t *reply, const char *name, uint32_t bit, const 
     } else {
         s_buttons &= ~bit;
     }
+    if (s_buttons == s_buttons_sent) {
+        // The sink already holds exactly this mask. The engine can only ack an
+        // unchanged BUTTON_STATE with a redundant report; ack it here instead.
+        note_accepted();
+        emit_ack(reply, name, args, count);
+        return;
+    }
     if (s_ops.buttons == NULL || !s_ops.buttons(s_ops.ctx, s_buttons, 0u)) {
         // Roll back rather than leave our idea of the mask ahead of the FPGA's.
         // A refusal here is the one-deep command queue being busy, which the
@@ -592,6 +693,7 @@ static void handle_button(reply_t *reply, const char *name, uint32_t bit, const 
         emit_refusal(reply, name, "busy");
         return;
     }
+    s_buttons_sent = s_buttons;
     note_accepted();
     emit_ack(reply, name, args, count);
 }
@@ -643,7 +745,7 @@ static void handle_click(reply_t *reply, const char *name, const int32_t *args, 
         hold = (uint32_t)reports;
     }
 
-    const char *blocked = sink_blocked(s_ops.buttons != NULL);
+    const char *blocked = sink_blocked(s_ops.buttons != NULL, false);
     if (blocked != NULL) {
         emit_refusal(reply, name, blocked);
         return;
@@ -663,11 +765,7 @@ static void handle_lock_button(reply_t *reply, const char *name, uint32_t bit, c
     if (count < 1u) {
         note_accepted();
         if (s_mode == KMCMD_MODE_MAKCU && !s_echo_off) {
-            reply_put(reply, "km.");
-            reply_put(reply, name);
-            reply_put(reply, "(");
-            reply_i32(reply, ((s_physical & bit) != 0u) ? 1 : 0);
-            reply_put(reply, ")\r\n>>>");
+            emit_value(reply, name, ((s_physical & bit) != 0u) ? 1 : 0);
         }
         return;
     }
@@ -675,7 +773,7 @@ static void handle_lock_button(reply_t *reply, const char *name, uint32_t bit, c
         emit_refusal(reply, name, "badstate");
         return;
     }
-    const char *blocked = sink_blocked(s_ops.physical_mask != NULL);
+    const char *blocked = sink_blocked(s_ops.physical_mask != NULL, false);
     if (blocked != NULL) {
         emit_refusal(reply, name, blocked);
         return;
@@ -687,12 +785,196 @@ static void handle_lock_button(reply_t *reply, const char *name, uint32_t bit, c
     } else {
         s_physical &= ~bit;
     }
+    if (s_physical == previous) {
+        // As in handle_button.
+        note_accepted();
+        emit_ack(reply, name, args, count);
+        return;
+    }
     if (s_ops.physical_mask == NULL || !s_ops.physical_mask(s_ops.ctx, s_physical)) {
         s_physical = previous;
         s_dropped++;
         emit_refusal(reply, name, "busy");
         return;
     }
+    note_accepted();
+    emit_ack(reply, name, args, count);
+}
+
+// --- pad handlers -----------------------------------------------------------
+//
+// The held vector is state, exactly as s_buttons is: every setter edits one
+// channel and re-sends the whole mask and all seven values. A refusal rolls the
+// edit back. A setter that changes nothing is acked without a frame, as an
+// unchanged km.left() is -- the FPGA's held state already equals the mirror.
+
+static bool send_absolute(reply_t *reply, const char *name, const int32_t *args, uint32_t count,
+                          uint8_t previous_mask, const int16_t previous_values[KMCMD_PAD_CHANNELS])
+{
+    if (!s_abs_hold_pending && s_abs_mask == previous_mask &&
+        memcmp(s_abs_values, previous_values, sizeof(s_abs_values)) == 0) {
+        note_accepted();
+        emit_ack(reply, name, args, count);
+        return true;
+    }
+    if (s_ops.absolute == NULL || !s_ops.absolute(s_ops.ctx, s_abs_mask, s_abs_values)) {
+        s_abs_mask = previous_mask;
+        memcpy(s_abs_values, previous_values, sizeof(s_abs_values));
+        s_dropped++;
+        emit_refusal(reply, name, "busy");
+        return false;
+    }
+    s_abs_hold_pending = false;
+    note_accepted();
+    emit_ack(reply, name, args, count);
+    return true;
+}
+
+// pad.lx(v) .. pad.rt(v): hold channel `channel` at v (-32768..32767). Bare:
+// answer the held value (0 when released).
+static void handle_pad_axis(reply_t *reply, const char *name, uint32_t channel,
+                            const int32_t *args, uint32_t count)
+{
+    if (count < 1u) {
+        note_accepted();
+        if (s_mode == KMCMD_MODE_MAKCU && !s_echo_off) {
+            emit_value(reply, name,
+                       ((s_abs_mask & (1u << channel)) != 0u) ? s_abs_values[channel] : 0);
+        }
+        return;
+    }
+    if (args[0] < -32768 || args[0] > 32767) {
+        emit_refusal(reply, name, "badargs");
+        return;
+    }
+    const char *blocked = sink_blocked(s_ops.absolute != NULL, true);
+    if (blocked != NULL) {
+        emit_refusal(reply, name, blocked);
+        return;
+    }
+    const uint8_t previous_mask = s_abs_mask;
+    int16_t previous_values[KMCMD_PAD_CHANNELS];
+    memcpy(previous_values, s_abs_values, sizeof(previous_values));
+    s_abs_mask |= (uint8_t)(1u << channel);
+    s_abs_values[channel] = (int16_t)args[0];
+    (void)send_absolute(reply, name, args, count, previous_mask, previous_values);
+}
+
+// pad.hat(d): 0..7 are the eight directions clockwise from up; 8 is the null
+// (centred) value. Anything else is `badstate`, because the FPGA writes the
+// value unclamped and the device's hat has no meaning for it.
+static void handle_pad_hat(reply_t *reply, const char *name, const int32_t *args, uint32_t count)
+{
+    if (count < 1u) {
+        note_accepted();
+        if (s_mode == KMCMD_MODE_MAKCU && !s_echo_off) {
+            emit_value(reply, name,
+                       ((s_abs_mask & (1u << KMCMD_PAD_HAT)) != 0u) ? s_abs_values[KMCMD_PAD_HAT]
+                                                                    : KMCMD_PAD_HAT_NULL);
+        }
+        return;
+    }
+    if (args[0] < 0 || args[0] > KMCMD_PAD_HAT_NULL) {
+        emit_refusal(reply, name, "badstate");
+        return;
+    }
+    const char *blocked = sink_blocked(s_ops.absolute != NULL, true);
+    if (blocked != NULL) {
+        emit_refusal(reply, name, blocked);
+        return;
+    }
+    const uint8_t previous_mask = s_abs_mask;
+    int16_t previous_values[KMCMD_PAD_CHANNELS];
+    memcpy(previous_values, s_abs_values, sizeof(previous_values));
+    s_abs_mask |= (uint8_t)(1u << KMCMD_PAD_HAT);
+    s_abs_values[KMCMD_PAD_HAT] = (int16_t)args[0];
+    (void)send_absolute(reply, name, args, count, previous_mask, previous_values);
+}
+
+// pad.btn(n, 0|1): button n (1..32) through the same BUTTON_STATE path as
+// km.left(); the pad's buttons map as runs exactly like a mouse's.
+static void handle_pad_btn(reply_t *reply, const char *name, const int32_t *args, uint32_t count)
+{
+    if (count < 2u) {
+        emit_refusal(reply, name, "badargs");
+        return;
+    }
+    if (args[0] < 1 || args[0] > 32) {
+        emit_refusal(reply, name, "nobutton");
+        return;
+    }
+    if (args[1] != 0 && args[1] != 1) {
+        emit_refusal(reply, name, "badstate");
+        return;
+    }
+    const char *blocked = sink_blocked(s_ops.buttons != NULL, true);
+    if (blocked != NULL) {
+        emit_refusal(reply, name, blocked);
+        return;
+    }
+    const uint32_t bit = 1u << (uint32_t)(args[0] - 1);
+    const uint32_t previous = s_buttons;
+    if (args[1] == 1) {
+        s_buttons |= bit;
+    } else {
+        s_buttons &= ~bit;
+    }
+    if (s_buttons == s_buttons_sent) {
+        note_accepted();
+        emit_ack(reply, name, args, count);
+        return;
+    }
+    if (!s_ops.buttons(s_ops.ctx, s_buttons, 0u)) {
+        s_buttons = previous;
+        s_dropped++;
+        emit_refusal(reply, name, "busy");
+        return;
+    }
+    s_buttons_sent = s_buttons;
+    note_accepted();
+    emit_ack(reply, name, args, count);
+}
+
+// pad.release(): let every channel pass the physical value again -- an
+// ABSOLUTE with mask 0. The values are kept so a later setter re-holds one
+// channel without disturbing what the others last read.
+static void handle_pad_release(reply_t *reply, const char *name, const int32_t *args,
+                               uint32_t count)
+{
+    const char *blocked = sink_blocked(s_ops.absolute != NULL, true);
+    if (blocked != NULL) {
+        emit_refusal(reply, name, blocked);
+        return;
+    }
+    const uint8_t previous_mask = s_abs_mask;
+    int16_t previous_values[KMCMD_PAD_CHANNELS];
+    memcpy(previous_values, s_abs_values, sizeof(previous_values));
+    s_abs_mask = 0u;
+    (void)send_absolute(reply, name, args, count, previous_mask, previous_values);
+}
+
+// pad.hold(ms): the sink releases every held channel after `ms`. Our mirror is
+// cleared now, as a click with an explicit hold clears s_buttons: the release
+// will happen without a command from us, and a mirror that still said "held"
+// would ack the next identical setter without a frame.
+static void handle_pad_hold(reply_t *reply, const char *name, const int32_t *args, uint32_t count)
+{
+    if (count < 1u || args[0] < 1) {
+        emit_refusal(reply, name, "badargs");
+        return;
+    }
+    const char *blocked = sink_blocked(s_ops.absolute_hold != NULL, true);
+    if (blocked != NULL) {
+        emit_refusal(reply, name, blocked);
+        return;
+    }
+    if (!s_ops.absolute_hold(s_ops.ctx, (uint32_t)args[0])) {
+        s_dropped++;
+        emit_refusal(reply, name, "busy");
+        return;
+    }
+    s_abs_mask = 0u;
+    s_abs_hold_pending = true;
     note_accepted();
     emit_ack(reply, name, args, count);
 }
@@ -709,15 +991,16 @@ kmcmd_verdict_t kmcmd_line(const char *line, char *reply, uint32_t reply_size)
     }
 
     char name[NAME_MAX];
-    bool had_prefix = false;
+    namespace_t ns = NS_NONE;
     uint32_t args_at = 0u;
-    if (!split_call(line, name, &had_prefix, &args_at)) {
+    if (!split_call(line, name, &ns, &args_at)) {
         return KMCMD_NOT_MINE;
     }
+    s_prefix = (ns == NS_PAD) ? "pad." : "km.";
 
-    const classified_t command = classify(name);
+    const classified_t command = (ns == NS_PAD) ? classify_pad(name) : classify(name);
     if (command.kind == CMD_UNKNOWN) {
-        if (!had_prefix) {
+        if (ns == NS_NONE) {
             // Shaped like a call but not a name we know and not addressed to
             // us. The console's own dispatch gets it, so a future command
             // there is not shadowed by this parser.
@@ -756,6 +1039,21 @@ kmcmd_verdict_t kmcmd_line(const char *line, char *reply, uint32_t reply_size)
             break;
         case CMD_LOCK_BUTTON:
             handle_lock_button(&out, name, command.button, args, count);
+            break;
+        case CMD_PAD_AXIS:
+            handle_pad_axis(&out, name, command.button, args, count);
+            break;
+        case CMD_PAD_HAT:
+            handle_pad_hat(&out, name, args, count);
+            break;
+        case CMD_PAD_BTN:
+            handle_pad_btn(&out, name, args, count);
+            break;
+        case CMD_PAD_RELEASE:
+            handle_pad_release(&out, name, args, count);
+            break;
+        case CMD_PAD_HOLD:
+            handle_pad_hold(&out, name, args, count);
             break;
         case CMD_VERSION:
             note_accepted();
@@ -801,6 +1099,7 @@ bool kmcmd_step(void)
                 return false;
             }
             s_buttons = mask;
+            s_buttons_sent = mask;
             s_click_release_pending = false;
             return true;
         }
@@ -810,13 +1109,17 @@ bool kmcmd_step(void)
             return false;
         }
         s_buttons = mask;
+        s_buttons_sent = mask;
         s_click_remaining--;
         // With an explicit hold the engine's hold_reports drives the release
         // (injection.py arms a click-release target from it), so queueing one
         // here would cut the press short. Without one we owe the release.
         s_click_release_pending = (s_click_hold == 0u);
         if (s_click_hold != 0u) {
+            // The engine restores the pre-click mask when the hold expires, so
+            // that is what the sink will be holding.
             s_buttons &= ~s_click_mask;
+            s_buttons_sent = s_buttons;
         }
         return true;
     }
@@ -896,7 +1199,11 @@ void kmcmd_set_link(bool up)
     s_click_hold = 0u;
     s_click_release_pending = false;
     s_buttons = 0u;
+    s_buttons_sent = 0u;
     s_physical = 0u;
+    s_abs_mask = 0u;
+    s_abs_hold_pending = false;
+    memset(s_abs_values, 0, sizeof(s_abs_values));
 }
 
 void kmcmd_set_mode(kmcmd_mode_t mode)
@@ -923,7 +1230,11 @@ void kmcmd_init(const kmcmd_ops_t *ops)
     // integrator on a Full Speed link should set 1.
     s_reports_per_ms = 8u;
     s_buttons = 0u;
+    s_buttons_sent = 0u;
     s_physical = 0u;
+    s_abs_mask = 0u;
+    s_abs_hold_pending = false;
+    memset(s_abs_values, 0, sizeof(s_abs_values));
     s_pend_x = 0;
     s_pend_y = 0;
     s_pend_wheel = 0;

@@ -31,6 +31,7 @@ INJ_TYPE_BUTTON_STATE = 0x85
 INJ_TYPE_PHYSICAL_MASK = 0x86
 INJ_TYPE_CLEAR = 0x87
 INJ_TYPE_TELEMETRY_CONFIG = 0x88
+INJ_TYPE_ABSOLUTE = 0x89
 
 MESSAGE_TYPES = {
     "IDLE": INJ_TYPE_IDLE,
@@ -48,6 +49,7 @@ MESSAGE_TYPES = {
     "PHYSICAL_MASK": INJ_TYPE_PHYSICAL_MASK,
     "CLEAR": INJ_TYPE_CLEAR,
     "TELEMETRY_CONFIG": INJ_TYPE_TELEMETRY_CONFIG,
+    "ABSOLUTE": INJ_TYPE_ABSOLUTE,
 }
 MESSAGE_NAMES = {value: name for name, value in MESSAGE_TYPES.items()}
 
@@ -85,11 +87,14 @@ COUNTER_POSITIONS = {
     },
 }
 FIELD_ALLOWED_MASKS = {
+    "ABSOLUTE": {
+        "flags": (11, 1, 127),
+    },
     "BUTTON_STATE": {
         "flags": (11, 1, 0),
     },
     "CLEAR": {
-        "clear_flags": (8, 2, 15),
+        "clear_flags": (8, 2, 31),
     },
     "COMMAND_ACK": {
         "flags": (15, 1, 3),
@@ -101,10 +106,10 @@ FIELD_ALLOWED_MASKS = {
         "link_flags": (3, 1, 15),
     },
     "MAP_BEGIN": {
-        "flags": (6, 2, 0),
+        "flags": (6, 2, 1),
     },
     "MAP_COMMIT": {
-        "flags": (6, 2, 0),
+        "flags": (6, 2, 1),
     },
     "MAP_ENTRY": {
         "flags": (15, 1, 127),
@@ -130,12 +135,22 @@ RECEIVE_REJECT_MASKS = {
 }
 
 ENUMERATIONS = {
+    "ABSOLUTE_FLAG": {
+        "LX": 1,
+        "LY": 2,
+        "RX": 4,
+        "RY": 8,
+        "LT": 16,
+        "RT": 32,
+        "HAT": 64,
+    },
     "CLEAR_FLAG": {
         "MOTION": 1,
         "BUTTONS": 2,
         "PHYSICAL_MASKS": 4,
         "QUEUED_TIMED": 8,
-        "ALL": 15,
+        "ABSOLUTE": 16,
+        "ALL": 31,
     },
     "COMMAND_ACK_FLAG": {
         "LATE": 1,
@@ -166,6 +181,15 @@ ENUMERATIONS = {
         "INJECTION_ENABLED": 4,
         "RELAY_READY": 8,
     },
+    "MAP_ENTRY_CHANNEL": {
+        "LX": 0,
+        "LY": 1,
+        "RX": 2,
+        "RY": 3,
+        "LT": 4,
+        "RT": 5,
+        "HAT": 6,
+    },
     "MAP_ENTRY_FLAG": {
         "SIGNED": 1,
         "RELATIVE": 2,
@@ -174,6 +198,9 @@ ENUMERATIONS = {
         "Y": 16,
         "WHEEL": 32,
         "PAN": 64,
+    },
+    "MAP_FLAG": {
+        "NATIVE_ONLY": 1,
     },
     "MAP_STATUS_ERROR": {
         "NONE": 0,
@@ -207,11 +234,19 @@ ENUMERATIONS = {
     },
 }
 
+INJ_ABSOLUTE_FLAG_LX = 1
+INJ_ABSOLUTE_FLAG_LY = 2
+INJ_ABSOLUTE_FLAG_RX = 4
+INJ_ABSOLUTE_FLAG_RY = 8
+INJ_ABSOLUTE_FLAG_LT = 16
+INJ_ABSOLUTE_FLAG_RT = 32
+INJ_ABSOLUTE_FLAG_HAT = 64
 INJ_CLEAR_FLAG_MOTION = 1
 INJ_CLEAR_FLAG_BUTTONS = 2
 INJ_CLEAR_FLAG_PHYSICAL_MASKS = 4
 INJ_CLEAR_FLAG_QUEUED_TIMED = 8
-INJ_CLEAR_FLAG_ALL = 15
+INJ_CLEAR_FLAG_ABSOLUTE = 16
+INJ_CLEAR_FLAG_ALL = 31
 INJ_COMMAND_ACK_FLAG_LATE = 1
 INJ_COMMAND_ACK_FLAG_SYNTHESIZED = 2
 INJ_COMMAND_ACK_RESULT_SUCCESS = 0
@@ -231,6 +266,13 @@ INJ_LINK_STATUS_FLAG_ENUMERATED = 1
 INJ_LINK_STATUS_FLAG_MAP_ACTIVE = 2
 INJ_LINK_STATUS_FLAG_INJECTION_ENABLED = 4
 INJ_LINK_STATUS_FLAG_RELAY_READY = 8
+INJ_MAP_ENTRY_CHANNEL_LX = 0
+INJ_MAP_ENTRY_CHANNEL_LY = 1
+INJ_MAP_ENTRY_CHANNEL_RX = 2
+INJ_MAP_ENTRY_CHANNEL_RY = 3
+INJ_MAP_ENTRY_CHANNEL_LT = 4
+INJ_MAP_ENTRY_CHANNEL_RT = 5
+INJ_MAP_ENTRY_CHANNEL_HAT = 6
 INJ_MAP_ENTRY_FLAG_SIGNED = 1
 INJ_MAP_ENTRY_FLAG_RELATIVE = 2
 INJ_MAP_ENTRY_FLAG_BUTTON = 4
@@ -238,6 +280,7 @@ INJ_MAP_ENTRY_FLAG_X = 8
 INJ_MAP_ENTRY_FLAG_Y = 16
 INJ_MAP_ENTRY_FLAG_WHEEL = 32
 INJ_MAP_ENTRY_FLAG_PAN = 64
+INJ_MAP_FLAG_NATIVE_ONLY = 1
 INJ_MAP_STATUS_ERROR_NONE = 0
 INJ_MAP_STATUS_ERROR_DESCRIPTOR_GENERATION = 1
 INJ_MAP_STATUS_ERROR_MAP_GENERATION = 2
@@ -263,6 +306,21 @@ INJ_RELATIVE_FLAG_Y = 2
 INJ_RELATIVE_FLAG_WHEEL = 4
 INJ_RELATIVE_FLAG_PAN = 8
 
+INJ_ABSOLUTE_LEASE_GENERATION_OFFSET = 0
+INJ_ABSOLUTE_MAP_GENERATION_OFFSET = 2
+INJ_ABSOLUTE_COMMAND_SEQUENCE_OFFSET = 4
+INJ_ABSOLUTE_HOLD_REPORTS_OFFSET = 6
+INJ_ABSOLUTE_INTERFACE_NUMBER_OFFSET = 8
+INJ_ABSOLUTE_ENDPOINT_NUMBER_OFFSET = 9
+INJ_ABSOLUTE_REPORT_ID_OFFSET = 10
+INJ_ABSOLUTE_FLAGS_OFFSET = 11
+INJ_ABSOLUTE_LX_OFFSET = 12
+INJ_ABSOLUTE_LY_OFFSET = 14
+INJ_ABSOLUTE_RX_OFFSET = 16
+INJ_ABSOLUTE_RY_OFFSET = 18
+INJ_ABSOLUTE_LT_OFFSET = 20
+INJ_ABSOLUTE_RT_OFFSET = 22
+INJ_ABSOLUTE_HAT_OFFSET = 24
 INJ_BUTTON_STATE_LEASE_GENERATION_OFFSET = 0
 INJ_BUTTON_STATE_MAP_GENERATION_OFFSET = 2
 INJ_BUTTON_STATE_COMMAND_SEQUENCE_OFFSET = 4
@@ -340,6 +398,7 @@ INJ_MAP_ENTRY_FLAGS_OFFSET = 15
 INJ_MAP_ENTRY_LOGICAL_MINIMUM_OFFSET = 16
 INJ_MAP_ENTRY_LOGICAL_MAXIMUM_OFFSET = 20
 INJ_MAP_ENTRY_REPORT_LENGTH_OFFSET = 24
+INJ_MAP_ENTRY_CHANNEL_OFFSET = 25
 INJ_MAP_STATUS_DESCRIPTOR_GENERATION_OFFSET = 0
 INJ_MAP_STATUS_MAP_GENERATION_OFFSET = 2
 INJ_MAP_STATUS_ACTIVE_MAP_GENERATION_OFFSET = 4
@@ -386,6 +445,23 @@ INJ_TELEMETRY_CONFIG_COUNTER_PAGE_OFFSET = 12
 INJ_TELEMETRY_CONFIG_FLAGS_OFFSET = 13
 
 PAYLOAD_LAYOUTS = {
+    "ABSOLUTE": (
+        ("lease_generation", 0, 2),
+        ("map_generation", 2, 2),
+        ("command_sequence", 4, 2),
+        ("hold_reports", 6, 2),
+        ("interface_number", 8, 1),
+        ("endpoint_number", 9, 1),
+        ("report_id", 10, 1),
+        ("flags", 11, 1),
+        ("lx", 12, 2),
+        ("ly", 14, 2),
+        ("rx", 16, 2),
+        ("ry", 18, 2),
+        ("lt", 20, 2),
+        ("rt", 22, 2),
+        ("hat", 24, 2),
+    ),
     "BUTTON_STATE": (
         ("lease_generation", 0, 2),
         ("map_generation", 2, 2),
@@ -488,7 +564,7 @@ PAYLOAD_LAYOUTS = {
         ("logical_minimum", 16, 4),
         ("logical_maximum", 20, 4),
         ("report_length", 24, 1),
-        ("reserved", 25, 1),
+        ("channel", 25, 1),
     ),
     "MAP_STATUS": (
         ("descriptor_generation", 0, 2),
@@ -550,6 +626,23 @@ PAYLOAD_LAYOUTS = {
     ),
 }
 _PAYLOAD_FIELDS = {
+    "ABSOLUTE": (
+        ("lease_generation", 0, "u16", 2, False),
+        ("map_generation", 2, "u16", 2, False),
+        ("command_sequence", 4, "u16", 2, False),
+        ("hold_reports", 6, "u16", 2, False),
+        ("interface_number", 8, "u8", 1, False),
+        ("endpoint_number", 9, "u8", 1, False),
+        ("report_id", 10, "u8", 1, False),
+        ("flags", 11, "u8", 1, False),
+        ("lx", 12, "i16", 2, False),
+        ("ly", 14, "i16", 2, False),
+        ("rx", 16, "i16", 2, False),
+        ("ry", 18, "i16", 2, False),
+        ("lt", 20, "i16", 2, False),
+        ("rt", 22, "i16", 2, False),
+        ("hat", 24, "i16", 2, False),
+    ),
     "BUTTON_STATE": (
         ("lease_generation", 0, "u16", 2, False),
         ("map_generation", 2, "u16", 2, False),
@@ -652,7 +745,7 @@ _PAYLOAD_FIELDS = {
         ("logical_minimum", 16, "i32", 4, False),
         ("logical_maximum", 20, "i32", 4, False),
         ("report_length", 24, "u8", 1, False),
-        ("reserved", 25, "u8", 1, True),
+        ("channel", 25, "u8", 1, False),
     ),
     "MAP_STATUS": (
         ("descriptor_generation", 0, "u16", 2, False),
@@ -713,6 +806,32 @@ _PAYLOAD_FIELDS = {
         ("reserved", 14, "bytes", 12, True),
     ),
 }
+
+
+@dataclass(frozen=True)
+class AbsolutePayload:
+    lease_generation: int
+    map_generation: int
+    command_sequence: int
+    hold_reports: int
+    interface_number: int
+    endpoint_number: int
+    report_id: int
+    flags: int
+    lx: int
+    ly: int
+    rx: int
+    ry: int
+    lt: int
+    rt: int
+    hat: int
+
+    def to_bytes(self) -> bytes:
+        return _pack_payload("ABSOLUTE", self.__dict__)
+
+    @classmethod
+    def from_bytes(cls, payload: bytes) -> AbsolutePayload:
+        return cls(**_unpack_payload("ABSOLUTE", payload))
 
 
 @dataclass(frozen=True)
@@ -894,6 +1013,7 @@ class MapEntryPayload:
     logical_minimum: int
     logical_maximum: int
     report_length: int
+    channel: int
 
     def to_bytes(self) -> bytes:
         return _pack_payload("MAP_ENTRY", self.__dict__)
@@ -1004,6 +1124,7 @@ class TelemetryConfigPayload:
 
 RELATIVE_GOLDEN_PAYLOAD = bytes.fromhex("2211443366558877090a0b0ffeff3412ccedff7fbc9a00000000")
 MAP_ENTRY_GOLDEN_PAYLOAD = bytes.fromhex("341278569a0203010100300008000c1b00f8ffffff0700000400")
+ABSOLUTE_GOLDEN_PAYLOAD = bytes.fromhex("2211443366558877090a0b7ffeff3412ccedff7f008001000800")
 
 
 class FrameError(ValueError):

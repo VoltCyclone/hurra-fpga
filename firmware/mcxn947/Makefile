@@ -35,6 +35,13 @@ OBJCOPY := $(CROSS_COMPILE)objcopy
 SIZE    := $(CROSS_COMPILE)size
 HOST_CC ?= cc
 
+DEMO ?= 0
+ifeq ($(filter 0 1,$(DEMO)),)
+$(error DEMO must be 0 or 1, got '$(DEMO)')
+endif
+DEMO_CFLAGS := $(if $(filter 1,$(DEMO)),-DHURRA_DEMO=1)
+DEMO_CONFIG_STAMP := build/.demo-config
+
 # Cortex-M33 with the single-precision FPU and DSP extension the part
 # implements (__FPU_PRESENT / __DSP_PRESENT in
 # vendor/mcux-sdk/devices/MCXN947/MCXN947_cm33_core0_COMMON.h).
@@ -83,7 +90,8 @@ INCLUDES := -Isrc -isystem include \
 	-isystem $(VENDOR_SDK)/components/display/st7796s \
 	-isystem $(VENDOR_TUSB)/src
 
-COMMON_CFLAGS := $(CORE0_ARCH) $(CORE0_DEFINES) $(INCLUDES) $(EXTRA_CFLAGS) -Os \
+COMMON_CFLAGS := $(CORE0_ARCH) $(CORE0_DEFINES) $(INCLUDES) $(DEMO_CFLAGS) \
+	$(EXTRA_CFLAGS) -Os \
 	-ffunction-sections -fdata-sections -fno-common
 # MCUX_DBI_LEGACY stays at its default of 1, and that is load-bearing.
 #
@@ -99,7 +107,7 @@ COMMON_CFLAGS := $(CORE0_ARCH) $(CORE0_DEFINES) $(INCLUDES) $(EXTRA_CFLAGS) -Os 
 # (fsl_st7796s.c: `uint16_t param_data = params[i]`), which is correct, and is
 # the path NXP's own working frdmmcxn947 display examples use.
 CORE1_CFLAGS := $(CORE1_ARCH) $(CORE1_DEFINES) \
-	$(INCLUDES) $(EXTRA_CFLAGS) -Os \
+	$(INCLUDES) $(DEMO_CFLAGS) $(EXTRA_CFLAGS) -Os \
 	-ffunction-sections -fdata-sections -fno-common
 APP_WARNINGS      := -std=c11 -Wall -Wextra -Werror -Wconversion -Wshadow
 # Vendor sources are byte-exact imports and are not held to the app's warning
@@ -318,6 +326,7 @@ CORE0_OBJECTS := \
 	build/core0/hid_item.o \
 	build/core0/hid_fields.o \
 	build/core0/hid_mouse_layout.o \
+	build/core0/hid_pad_layout.o \
 	build/core0/inj_map_build.o \
 	build/core0/usb_descriptors.o \
 	build/core0/usb_console.o \
@@ -356,6 +365,13 @@ CORE1_OBJECTS := \
 	build/core1/display.o \
 	build/core1/main_core1.o
 
+# Make does not otherwise know that a command-line flag changed. Keep the
+# effective target-only demo flags in one stamp and make every target object
+# depend on it, so changing DEMO rebuilds both cores instead of silently
+# reusing objects from the other configuration. Host tests intentionally do
+# not depend on this stamp and continue to compile production behavior.
+$(CORE0_OBJECTS) $(CORE1_OBJECTS): $(DEMO_CONFIG_STAMP)
+
 .PHONY: all check check-copies clean flash flash-core0-only flash-merged \
 	verify-core1-blank probes test test-platform \
 	test-heartbeat test-link test-link-retire test-link-recovery test-spi-frame \
@@ -363,9 +379,9 @@ CORE1_OBJECTS := \
 	test-console test-kmcmd test-core1-release test-shared-window test-link-snapshot test-status-led \
 	test-text-grid test-glyphs test-display-panel test-display \
 	test-hid-descriptor-reassembly test-hid-report-decoder \
-	test-hid-item test-hid-fields test-hid-mouse-layout test-inj-map-build \
+	test-hid-item test-hid-fields test-hid-mouse-layout test-hid-pad-layout test-inj-map-build \
 	test-hid-descriptor-set test-inj-command test-inj-session test-link-fault-classify \
-	test-merge-images
+	test-merge-images FORCE
 
 all: build/hurra-mcxn947.bin
 
@@ -423,6 +439,7 @@ build/core0/link.o: src/link.c src/link.h src/link_retire.h src/link_recovery.h 
 		src/spi_frame.h src/platform.h src/dbg_uart.h src/shared_window.h \
 		src/link_snapshot.h src/inj_command.h src/inj_session.h src/reset_cause.h \
 		src/hid_descriptor_set.h src/hid_descriptor_reassembly.h src/hid_mouse_layout.h \
+		src/hid_pad_layout.h src/hid_layout.h \
 		include/injection_wire.h | build/core0
 	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
@@ -434,7 +451,7 @@ build/core0/inj_command.o: src/inj_command.c src/inj_command.h src/spi_frame.h \
 	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
 build/core0/inj_session.o: src/inj_session.c src/inj_session.h src/inj_command.h \
-		src/spi_frame.h src/inj_map_build.h src/hid_mouse_layout.h \
+		src/spi_frame.h src/inj_map_build.h src/hid_mouse_layout.h src/hid_layout.h \
 		include/injection_wire.h | build/core0
 	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
@@ -448,11 +465,15 @@ build/core0/hid_fields.o: src/hid_fields.c src/hid_fields.h src/hid_item.h | bui
 	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
 build/core0/hid_mouse_layout.o: src/hid_mouse_layout.c src/hid_mouse_layout.h \
+		src/hid_layout.h src/hid_fields.h include/injection_wire.h | build/core0
+	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
+
+build/core0/hid_pad_layout.o: src/hid_pad_layout.c src/hid_pad_layout.h src/hid_layout.h \
 		src/hid_fields.h include/injection_wire.h | build/core0
 	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
 build/core0/inj_map_build.o: src/inj_map_build.c src/inj_map_build.h src/hid_mouse_layout.h \
-		src/inj_command.h include/injection_wire.h | build/core0
+		src/hid_layout.h src/inj_command.h include/injection_wire.h | build/core0
 	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
 # The portable transport half of step 3. Neither of these compiles a single
@@ -511,10 +532,10 @@ build/core0/usb_descriptors.o: src/usb_descriptors.c src/tusb_config.h | build/c
 	$(CC) $(COMMON_CFLAGS) $(GLUE_WARNINGS) -c $< -o $@
 
 build/core0/usb_console.o: src/usb_console.c src/usb_console.h src/console.h \
-		src/fault.h src/kmcmd.h src/core1_release.h \
+		src/fault.h src/kmcmd.h src/core1_release.h src/inj_session.h src/hid_layout.h \
 		src/dbg_uart.h src/link.h src/link_retire.h src/platform.h \
 		src/reset_cause.h src/shared_window.h src/link_snapshot.h \
-		src/tusb_config.h | build/core0
+		src/tusb_config.h include/injection_wire.h | build/core0
 	$(CC) $(COMMON_CFLAGS) $(GLUE_WARNINGS) -c $< -o $@
 
 # --- vendored TinyUSB ------------------------------------------------------
@@ -674,6 +695,14 @@ build/core1/main_core1.o: src/main_core1.c src/fault.h src/shared_window.h \
 build/core0 build/core1 build/host:
 	mkdir -p $@
 
+$(DEMO_CONFIG_STAMP): FORCE
+	@mkdir -p $(dir $@)
+	@if [ ! -f $@ ] || ! grep -Fqx -- '$(DEMO_CFLAGS)' $@; then \
+		printf '%s\n' '$(DEMO_CFLAGS)' > $@; \
+	fi
+
+FORCE:
+
 # --- the gate ---------------------------------------------------------------
 
 CHECK_OBJECT_ARGS := \
@@ -747,7 +776,7 @@ test: test-platform test-heartbeat test-spi-frame test-link test-link-retire \
 	test-link-snapshot test-status-led test-text-grid test-glyphs \
 	test-display-panel test-display test-inj-command test-inj-session \
 	test-hid-descriptor-reassembly test-hid-report-decoder \
-	test-hid-item test-hid-fields test-hid-mouse-layout test-inj-map-build \
+	test-hid-item test-hid-fields test-hid-mouse-layout test-hid-pad-layout test-inj-map-build \
 	test-hid-descriptor-set \
 	test-merge-images
 
@@ -787,11 +816,12 @@ test-inj-session: build/host/inj_session_test
 build/host/inj_session_test: test/inj_session_test.c test/hid_fixtures.h src/inj_session.c \
 		src/inj_command.c src/spi_frame.c src/inj_session.h src/inj_command.h src/spi_frame.h \
 		src/inj_map_build.c src/inj_map_build.h src/hid_mouse_layout.c src/hid_mouse_layout.h \
+		src/hid_pad_layout.c src/hid_pad_layout.h src/hid_layout.h \
 		src/hid_fields.c src/hid_fields.h src/hid_item.c src/hid_item.h \
 		include/injection_wire.h | build/host
 	$(HOST_CC) $(APP_WARNINGS) -Isrc -Itest -isystem include test/inj_session_test.c \
 		src/inj_session.c src/inj_command.c src/spi_frame.c src/inj_map_build.c \
-		src/hid_mouse_layout.c src/hid_fields.c src/hid_item.c -o $@
+		src/hid_mouse_layout.c src/hid_pad_layout.c src/hid_fields.c src/hid_item.c -o $@
 
 test-link: build/host/link_test
 	./build/host/link_test
@@ -980,10 +1010,21 @@ test-hid-mouse-layout: build/host/hid_mouse_layout_test
 	./build/host/hid_mouse_layout_test
 
 build/host/hid_mouse_layout_test: test/hid_mouse_layout_test.c test/hid_fixtures.h \
-		src/hid_mouse_layout.c src/hid_mouse_layout.h src/hid_fields.c src/hid_fields.h \
+		src/hid_mouse_layout.c src/hid_mouse_layout.h src/hid_layout.h \
+		src/hid_fields.c src/hid_fields.h \
 		src/hid_item.c src/hid_item.h src/kmcmd.h include/injection_wire.h | build/host
 	$(HOST_CC) $(APP_WARNINGS) -Isrc -Itest -isystem include test/hid_mouse_layout_test.c \
 		src/hid_mouse_layout.c src/hid_fields.c src/hid_item.c -o $@
+
+test-hid-pad-layout: build/host/hid_pad_layout_test
+	./build/host/hid_pad_layout_test
+
+build/host/hid_pad_layout_test: test/hid_pad_layout_test.c test/hid_fixtures.h \
+		src/hid_pad_layout.c src/hid_pad_layout.h src/hid_layout.h src/hid_mouse_layout.h \
+		src/hid_fields.c src/hid_fields.h src/hid_item.c src/hid_item.h \
+		include/injection_wire.h | build/host
+	$(HOST_CC) $(APP_WARNINGS) -Isrc -Itest -isystem include test/hid_pad_layout_test.c \
+		src/hid_pad_layout.c src/hid_fields.c src/hid_item.c -o $@
 
 test-inj-map-build: build/host/inj_map_build_test
 	./build/host/inj_map_build_test
@@ -991,10 +1032,12 @@ test-inj-map-build: build/host/inj_map_build_test
 build/host/inj_map_build_test: test/inj_map_build_test.c test/hid_fixtures.h \
 		src/inj_map_build.c src/inj_map_build.h src/inj_command.c src/inj_command.h \
 		src/spi_frame.c src/spi_frame.h src/hid_mouse_layout.c src/hid_mouse_layout.h \
+		src/hid_layout.h src/hid_pad_layout.c src/hid_pad_layout.h \
 		src/hid_fields.c src/hid_fields.h src/hid_item.c src/hid_item.h \
 		include/injection_wire.h | build/host
 	$(HOST_CC) $(APP_WARNINGS) -Isrc -Itest -isystem include test/inj_map_build_test.c \
 		src/inj_map_build.c src/inj_command.c src/spi_frame.c src/hid_mouse_layout.c \
+		src/hid_pad_layout.c \
 		src/hid_fields.c src/hid_item.c -o $@
 
 # Note what is NOT on this recipe: -isystem include. The decoder speaks raw HID

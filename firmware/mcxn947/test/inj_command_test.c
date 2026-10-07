@@ -179,12 +179,56 @@ static void test_button_and_mask_frames_round_trip(void)
     assert(payload[INJ_PHYSICAL_MASK_BUTTON_MASK_OFFSET] == 0x01u);
 }
 
+// ABSOLUTE (0x89) is adjacent to TELEMETRY_CONFIG (0x88) and opens with the
+// same 12-byte header as RELATIVE (0x84). A builder pointed at either
+// neighbour would still pack, CRC and round-trip; what tells them apart on the
+// wire is the type byte and where the seven i16 values land.
+static void test_absolute_round_trips_with_fields_at_offsets(void)
+{
+    inj_absolute_payload_t abs;
+    memset(&abs, 0, sizeof(abs));
+    abs.lease_generation = 1u;
+    abs.map_generation = 1u;
+    abs.command_sequence = 0x2211u;
+    abs.hold_reports = 0u;
+    abs.interface_number = 3u;
+    abs.endpoint_number = 4u;
+    abs.report_id = 1u;
+    abs.flags = INJ_ABSOLUTE_FLAG_LX | INJ_ABSOLUTE_FLAG_HAT;
+    abs.lx = (int16_t)-2;  // 0xFFFE
+    abs.hat = 8;
+
+    uint8_t slot[INJ_FRAME_SIZE];
+    assert(inj_build_absolute(slot, 9u, &abs) == SPI_FRAME_OK);
+    assert(slot[SPI_FRAME_OFF_TYPE] == INJ_TYPE_ABSOLUTE);
+    assert(slot[SPI_FRAME_OFF_TYPE] == 0x89u);
+    assert(slot[SPI_FRAME_OFF_TYPE] != INJ_TYPE_TELEMETRY_CONFIG);
+    assert(slot[SPI_FRAME_OFF_TYPE] != INJ_TYPE_RELATIVE);
+    assert(slot[SPI_FRAME_OFF_SEQUENCE] == 9u);
+    assert(slot[SPI_FRAME_OFF_LENGTH] == INJ_FRAME_PAYLOAD_SIZE);
+
+    const uint8_t *p = &slot[SPI_FRAME_OFF_PAYLOAD];
+    assert(p[INJ_ABSOLUTE_FLAGS_OFFSET] == (INJ_ABSOLUTE_FLAG_LX | INJ_ABSOLUTE_FLAG_HAT));
+    assert(p[INJ_ABSOLUTE_LX_OFFSET] == 0xFEu && p[INJ_ABSOLUTE_LX_OFFSET + 1u] == 0xFFu);
+    assert(p[INJ_ABSOLUTE_HAT_OFFSET] == 8u && p[INJ_ABSOLUTE_HAT_OFFSET + 1u] == 0u);
+    assert(INJ_ABSOLUTE_HAT_OFFSET + 2u == INJ_FRAME_PAYLOAD_SIZE);  // no reserved tail
+
+    uint8_t type = 0u;
+    uint8_t sequence = 0u;
+    const uint8_t *payload = NULL;
+    uint8_t length = 0u;
+    assert(spi_frame_unpack(slot, &type, &sequence, &payload, &length) == SPI_FRAME_OK);
+    assert(type == INJ_TYPE_ABSOLUTE && sequence == 9u && length == INJ_FRAME_PAYLOAD_SIZE);
+    assert(memcmp(payload, &abs, sizeof(abs)) == 0);
+}
+
 int main(void)
 {
     test_crc32_matches_zlib();
     test_relative_round_trips_with_fields_at_offsets();
     test_map_frames_round_trip();
     test_button_and_mask_frames_round_trip();
+    test_absolute_round_trips_with_fields_at_offsets();
 
     printf("inj_command_test: ok\n");
     return 0;

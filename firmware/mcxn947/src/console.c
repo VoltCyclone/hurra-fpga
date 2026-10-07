@@ -130,14 +130,14 @@ static const char *console_argument(const char *line, const char *name)
 static void cmd_help(void)
 {
     console_put("commands:\r\n"
-                "  help     this list\r\n"
-                "  stats    link counters, to be compared against the FPGA's\r\n"
-                "  version  firmware identity\r\n"
-                "  flood    saturate this pipe until a key is pressed\r\n"
-                "  cpu1halt hold CPU1 in reset (the link must not notice)\r\n"
-                "  cpu1start release CPU1 again\r\n"
-                "  kmmode   KMBox/MAKCU command input: off|makcu|kmbox\r\n"
-                "  fault    DANGER: HALTS MCU; usage|bus|hard|stack|fp\r\n");
+                "  help       list these commands\r\n"
+                "  stats      print link counters to compare with the FPGA's registers\r\n"
+                "  version    print the firmware identity\r\n"
+                "  flood      fill this console with output until any key is pressed\r\n"
+                "  cpu1halt   hold CPU1 in reset; the link keeps running\r\n"
+                "  cpu1start  release CPU1 again\r\n"
+                "  kmmode     show or set km.* and pad.* input: off|makcu|kmbox\r\n"
+                "  fault      trigger a CPU fault, usage|bus|hard|stack|fp (HALTS MCU)\r\n");
 }
 
 static const char *km_mode_name(kmcmd_mode_t mode)
@@ -325,7 +325,7 @@ static void cmd_cpu1(bool start)
 
 static void fault_usage(void)
 {
-    console_put("usage: fault usage|bus|hard|stack|fp (DANGER: HALTS MCU)\r\n");
+    console_put("usage: fault usage|bus|hard|stack|fp (HALTS MCU)\r\n");
 }
 
 static void cmd_fault(const char *argument)

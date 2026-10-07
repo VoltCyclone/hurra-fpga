@@ -10,6 +10,7 @@
 
 #include "hid_fixtures.h"
 #include "hid_mouse_layout.h"
+#include "hid_pad_layout.h"
 #include "inj_map_build.h"
 
 static void assert_entry(const inj_map_entry_payload_t *e, uint8_t index, uint16_t page,
@@ -21,7 +22,7 @@ static void assert_entry(const inj_map_entry_payload_t *e, uint8_t index, uint16
     assert(e->bit_offset == offset && e->bit_width == width);
     assert(e->flags == flags);
     assert(e->logical_minimum == minimum && e->logical_maximum == maximum);
-    assert(e->reserved == 0u);
+    assert(e->channel == 0u);  // a mouse entry never names a channel
 }
 
 static void test_boot_mouse_entries(void)
@@ -113,12 +114,73 @@ static void test_target_report_length_is_stamped(void)
     }
 }
 
+// A pad layout's axes are ABSOLUTE entries: neither RELATIVE nor BUTTON, no
+// X/Y/WHEEL/PAN bit, SIGNED only below zero, and byte 25 names the channel.
+// The button run is a BUTTON entry with channel 0, exactly as a mouse's.
+static void test_pad_entries_are_absolute_with_channels(void)
+{
+    hid_layout_t layout;
+    assert(hid_pad_compile(HID_FIXTURE_GAMEPAD_DS4_SHAPED, sizeof(HID_FIXTURE_GAMEPAD_DS4_SHAPED),
+                           &layout) == HID_PAD_OK);
+    const inj_map_target_t target = {
+        .descriptor_generation = 3u,
+        .map_generation = 1u,
+        .interface_number = 3u,
+        .endpoint_number = 4u,
+        .report_length = 64u,
+    };
+    inj_map_entry_payload_t entries[HID_LAYOUT_MAX_FIELDS];
+    const uint8_t count = inj_map_build_entries(&layout, &target, entries);
+    assert(count == 8u);
+    static const uint8_t channels[7] = {
+        INJ_MAP_ENTRY_CHANNEL_LX, INJ_MAP_ENTRY_CHANNEL_LY, INJ_MAP_ENTRY_CHANNEL_RX,
+        INJ_MAP_ENTRY_CHANNEL_RY, INJ_MAP_ENTRY_CHANNEL_LT, INJ_MAP_ENTRY_CHANNEL_RT,
+        INJ_MAP_ENTRY_CHANNEL_HAT,
+    };
+    for (uint8_t i = 0u; i < 7u; ++i) {
+        assert(entries[i].entry_index == i);
+        assert(entries[i].report_id == 1u && entries[i].report_length == 64u);
+        assert(entries[i].flags == 0u);  // 0..255 and 0..7: unsigned, absolute
+        assert(entries[i].channel == channels[i]);
+    }
+    assert(entries[0].bit_offset == 8u && entries[0].usage == 0x30u);
+    assert(entries[4].bit_offset == 64u && entries[4].usage == 0x33u);  // Rx -> LT
+    assert(entries[6].bit_offset == 40u && entries[6].bit_width == 4u);  // hat
+    assert(entries[6].logical_minimum == 0 && entries[6].logical_maximum == 7);
+    assert(entries[7].flags == INJ_MAP_ENTRY_FLAG_BUTTON);
+    assert(entries[7].channel == 0u);
+    assert(entries[7].usage == 1u && entries[7].bit_offset == 44u && entries[7].bit_width == 14u);
+}
+
+// A signed absolute axis carries SIGNED and nothing else.
+static void test_signed_pad_axis_carries_only_signed(void)
+{
+    hid_layout_t layout;
+    memset(&layout, 0, sizeof(layout));
+    layout.device_class = HID_DEVICE_CLASS_PAD;
+    layout.field_count = 1u;
+    layout.fields[0].kind = HID_PAD_KIND_RY;
+    layout.fields[0].usage_page = 0x01u;
+    layout.fields[0].usage = 0x35u;
+    layout.fields[0].bit_offset = 16u;
+    layout.fields[0].bit_width = 16u;
+    layout.fields[0].logical_minimum = -32768;
+    layout.fields[0].logical_maximum = 32767;
+    const inj_map_target_t target = {.endpoint_number = 1u, .report_length = 8u};
+    inj_map_entry_payload_t entries[HID_LAYOUT_MAX_FIELDS];
+    assert(inj_map_build_entries(&layout, &target, entries) == 1u);
+    assert(entries[0].flags == INJ_MAP_ENTRY_FLAG_SIGNED);
+    assert(entries[0].channel == INJ_MAP_ENTRY_CHANNEL_RY);
+}
+
 int main(void)
 {
     test_boot_mouse_entries();
     test_report_id_mouse_entries();
     test_unsigned_axis_has_no_signed_flag();
     test_target_report_length_is_stamped();
+    test_pad_entries_are_absolute_with_channels();
+    test_signed_pad_axis_carries_only_signed();
     printf("inj_map_build_test: ok\n");
     return 0;
 }

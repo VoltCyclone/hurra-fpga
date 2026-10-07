@@ -117,6 +117,38 @@ int main(void)
     assert(LINK_DMA_MAJOR_ITER == 8u);
     assert(LINK_SPI_FRAMESZ == 255u);
 
+    // Normalized -32768..32767 onto a field's logical range: ends land on the
+    // ends, the centre on the upper middle, rounding is to nearest, and the
+    // result never leaves the range. For an unsigned 16-bit field the value is
+    // returned as the FIELD'S BIT PATTERN (the FPGA writes only bit_width bits).
+    assert(link_scale_absolute(-32768, 0, 255) == 0);
+    assert(link_scale_absolute(32767, 0, 255) == 255);
+    assert(link_scale_absolute(0, 0, 255) == 128);
+    assert(link_scale_absolute(-1, 0, 255) == 127);
+    assert(link_scale_absolute(16384, 0, 255) == 191);  // 191.25 rounds down
+    assert(link_scale_absolute(-16384, 0, 255) == 64);
+    assert(link_scale_absolute(-32768, -32768, 32767) == -32768);  // identity
+    assert(link_scale_absolute(32767, -32768, 32767) == 32767);
+    assert(link_scale_absolute(1234, -32768, 32767) == 1234);
+    assert(link_scale_absolute(-5, -32768, 32767) == -5);
+    assert(link_scale_absolute(32767, 0, 4095) == 4095);
+    assert(link_scale_absolute(-32768, 0, 4095) == 0);
+    assert(link_scale_absolute(0, 0, 4095) == 2048);
+    assert((uint16_t)link_scale_absolute(32767, 0, 65535) == 65535u);
+    assert((uint16_t)link_scale_absolute(0, 0, 65535) == 32768u);
+    assert(link_scale_absolute(-32768, 0, 65535) == 0);
+    assert(link_scale_absolute(-32768, -127, 127) == -127);
+    assert(link_scale_absolute(32767, -127, 127) == 127);
+    assert(link_scale_absolute(0, -127, 127) == 0);
+    assert(link_scale_absolute(100, 5, 5) == 5);  // degenerate range: the minimum
+    int32_t last = -1;
+    for (int32_t n = -32768; n <= 32767; ++n) {
+        const int32_t v = link_scale_absolute((int16_t)n, 0, 255);
+        assert(v >= 0 && v <= 255 && v >= last);  // monotonic, in range
+        last = v;
+    }
+    assert(LINK_PAD_CHANNELS == 7u);
+
     printf("link_test: ok\n");
     return 0;
 }

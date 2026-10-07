@@ -13,6 +13,7 @@ from .injection_wire import (
     CRC32_INIT,
     CRC32_POLY,
     CRC32_XOROUT,
+    INJ_MAP_ENTRY_CHANNEL_HAT,
     INJ_MAP_ENTRY_FLAG_BUTTON,
     INJ_MAP_ENTRY_FLAG_PAN,
     INJ_MAP_ENTRY_FLAG_RELATIVE,
@@ -20,6 +21,7 @@ from .injection_wire import (
     INJ_MAP_ENTRY_FLAG_WHEEL,
     INJ_MAP_ENTRY_FLAG_X,
     INJ_MAP_ENTRY_FLAG_Y,
+    INJ_MAP_FLAG_NATIVE_ONLY,
     INJ_MAP_STATUS_ERROR_BIT_OFFSET,
     INJ_MAP_STATUS_ERROR_CRC,
     INJ_MAP_STATUS_ERROR_DESCRIPTOR_GENERATION,
@@ -151,6 +153,10 @@ class InjectionMapStore(Elaboratable):
         self.candidate_entry_count = Signal(8)
         self.candidate_layout_count = Signal(8)
         self.candidate_entries_crc32 = Signal(32)
+        #: MAP_BEGIN.flags, sampled on the same cycle as ``begin``. Bit 0 is
+        #: MAP_FLAG.NATIVE_ONLY; undefined bits are ignored (the sender's
+        #: transmit mask refuses them). MAP_COMMIT's flags are never read.
+        self.begin_flags = Signal(16)
 
         self.busy = Signal()
         self.commit_ack = Signal()
@@ -163,6 +169,18 @@ class InjectionMapStore(Elaboratable):
         self.active_generation = Signal(16)
         self.active_entry_count = Signal(7)
         self.active_layout_count = Signal(5)
+        #: Pulses on the first cycle ``active_*`` describe a newly committed map.
+        self.activated = Signal()
+        #: The active map was begun with MAP_FLAG.NATIVE_ONLY: the engine commits
+        #: commands to its layouts' records and acks with nothing on the wire. A
+        #: plain register written at ACCEPT, the same edge as the bank flip --
+        #: cheaper than and equivalent to ``Array(bank_flags)[active_bank]``.
+        self.active_native_only = Signal()
+
+        #: The active bank's layout directory entry at ``directory_index``, one
+        #: cycle behind it. The engine walks a new map's layouts through this.
+        self.directory_index = Signal(4)
+        self.directory = Signal(LAYOUT_DIRECTORY_LAYOUT)
 
         self.lookup_index = Signal(range(max_fields))
         self.lookup_valid = Signal()
@@ -224,6 +242,11 @@ class InjectionMapStore(Elaboratable):
         layout_directory_write = layout_directory.write_port(domain="usb")
         runtime_layout_read = layout_directory.read_port(domain="usb")
         candidate_layout_read = layout_directory.read_port(domain="usb")
+        indexed_layout_read = layout_directory.read_port(domain="usb")
+        m.d.comb += [
+            indexed_layout_read.addr.eq(Cat(self.directory_index, self.active_bank)),
+            self.directory.eq(indexed_layout_read.data),
+        ]
         directory_write_enable = Signal()
         directory_write_address = Signal(5)
         directory_write_data = Signal(LAYOUT_DIRECTORY_LAYOUT)
@@ -242,6 +265,7 @@ class InjectionMapStore(Elaboratable):
         latched_entry_count = Signal(8)
         latched_layout_count = Signal(8)
         latched_entries_crc32 = Signal(32)
+        latched_native_only = Signal()
 
         validation_index = Signal(range(self.max_fields))
         crc_byte_index = Signal(range(MAX_PAYLOAD))
@@ -489,11 +513,24 @@ class InjectionMapStore(Elaboratable):
         has_signed = (validation_entry_q.flags & INJ_MAP_ENTRY_FLAG_SIGNED) != 0
         has_relative = (validation_entry_q.flags & INJ_MAP_ENTRY_FLAG_RELATIVE) != 0
         has_button = (validation_entry_q.flags & INJ_MAP_ENTRY_FLAG_BUTTON) != 0
-        supported_button = has_button & ~has_relative & ~has_signed & (axis_flags == 0)
-        supported_axis = has_relative & ~has_button & axis_one_hot
+        # The channel byte names the ABSOLUTE value an absolute entry carries and
+        # is meaningless -- so must be 0 -- on a button or relative one.
+        has_channel = validation_entry_q.channel != 0
+        supported_button = (
+            has_button & ~has_relative & ~has_signed & (axis_flags == 0) & ~has_channel
+        )
+        supported_axis = has_relative & ~has_button & axis_one_hot & ~has_channel
+        # Class 3, absolute: neither BUTTON nor RELATIVE nor an axis flag. SIGNED
+        # may be set and the engine ignores it; a held value is written to the
+        # field masked to bit_width, never clamped, so no range is needed.
+        is_absolute = ~has_button & ~has_relative & (axis_flags == 0)
+        supported_absolute = is_absolute & (validation_entry_q.channel <= INJ_MAP_ENTRY_CHANNEL_HAT)
+        # A 16-bit held value sign-extends through the engine's 32-bit
+        # emitted_field; writing it into a wider unsigned field would corrupt it.
+        absolute_too_wide = is_absolute & (validation_entry_q.bit_width > 16)
         unsupported_field = (
             ((validation_entry_q.flags & ~_ALLOWED_FLAGS) != 0)
-            | ~(supported_button | supported_axis)
+            | ~(supported_button | supported_axis | supported_absolute)
             | (validation_entry_q.logical_minimum > validation_entry_q.logical_maximum)
         )
 
@@ -504,6 +541,7 @@ class InjectionMapStore(Elaboratable):
             self.commit_ack.eq(0),
             self.commit_error.eq(MapError.NONE),
             self.commit_error_entry_index.eq(0xFF),
+            self.activated.eq(0),
         ]
 
         with m.FSM(domain="usb"):
@@ -522,6 +560,7 @@ class InjectionMapStore(Elaboratable):
                         latched_entry_count.eq(self.candidate_entry_count),
                         latched_layout_count.eq(self.candidate_layout_count),
                         latched_entries_crc32.eq(self.candidate_entries_crc32),
+                        latched_native_only.eq((self.begin_flags & INJ_MAP_FLAG_NATIVE_ONLY) != 0),
                     ]
                     m.next = "RECEIVE"
 
@@ -707,6 +746,12 @@ class InjectionMapStore(Elaboratable):
                         pending_error_entry_index.eq(validation_index),
                     ]
                     m.next = "REJECT"
+                with m.Elif(absolute_too_wide):
+                    m.d.usb += [
+                        pending_error.eq(MapError.FIELD_WIDTH),
+                        pending_error_entry_index.eq(validation_index),
+                    ]
+                    m.next = "REJECT"
                 with m.Else():
                     m.d.comb += self._candidate_layout_capture_active.eq(1)
                     m.d.usb += [
@@ -849,10 +894,12 @@ class InjectionMapStore(Elaboratable):
                             ]
                     m.d.usb += [
                         self.active_bank.eq(inactive_bank),
+                        self.active_native_only.eq(latched_native_only),
                         validation_active.eq(0),
                         self.commit_ack.eq(1),
                         self.commit_error.eq(MapError.NONE),
                         self.commit_error_entry_index.eq(0xFF),
+                        self.activated.eq(1),  # same edge as the bank flip
                     ]
                 m.next = "IDLE"
 
@@ -875,5 +922,6 @@ class InjectionMapStore(Elaboratable):
         with m.If(self.invalidate | invalidation_latched):
             for valid in bank_valid:
                 m.d.usb += valid.eq(0)
+            m.d.usb += self.active_native_only.eq(0)
 
         return m

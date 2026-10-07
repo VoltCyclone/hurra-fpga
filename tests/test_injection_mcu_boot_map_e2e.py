@@ -69,6 +69,7 @@ def _boot_entries(descriptor_generation: int) -> list[MapEntryPayload]:
         "logical_minimum": -127,
         "logical_maximum": 127,
         "report_length": FW_REPORT_LENGTH,
+        "channel": 0,
     }
     x = MapEntryPayload(
         entry_index=0,
@@ -174,5 +175,45 @@ def test_firmware_relative_command_mutates_a_live_report_additively() -> None:
         assert emitted[1] == (5 + FW_INJECT_X) & 0xFF  # 253
         assert emitted[2] == (100 + FW_INJECT_Y) & 0xFF  # 76
         assert emitted[3] == 0x00  # wheel untouched
+
+    run_simulation(bench)
+
+
+def test_firmware_relative_command_moves_a_still_device_right_after_the_commit() -> None:
+    # No native report between the commit and the command: the device is still.
+    # The command is delivered from the seeded template and acked.
+    async def bench(ctx, harness) -> None:
+        plane = harness.plane
+        await initialize(ctx, plane)
+        dg = ctx.get(harness.store.descriptor_generation)
+        await _commit_boot_map(ctx, harness, _boot_entries(dg))
+
+        rel = RelativePayload(
+            lease_generation=FW_MAP_GENERATION,
+            map_generation=FW_MAP_GENERATION,
+            command_sequence=1,
+            target_frame=0,
+            interface_number=FW_INTERFACE,
+            endpoint_number=FW_ENDPOINT,
+            report_id=FW_REPORT_ID,
+            flags=INJ_RELATIVE_FLAG_X | INJ_RELATIVE_FLAG_Y,
+            x=FW_INJECT_X,
+            y=FW_INJECT_Y,
+            wheel=0,
+            pan=0,
+            hold_reports=0,
+        )
+        await send_rx(ctx, plane, INJ_TYPE_RELATIVE, rel.to_bytes(), sequence=0x40)
+
+        ctx.set(plane.sof_tick, 1)
+        await ctx.tick("usb")
+        ctx.set(plane.sof_tick, 0)
+        emitted = await drain_output(ctx, plane, FW_REPORT_LENGTH)
+
+        assert emitted == bytes([0x00, FW_INJECT_X & 0xFF, FW_INJECT_Y & 0xFF, 0x00])
+        assert ctx.get(plane.synthesized_report_count) == 1
+        assert ctx.get(plane.command_commit_count) == 1
+        # Consumed: the RX staging is free.
+        assert not ctx.get(plane.engine.relative_valid)
 
     run_simulation(bench)

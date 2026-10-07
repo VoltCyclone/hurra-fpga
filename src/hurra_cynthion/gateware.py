@@ -25,6 +25,7 @@ from .injection_map import InjectionMapStore, MapError
 from .injection_wire import (
     INJ_MAP_STATUS_STATUS_COMMIT_ACCEPTED,
     INJ_MAP_STATUS_STATUS_REJECTED,
+    INJ_TYPE_ABSOLUTE,
     INJ_TYPE_BUTTON_STATE,
     INJ_TYPE_CLEAR,
     INJ_TYPE_MAP_BEGIN,
@@ -143,7 +144,18 @@ class ReportInjectionDataPlane(Elaboratable):
         # staging register. The link queue is released only after all 26 bytes
         # have been captured; loss invalidates both partial and complete state.
         rx_staged_valid = Signal()
-        rx_staged_type = Signal(8)
+        # One-hot type decode, registered on the edge that latches the frame's
+        # type. The type is constant from there until the frame is accepted, so
+        # the decode is too; as eight 8-bit compares it fed the rx_accept cone,
+        # a recorded failing family (rx_staged_type -> *_valid -> ...).
+        rx_staged_is_map_begin = Signal()
+        rx_staged_is_map_entry = Signal()
+        rx_staged_is_map_commit = Signal()
+        rx_staged_is_relative = Signal()
+        rx_staged_is_button = Signal()
+        rx_staged_is_mask = Signal()
+        rx_staged_is_clear = Signal()
+        rx_staged_is_absolute = Signal()
         rx_staged_sequence = Signal(8)
         rx_staged_payload = Signal(MAX_PAYLOAD * 8)
         rx_load_active = Signal()
@@ -209,7 +221,14 @@ class ReportInjectionDataPlane(Elaboratable):
                     m.d.usb += rx_load_index.eq(rx_load_index + 1)
         with m.Elif(self.rx_valid & ~rx_staged_valid):
             m.d.usb += [
-                rx_staged_type.eq(self.rx_type),
+                rx_staged_is_map_begin.eq(self.rx_type == INJ_TYPE_MAP_BEGIN),
+                rx_staged_is_map_entry.eq(self.rx_type == INJ_TYPE_MAP_ENTRY),
+                rx_staged_is_map_commit.eq(self.rx_type == INJ_TYPE_MAP_COMMIT),
+                rx_staged_is_relative.eq(self.rx_type == INJ_TYPE_RELATIVE),
+                rx_staged_is_button.eq(self.rx_type == INJ_TYPE_BUTTON_STATE),
+                rx_staged_is_mask.eq(self.rx_type == INJ_TYPE_PHYSICAL_MASK),
+                rx_staged_is_clear.eq(self.rx_type == INJ_TYPE_CLEAR),
+                rx_staged_is_absolute.eq(self.rx_type == INJ_TYPE_ABSOLUTE),
                 rx_staged_sequence.eq(self.rx_sequence),
                 rx_load_active.eq(1),
                 rx_load_primed.eq(0),
@@ -248,21 +267,22 @@ class ReportInjectionDataPlane(Elaboratable):
         rx_layout_count = rx_staged_payload[40:48]
         rx_entries_crc32 = rx_staged_payload[64:96]
 
-        is_map_begin = rx_staged_type == INJ_TYPE_MAP_BEGIN
-        is_map_entry = rx_staged_type == INJ_TYPE_MAP_ENTRY
-        is_map_commit = rx_staged_type == INJ_TYPE_MAP_COMMIT
-        is_relative = rx_staged_type == INJ_TYPE_RELATIVE
-        is_button = rx_staged_type == INJ_TYPE_BUTTON_STATE
-        is_mask = rx_staged_type == INJ_TYPE_PHYSICAL_MASK
-        is_clear = rx_staged_type == INJ_TYPE_CLEAR
-        is_command = is_relative | is_button | is_mask | is_clear
+        is_map_begin = rx_staged_is_map_begin
+        is_map_entry = rx_staged_is_map_entry
+        is_map_commit = rx_staged_is_map_commit
+        is_relative = rx_staged_is_relative
+        is_button = rx_staged_is_button
+        is_mask = rx_staged_is_mask
+        is_clear = rx_staged_is_clear
+        is_absolute = rx_staged_is_absolute
+        is_command = is_relative | is_button | is_mask | is_clear | is_absolute
         # The engine passes a boot-protocol endpoint's reports through and never
         # acks a command for it, so such a command is dropped as stale rather
         # than left blocking the one-deep RX queue for every later one. CLEAR
-        # names no endpoint. (relative/button/mask share the endpoint offset.)
+        # names no endpoint. (relative/button/mask/absolute share the endpoint offset.)
         command_endpoint = rx_staged_payload[72:80]
         targets_boot = (
-            (is_relative | is_button | is_mask)
+            (is_relative | is_button | is_mask | is_absolute)
             & (self.boot_protocol >> command_endpoint[:4])[0]
             & (command_endpoint[4:] == 0)
         )
@@ -274,14 +294,12 @@ class ReportInjectionDataPlane(Elaboratable):
             & ~targets_boot
         )
 
-        command_ready = Mux(
-            is_relative,
-            engine.relative_ready,
-            Mux(
-                is_button,
-                engine.button_ready,
-                Mux(is_mask, engine.mask_ready, engine.clear_ready),
-            ),
+        command_ready = (
+            (is_relative & engine.relative_ready)
+            | (is_button & engine.button_ready)
+            | (is_mask & engine.mask_ready)
+            | (is_absolute & engine.absolute_ready)
+            | (is_clear & engine.clear_ready)
         )
         supported_rx = is_map_begin | is_map_entry | is_map_commit | is_command
         map_message_allowed = (
@@ -349,6 +367,8 @@ class ReportInjectionDataPlane(Elaboratable):
 
         m.d.comb += [
             map_store.begin.eq(begin_accept),
+            # MAP_BEGIN.flags; MAP_COMMIT's copy is never looked at.
+            map_store.begin_flags.eq(rx_staged_payload[48:64]),
             map_store.entry_valid.eq(entry_accept),
             map_store.entry.as_value().eq(rx_staged_payload),
             map_store.commit.eq(commit_accept),
@@ -415,7 +435,24 @@ class ReportInjectionDataPlane(Elaboratable):
             ),
             engine.clear_flags.eq(rx_staged_payload[64:80]),
             engine.clear_command_sequence.eq(rx_staged_payload[32:48]),
+            engine.absolute_valid.eq(
+                rx_staged_valid
+                & self.sequence_class_valid
+                & self.sequence_class_allowed
+                & is_absolute
+                & command_fresh
+            ),
+            engine.absolute_interface.eq(rx_staged_payload[64:72]),
+            engine.absolute_endpoint.eq(rx_staged_payload[72:80]),
+            engine.absolute_report_id.eq(rx_staged_payload[80:88]),
+            # flags bit 7 is undefined on the wire and dropped here.
+            engine.absolute_mask.eq(rx_staged_payload[88:95]),
+            engine.absolute_command_sequence.eq(rx_staged_payload[32:48]),
         ]
+        # lx ly rx ry lt rt hat: seven i16 at offsets 12..24.
+        for channel, value in enumerate(engine.absolute_values):
+            low = 96 + 16 * channel
+            m.d.comb += value.eq(rx_staged_payload[low : low + 16].as_signed())
 
         # Authoritative path: host -> transactional engine -> transparent
         # monitor -> clone relay. No telemetry signal enters this ready chain.
@@ -452,8 +489,16 @@ class ReportInjectionDataPlane(Elaboratable):
         native_input_start = engine.report_valid & engine.report_ready & engine.report_first
         output_accept = monitor.output_valid & monitor.output_ready
         report_accept = output_accept & monitor.output_last
-        command_commit = report_accept & (
-            engine.relative_ready | engine.button_ready | engine.mask_ready | engine.clear_ready
+        # Each *_ready is the engine's final-byte handshake. While every commit
+        # carried a report this equalled report_accept & (...) -- the monitor is
+        # transparent -- but a NATIVE_ONLY layout commits with nothing on the
+        # wire, and that command still counts; the report (there is none) does not.
+        command_commit = (
+            engine.relative_ready
+            | engine.button_ready
+            | engine.mask_ready
+            | engine.absolute_ready
+            | engine.clear_ready
         )
         with m.If(native_input_start):
             m.d.usb += native_transaction.eq(1)
@@ -470,7 +515,8 @@ class ReportInjectionDataPlane(Elaboratable):
         with m.If(command_commit):
             with m.If(self.command_commit_count != 0xFFFF_FFFF):
                 m.d.usb += self.command_commit_count.eq(self.command_commit_count + 1)
-            with m.If(self.mutated_report_count != 0xFFFF_FFFF):
+            # A suppressed ack carries no report.
+            with m.If(report_accept & (self.mutated_report_count != 0xFFFF_FFFF)):
                 m.d.usb += self.mutated_report_count.eq(self.mutated_report_count + 1)
         with m.If(invalid_rx & (self.invalid_rx_count != 0xFFFF_FFFF)):
             m.d.usb += self.invalid_rx_count.eq(self.invalid_rx_count + 1)
@@ -1105,6 +1151,17 @@ class CynthionMouseHostTop(Elaboratable):
             "boot_resync",
             resync_ok=debug.counter(tracker.resync_ok, name="resync_ok", width=16),
             resync_failed=debug.counter(tracker.resync_fail, name="resync_failed", width=16),
+        )
+        # Pad injection. Every source is a register: the engine's held_mask and
+        # commit pulse, the store's active_native_only.
+        engine = injection_plane.engine
+        debug.status(
+            "pad_hold",
+            held_mask=engine.held_mask,
+            native_only=map_store.active_native_only,
+            absolute_commits=debug.counter(
+                engine.absolute_commit_pulse, name="absolute_commits", width=16
+            ),
         )
         debug.set_led(0, host.connected)
         debug.set_led(1, host.enumerating)

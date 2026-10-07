@@ -266,6 +266,8 @@ def test_report_injection_register_map_appends_bounded_diagnostics() -> None:
         # Appended for boot protocol (SET_PROTOCOL forwarding and its replay).
         (35, "boot_protocol"),
         (36, "boot_resync"),
+        # Appended for pad injection: held absolute channels and silent acks.
+        (37, "pad_hold"),
     ]
     # speed_policy is the first control register in this map; it shares the
     # address space with the status registers, so it must land after them.
@@ -296,6 +298,11 @@ def test_report_injection_register_map_appends_bounded_diagnostics() -> None:
     assert [(field.name, field.width) for field in m["boot_resync"].fields] == [
         ("resync_ok", 16),
         ("resync_failed", 16),
+    ]
+    assert [(field.name, field.width) for field in m["pad_hold"].fields] == [
+        ("held_mask", 7),
+        ("native_only", 1),
+        ("absolute_commits", 16),
     ]
     assert [(field.name, field.width) for field in m["usb_speed"].fields] == [
         ("aux_speed", 2),
@@ -741,3 +748,24 @@ def test_production_top_exposes_the_boot_protocol_registers_from_the_tracker() -
         target, event = events[counter]
         assert len(target) == 16, counter
         assert pulse in event._rhs_signals(), f"{counter} does not count {pulse}"
+
+
+def test_production_top_exposes_the_pad_hold_register_from_the_engine() -> None:
+    import warnings
+
+    from cynthion.gateware.platform import CynthionPlatformRev1D4
+
+    from hurra_cynthion.gateware import CynthionMouseHostTop
+
+    top = CynthionMouseHostTop()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        top.elaborate(CynthionPlatformRev1D4())
+    regmap = top.debug.regmap
+    assert regmap["pad_hold"].address in top.debug.regs.registers
+
+    engine = top.injection_plane.engine
+    events = {target.name: (target, event) for target, event, _ in top.debug._retained.specs}
+    target, event = events["count_absolute_commits"]
+    assert len(target) == 16
+    assert engine.absolute_commit_pulse in event._rhs_signals()

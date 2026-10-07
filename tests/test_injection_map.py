@@ -9,11 +9,14 @@ from amaranth.sim import Simulator
 
 from hurra_cynthion.injection_map import InjectionMapStore, MapError, _crc32_byte
 from hurra_cynthion.injection_wire import (
+    INJ_MAP_ENTRY_CHANNEL_HAT,
+    INJ_MAP_ENTRY_CHANNEL_LY,
     INJ_MAP_ENTRY_FLAG_BUTTON,
     INJ_MAP_ENTRY_FLAG_RELATIVE,
     INJ_MAP_ENTRY_FLAG_SIGNED,
     INJ_MAP_ENTRY_FLAG_X,
     INJ_MAP_ENTRY_FLAG_Y,
+    INJ_MAP_FLAG_NATIVE_ONLY,
     MapEntryPayload,
 )
 
@@ -83,6 +86,7 @@ def field(
     logical_minimum: int = -32768,
     logical_maximum: int = 32767,
     report_length: int = 4,
+    channel: int = 0,
 ) -> MapEntryPayload:
     if flags is None:
         flags_by_kind = {
@@ -106,6 +110,7 @@ def field(
         logical_minimum=logical_minimum,
         logical_maximum=logical_maximum,
         report_length=report_length,
+        channel=channel,
     )
 
 
@@ -150,6 +155,7 @@ async def commit_candidate(
     commit_generation: int | None = None,
     commit_descriptor_generation: int | None = None,
     after_commit=None,
+    begin_flags: int = 0,
 ) -> CommitResult:
     entries = [
         with_candidate_metadata(
@@ -176,9 +182,12 @@ async def commit_candidate(
     ctx.set(store.candidate_entry_count, declared_entry_count)
     ctx.set(store.candidate_layout_count, declared_layout_count)
     ctx.set(store.candidate_entries_crc32, entries_crc32)
+    ctx.set(store.begin_flags, begin_flags)
     ctx.set(store.begin, 1)
     await ctx.tick("usb")
     ctx.set(store.begin, 0)
+    # Sampled with begin: a value presented later, commit included, is ignored.
+    ctx.set(store.begin_flags, 0)
 
     for entry in entries:
         ctx.set(store.entry.as_value(), int.from_bytes(entry.to_bytes(), "little"))
@@ -753,7 +762,17 @@ def test_rejects_invalid_layouts_crc_generations_and_unsupported_fields() -> Non
                 MapError.ENDPOINT,
             ),
             (
-                {"entries": [field("x", 0, 8, flags=0)]},
+                # BUTTON and RELATIVE together name no class.
+                {
+                    "entries": [
+                        field(
+                            "x",
+                            0,
+                            8,
+                            flags=INJ_MAP_ENTRY_FLAG_BUTTON | INJ_MAP_ENTRY_FLAG_RELATIVE,
+                        )
+                    ]
+                },
                 MapError.UNSUPPORTED_FIELD,
             ),
             (
@@ -797,6 +816,64 @@ def test_rejects_invalid_layouts_crc_generations_and_unsupported_fields() -> Non
             )
             assert result.error == error
             assert result.active_generation == 0
+
+    simulated_store(bench)
+
+
+def test_absolute_entries_are_class_three_with_bounded_channels_and_widths() -> None:
+    # Neither BUTTON nor RELATIVE nor an axis flag (SIGNED tolerated) is the
+    # absolute class a pad's sticks, triggers and hat map to. The channel byte
+    # names which ABSOLUTE value lands in the field and must be 0 on every other
+    # class. Rejections reuse existing codes: commit_error is 4 bits and the
+    # map_validation debug field is 4 bits, so there is no room for a new one.
+    async def bench(ctx, store) -> None:
+        accepted = [
+            [field("x", 0, 8, flags=0)],
+            [
+                field(
+                    "x",
+                    0,
+                    16,
+                    flags=INJ_MAP_ENTRY_FLAG_SIGNED,
+                    channel=INJ_MAP_ENTRY_CHANNEL_HAT,
+                )
+            ],
+            [
+                field(
+                    "x",
+                    0,
+                    4,
+                    flags=0,
+                    channel=INJ_MAP_ENTRY_CHANNEL_LY,
+                    logical_minimum=0,
+                    logical_maximum=7,
+                )
+            ],
+        ]
+        for generation, entries in enumerate(accepted, start=1):
+            result = await commit_candidate(ctx, store, generation=generation, entries=entries)
+            assert result.error == MapError.NONE, entries
+            assert result.active_generation == generation
+        last_accepted = len(accepted)
+
+        rejected = [
+            # A 16-bit held value sign-extends through the 32-bit emitted_field;
+            # a wider unsigned field would be corrupted, so widths stop at 16.
+            ([field("x", 0, 17, flags=0)], MapError.FIELD_WIDTH),
+            (
+                [field("x", 0, 8, flags=0, channel=INJ_MAP_ENTRY_CHANNEL_HAT + 1)],
+                MapError.UNSUPPORTED_FIELD,
+            ),
+            ([field("button", 8, 1, channel=1)], MapError.UNSUPPORTED_FIELD),
+            ([field("x", 0, 8, channel=1)], MapError.UNSUPPORTED_FIELD),
+            # An axis flag without RELATIVE is still no class at all.
+            ([field("x", 0, 8, flags=INJ_MAP_ENTRY_FLAG_X)], MapError.UNSUPPORTED_FIELD),
+        ]
+        for generation, (entries, error) in enumerate(rejected, start=last_accepted + 1):
+            result = await commit_candidate(ctx, store, generation=generation, entries=entries)
+            assert result.error == error, entries
+            assert result.error_entry_index == 0
+            assert result.active_generation == last_accepted
 
     simulated_store(bench)
 
@@ -1044,3 +1121,53 @@ def test_module_elaborates_to_two_banks_of_sixty_four_packed_entries() -> None:
     assert netlist.count("memory width 16 size 512") == 1
     assert netlist.count("memory width 31 size 32") == 1
     assert "layout_interface_0_0" not in netlist
+
+
+def test_map_begin_native_only_flag_is_published_with_the_bank_flip() -> None:
+    # MAP_BEGIN.flags bit 0 is NATIVE_ONLY. It is latched with the other begin
+    # metadata and published as a plain register on the ACCEPT edge, so the
+    # engine reads the active map's flag with no bank select in front of it.
+    async def bench(ctx, store) -> None:
+        assert ctx.get(store.active_native_only) == 0
+        result = await commit_candidate(ctx, store, generation=1, entries=[field("x", 0, 8)])
+        assert result.error == MapError.NONE
+        assert ctx.get(store.active_native_only) == 0
+
+        result = await commit_candidate(
+            ctx,
+            store,
+            generation=2,
+            entries=[field("x", 0, 8)],
+            begin_flags=INJ_MAP_FLAG_NATIVE_ONLY,
+        )
+        assert result.error == MapError.NONE
+        assert ctx.get(store.active_native_only) == 1
+
+        # A rejected candidate leaves the active map alone, flag included.
+        result = await commit_candidate(
+            ctx, store, generation=3, entries=[field("x", 0, 8)], entries_crc32=0x12345678
+        )
+        assert result.error == MapError.CRC
+        assert ctx.get(store.active_native_only) == 1
+
+        # Flipping to a map begun without the flag clears it.
+        result = await commit_candidate(ctx, store, generation=4, entries=[field("x", 0, 8)])
+        assert result.error == MapError.NONE
+        assert ctx.get(store.active_native_only) == 0
+
+        # Invalidation clears it with the banks.
+        result = await commit_candidate(
+            ctx,
+            store,
+            generation=5,
+            entries=[field("x", 0, 8)],
+            begin_flags=INJ_MAP_FLAG_NATIVE_ONLY,
+        )
+        assert ctx.get(store.active_native_only) == 1
+        ctx.set(store.invalidate, 1)
+        await ctx.tick("usb")
+        ctx.set(store.invalidate, 0)
+        await ctx.tick("usb")
+        assert ctx.get(store.active_native_only) == 0
+
+    simulated_store(bench)

@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from hurra_cynthion.injection_wire import (
+    ABSOLUTE_GOLDEN_PAYLOAD,
     COUNTER_POSITIONS,
     CRC32_ALGORITHM,
     CRC32_INIT,
@@ -18,6 +19,7 @@ from hurra_cynthion.injection_wire import (
     MAX_PAYLOAD,
     PAYLOAD_LAYOUTS,
     RELATIVE_GOLDEN_PAYLOAD,
+    AbsolutePayload,
     FrameError,
     MapEntryPayload,
     RelativePayload,
@@ -120,7 +122,7 @@ EXPECTED_LAYOUTS = {
         ("logical_minimum", 16, 4),
         ("logical_maximum", 20, 4),
         ("report_length", 24, 1),
-        ("reserved", 25, 1),
+        ("channel", 25, 1),
     ),
     "MAP_COMMIT": (
         ("descriptor_generation", 0, 2),
@@ -191,10 +193,35 @@ EXPECTED_LAYOUTS = {
         ("flags", 13, 1),
         ("reserved", 14, 12),
     ),
+    "ABSOLUTE": (
+        ("lease_generation", 0, 2),
+        ("map_generation", 2, 2),
+        ("command_sequence", 4, 2),
+        ("hold_reports", 6, 2),
+        ("interface_number", 8, 1),
+        ("endpoint_number", 9, 1),
+        ("report_id", 10, 1),
+        ("flags", 11, 1),
+        ("lx", 12, 2),
+        ("ly", 14, 2),
+        ("rx", 16, 2),
+        ("ry", 18, 2),
+        ("lt", 20, 2),
+        ("rt", 22, 2),
+        ("hat", 24, 2),
+    ),
 }
 
 EXPECTED_ENUMERATIONS = {
-    "CLEAR_FLAG": {"MOTION": 1, "BUTTONS": 2, "PHYSICAL_MASKS": 4, "QUEUED_TIMED": 8, "ALL": 15},
+    "ABSOLUTE_FLAG": {"LX": 1, "LY": 2, "RX": 4, "RY": 8, "LT": 16, "RT": 32, "HAT": 64},
+    "CLEAR_FLAG": {
+        "MOTION": 1,
+        "BUTTONS": 2,
+        "PHYSICAL_MASKS": 4,
+        "QUEUED_TIMED": 8,
+        "ABSOLUTE": 16,
+        "ALL": 31,
+    },
     "COMMAND_ACK_FLAG": {"LATE": 1, "SYNTHESIZED": 2},
     "COMMAND_ACK_RESULT": {
         "SUCCESS": 0,
@@ -213,6 +240,7 @@ EXPECTED_ENUMERATIONS = {
         "INJECTION_ENABLED": 4,
         "RELAY_READY": 8,
     },
+    "MAP_ENTRY_CHANNEL": {"LX": 0, "LY": 1, "RX": 2, "RY": 3, "LT": 4, "RT": 5, "HAT": 6},
     "MAP_ENTRY_FLAG": {
         "SIGNED": 1,
         "RELATIVE": 2,
@@ -222,6 +250,7 @@ EXPECTED_ENUMERATIONS = {
         "WHEEL": 32,
         "PAN": 64,
     },
+    "MAP_FLAG": {"NATIVE_ONLY": 1},
     "MAP_STATUS_ERROR": {
         "NONE": 0,
         "DESCRIPTOR_GENERATION": 1,
@@ -312,14 +341,15 @@ def test_pack_slot_rejects_unknown_or_wrong_known_payload_lengths():
         (0x04, 9, 0x01, False),
         (0x05, 15, 0x04, False),
         (0x06, 1, 0x01, False),
-        (0x81, 6, 0x01, False),
+        (0x81, 6, 0x02, False),
         (0x82, 15, 0x80, True),
-        (0x83, 6, 0x01, False),
+        (0x83, 6, 0x02, False),
         (0x84, 11, 0x10, False),
         (0x85, 11, 0x01, False),
         (0x86, 11, 0x01, False),
-        (0x87, 8, 0x10, False),
+        (0x87, 8, 0x20, False),
         (0x88, 13, 0x01, False),
+        (0x89, 11, 0x80, False),
     ],
 )
 def test_raw_slot_transmit_rejects_unassigned_flags(type_, offset, invalid, receive_reject):
@@ -474,27 +504,66 @@ def test_map_entry_golden_payload():
         logical_minimum=-2048,
         logical_maximum=2047,
         report_length=4,
+        channel=0,
     ).to_bytes()
     assert payload == MAP_ENTRY_GOLDEN_PAYLOAD
     assert payload.hex() == "341278569a0203010100300008000c1b00f8ffffff0700000400"
 
 
-def test_generated_c_header_is_current():
-    expected = Path("firmware/ch32h417/include/injection_wire.h").read_text()
+def test_absolute_golden_payload():
+    payload = AbsolutePayload(
+        lease_generation=0x1122,
+        map_generation=0x3344,
+        command_sequence=0x5566,
+        hold_reports=0x7788,
+        interface_number=9,
+        endpoint_number=10,
+        report_id=11,
+        flags=0x7F,
+        lx=-2,
+        ly=0x1234,
+        rx=-0x1234,
+        ry=0x7FFF,
+        lt=-0x8000,
+        rt=1,
+        hat=8,
+    ).to_bytes()
+    assert payload == ABSOLUTE_GOLDEN_PAYLOAD
+    assert payload.hex() == "2211443366558877090a0b7ffeff3412ccedff7f008001000800"
+    # Round trip: every one of the seven axes is signed on the way back too.
+    assert AbsolutePayload.from_bytes(payload).lt == -0x8000
+
+
+C_HEADERS = (
+    Path("firmware/ch32h417/include/injection_wire.h"),
+    Path("firmware/mcxn947/include/injection_wire.h"),
+)
+
+
+def _load_generator():
     generator_path = Path("tools/generate_report_injection_wire.py")
     spec = importlib.util.spec_from_file_location("generate_report_injection_wire", generator_path)
     assert spec is not None and spec.loader is not None
     generator = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(generator)
+    return generator
 
-    assert expected == generator.render_c(Path("protocol/report_injection_wire.json"))
+
+def test_generator_targets_both_controller_headers():
+    generator = _load_generator()
+    assert tuple(path.resolve() for path in generator.C_HEADER_PATHS) == tuple(
+        path.resolve() for path in C_HEADERS
+    )
+
+
+@pytest.mark.parametrize("header", C_HEADERS, ids=lambda path: path.parts[1])
+def test_generated_c_header_is_current(header):
+    generator = _load_generator()
+    assert header.read_text() == generator.render_c(Path("protocol/report_injection_wire.json"))
 
 
 def test_second_generation_does_not_change_outputs():
-    generated = (
-        Path("src/hurra_cynthion/injection_wire.py"),
-        Path("firmware/ch32h417/include/injection_wire.h"),
-    )
+    generated = (Path("src/hurra_cynthion/injection_wire.py"), *C_HEADERS)
     before = {path: path.read_bytes() for path in generated}
     subprocess.run(
         [sys.executable, "tools/generate_report_injection_wire.py"],

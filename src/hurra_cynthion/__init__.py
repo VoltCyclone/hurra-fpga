@@ -1,4 +1,4 @@
-"""Bounded full-speed USB mouse host gateware for Cynthion r1.4."""
+"""USB HID relay with live report injection for Cynthion r1.4."""
 
 from .crc import usb_crc5
 from .host import BoundedMouseHost

@@ -51,4 +51,10 @@ spi_frame_result_t inj_build_physical_mask(uint8_t slot[INJ_FRAME_SIZE], uint8_t
 spi_frame_result_t inj_build_relative(uint8_t slot[INJ_FRAME_SIZE], uint8_t frame_sequence,
                                       const inj_relative_payload_t *payload);
 
+// The held pad vector (ABSOLUTE): flags is the FULL held set, bit k = channel
+// k held at its named value; a clear bit releases that channel and its value
+// is ignored. hold_reports must be 0 (the FPGA ignores it in v1).
+spi_frame_result_t inj_build_absolute(uint8_t slot[INJ_FRAME_SIZE], uint8_t frame_sequence,
+                                      const inj_absolute_payload_t *payload);
+
 #endif  // INJ_COMMAND_H

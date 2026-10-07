@@ -12,6 +12,7 @@
 
 #include "console.h"
 #include "dbg_uart.h"
+#include "inj_session.h"
 #include "kmcmd.h"
 #include "link.h"
 #include "link_retire.h"
@@ -393,18 +394,49 @@ static bool km_ready(void *ctx)
     return link_inject_ready();
 }
 
-static bool km_no_mouse(void *ctx)
+static bool km_absolute(void *ctx, uint8_t mask, const int16_t normalized[KMCMD_PAD_CHANNELS])
 {
     (void)ctx;
-    return link_inject_no_mouse();
+    return link_inject_request_absolute(mask, normalized);
+}
+
+static bool km_absolute_hold(void *ctx, uint32_t ms)
+{
+    (void)ctx;
+    return link_inject_request_absolute_hold(ms);
+}
+
+// kmcmd's numbering is a copy of the session's and the wire's, kept without an
+// include so kmcmd.c stays free of injection_wire.h. This is the one file that
+// sees all three, so this is where they are held to each other.
+_Static_assert((int)KMCMD_DEVICE_UNKNOWN == (int)INJ_DEVICE_CLASS_UNKNOWN &&
+                   (int)KMCMD_DEVICE_NONE == (int)INJ_DEVICE_CLASS_NONE &&
+                   (int)KMCMD_DEVICE_MOUSE == (int)INJ_DEVICE_CLASS_MOUSE &&
+                   (int)KMCMD_DEVICE_PAD == (int)INJ_DEVICE_CLASS_PAD,
+               "kmcmd's device classes must mirror inj_session's");
+_Static_assert(KMCMD_PAD_LX == INJ_MAP_ENTRY_CHANNEL_LX && KMCMD_PAD_LY == INJ_MAP_ENTRY_CHANNEL_LY &&
+                   KMCMD_PAD_RX == INJ_MAP_ENTRY_CHANNEL_RX &&
+                   KMCMD_PAD_RY == INJ_MAP_ENTRY_CHANNEL_RY &&
+                   KMCMD_PAD_LT == INJ_MAP_ENTRY_CHANNEL_LT &&
+                   KMCMD_PAD_RT == INJ_MAP_ENTRY_CHANNEL_RT &&
+                   KMCMD_PAD_HAT == INJ_MAP_ENTRY_CHANNEL_HAT &&
+                   KMCMD_PAD_CHANNELS == LINK_PAD_CHANNELS,
+               "kmcmd's pad channels must mirror the wire's MAP_ENTRY_CHANNEL");
+
+static kmcmd_device_class_t km_device_class(void *ctx)
+{
+    (void)ctx;
+    return (kmcmd_device_class_t)link_inject_device_class();
 }
 
 static const kmcmd_ops_t s_kmcmd_ops = {
     .relative = km_relative,
     .buttons = km_buttons,
     .physical_mask = km_physical_mask,
+    .absolute = km_absolute,
+    .absolute_hold = km_absolute_hold,
     .ready = km_ready,
-    .no_mouse = km_no_mouse,
+    .device_class = km_device_class,
     .ctx = NULL,
 };
 

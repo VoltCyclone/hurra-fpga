@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "hurra-cynthion"
 version = "0.1.0"
-description = "Bounded full-speed USB mouse host gateware for Cynthion r1.4"
+description = "USB HID relay with live report injection for Cynthion r1.4"
 requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE"]

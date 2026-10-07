@@ -9,12 +9,24 @@ from hurra_cynthion.descriptors import DescriptorStore
 from hurra_cynthion.gateware import ReportInjectionDataPlane
 from hurra_cynthion.injection_map import MapError
 from hurra_cynthion.injection_wire import (
+    INJ_ABSOLUTE_FLAG_HAT,
+    INJ_ABSOLUTE_FLAG_LX,
+    INJ_MAP_ENTRY_CHANNEL_HAT,
+    INJ_MAP_ENTRY_CHANNEL_LT,
+    INJ_MAP_ENTRY_CHANNEL_LX,
+    INJ_MAP_ENTRY_CHANNEL_LY,
+    INJ_MAP_ENTRY_CHANNEL_RT,
+    INJ_MAP_ENTRY_CHANNEL_RX,
+    INJ_MAP_ENTRY_CHANNEL_RY,
+    INJ_MAP_ENTRY_FLAG_BUTTON,
     INJ_MAP_ENTRY_FLAG_RELATIVE,
     INJ_MAP_ENTRY_FLAG_SIGNED,
     INJ_MAP_ENTRY_FLAG_X,
+    INJ_MAP_FLAG_NATIVE_ONLY,
     INJ_MAP_STATUS_ERROR_NONE,
     INJ_MAP_STATUS_STATUS_COMMIT_ACCEPTED,
     INJ_RELATIVE_FLAG_X,
+    INJ_TYPE_ABSOLUTE,
     INJ_TYPE_DESCRIPTOR_FRAGMENT,
     INJ_TYPE_MAP_BEGIN,
     INJ_TYPE_MAP_COMMIT,
@@ -23,6 +35,7 @@ from hurra_cynthion.injection_wire import (
     INJ_TYPE_RELATIVE,
     INJ_TYPE_REPORT_FRAGMENT,
     INJ_TYPE_TELEMETRY_CONFIG,
+    AbsolutePayload,
     DescriptorFragmentPayload,
     MapBeginPayload,
     MapCommitPayload,
@@ -76,7 +89,70 @@ def relative_x_entry(*, descriptor_generation: int, report_length: int = 1) -> M
         logical_minimum=-127,
         logical_maximum=127,
         report_length=report_length,
+        channel=0,
     )
+
+
+def pad_entries(*, descriptor_generation: int) -> list[MapEntryPayload]:
+    """Buttons @0, unsigned LX @8 and LY @16, 4-bit hat @24; report length 4."""
+    common = {
+        "descriptor_generation": descriptor_generation,
+        "map_generation": 1,
+        "interface_number": 0,
+        "endpoint_number": 1,
+        "report_id": 0,
+        "report_length": 4,
+    }
+    return [
+        MapEntryPayload(
+            entry_index=0,
+            usage_page=0x09,
+            usage=1,
+            bit_offset=0,
+            bit_width=8,
+            flags=INJ_MAP_ENTRY_FLAG_BUTTON,
+            logical_minimum=0,
+            logical_maximum=1,
+            channel=0,
+            **common,
+        ),
+        MapEntryPayload(
+            entry_index=1,
+            usage_page=0x01,
+            usage=0x30,
+            bit_offset=8,
+            bit_width=8,
+            flags=0,
+            logical_minimum=0,
+            logical_maximum=255,
+            channel=INJ_MAP_ENTRY_CHANNEL_LX,
+            **common,
+        ),
+        MapEntryPayload(
+            entry_index=2,
+            usage_page=0x01,
+            usage=0x31,
+            bit_offset=16,
+            bit_width=8,
+            flags=0,
+            logical_minimum=0,
+            logical_maximum=255,
+            channel=INJ_MAP_ENTRY_CHANNEL_LY,
+            **common,
+        ),
+        MapEntryPayload(
+            entry_index=3,
+            usage_page=0x01,
+            usage=0x39,
+            bit_offset=24,
+            bit_width=4,
+            flags=0,
+            logical_minimum=0,
+            logical_maximum=7,
+            channel=INJ_MAP_ENTRY_CHANNEL_HAT,
+            **common,
+        ),
+    ]
 
 
 async def initialize(ctx, plane, *, link_ready: int = 1) -> None:
@@ -108,43 +184,55 @@ async def send_rx(ctx, plane, type_: int, payload: bytes, *, sequence: int = 0) 
     raise AssertionError(f"RX type 0x{type_:02x} was not accepted")
 
 
-async def commit_map(
+async def commit_entries(
     ctx,
     harness,
-    entry: MapEntryPayload,
+    entries: list[MapEntryPayload],
     *,
     sequence_start: int = 1,
+    begin_flags: int = 0,
+    commit_flags: int | None = None,
 ) -> None:
+    """MAP_BEGIN -> MAP_ENTRY* -> MAP_COMMIT through the real decode path.
+
+    The MCU mirrors begin metadata into commit, so ``commit_flags`` defaults to
+    ``begin_flags``; pass it explicitly to prove the commit copy is ignored.
+    """
     plane = harness.plane
-    canonical = entry.to_bytes()
+    canonical = b"".join(entry.to_bytes() for entry in entries)
+    layouts = {
+        (entry.interface_number, entry.endpoint_number, entry.report_id) for entry in entries
+    }
     metadata = {
-        "descriptor_generation": entry.descriptor_generation,
-        "map_generation": entry.map_generation,
-        "entry_count": 1,
-        "layout_count": 1,
-        "flags": 0,
+        "descriptor_generation": entries[0].descriptor_generation,
+        "map_generation": entries[0].map_generation,
+        "entry_count": len(entries),
+        "layout_count": len(layouts),
         "entries_crc32": zlib.crc32(canonical),
     }
     await send_rx(
         ctx,
         plane,
         INJ_TYPE_MAP_BEGIN,
-        MapBeginPayload(**metadata).to_bytes(),
+        MapBeginPayload(flags=begin_flags, **metadata).to_bytes(),
         sequence=sequence_start,
     )
-    await send_rx(
-        ctx,
-        plane,
-        INJ_TYPE_MAP_ENTRY,
-        canonical,
-        sequence=(sequence_start + 1) & 0xFF,
-    )
+    for index, entry in enumerate(entries):
+        await send_rx(
+            ctx,
+            plane,
+            INJ_TYPE_MAP_ENTRY,
+            entry.to_bytes(),
+            sequence=(sequence_start + 1 + index) & 0xFF,
+        )
     await send_rx(
         ctx,
         plane,
         INJ_TYPE_MAP_COMMIT,
-        MapCommitPayload(**metadata).to_bytes(),
-        sequence=(sequence_start + 2) & 0xFF,
+        MapCommitPayload(
+            flags=begin_flags if commit_flags is None else commit_flags, **metadata
+        ).to_bytes(),
+        sequence=(sequence_start + 1 + len(entries)) & 0xFF,
     )
     for _ in range(8_000):
         await ctx.tick("usb")
@@ -153,6 +241,25 @@ async def commit_map(
             assert ctx.get(plane.map_store.active_valid)
             return
     raise AssertionError("decoded map commit did not complete")
+
+
+async def commit_map(
+    ctx,
+    harness,
+    entry: MapEntryPayload,
+    *,
+    sequence_start: int = 1,
+    begin_flags: int = 0,
+    commit_flags: int | None = None,
+) -> None:
+    await commit_entries(
+        ctx,
+        harness,
+        [entry],
+        sequence_start=sequence_start,
+        begin_flags=begin_flags,
+        commit_flags=commit_flags,
+    )
 
 
 async def commit_empty_map(
@@ -230,6 +337,44 @@ async def drive_relative(
         ctx,
         plane,
         INJ_TYPE_RELATIVE,
+        payload,
+        sequence=sequence & 0xFF if rx_sequence is None else rx_sequence,
+    )
+
+
+async def drive_absolute(
+    ctx,
+    plane,
+    *,
+    mask: int,
+    values: dict[int, int] | None = None,
+    sequence: int = 1,
+    rx_sequence: int | None = None,
+    map_generation: int = 1,
+) -> None:
+    """Offer one ABSOLUTE frame. ``values`` is keyed by MAP_ENTRY_CHANNEL."""
+    values = values or {}
+    payload = AbsolutePayload(
+        lease_generation=1,
+        map_generation=map_generation,
+        command_sequence=sequence,
+        hold_reports=0,
+        interface_number=0,
+        endpoint_number=1,
+        report_id=0,
+        flags=mask,
+        lx=values.get(INJ_MAP_ENTRY_CHANNEL_LX, 0),
+        ly=values.get(INJ_MAP_ENTRY_CHANNEL_LY, 0),
+        rx=values.get(INJ_MAP_ENTRY_CHANNEL_RX, 0),
+        ry=values.get(INJ_MAP_ENTRY_CHANNEL_RY, 0),
+        lt=values.get(INJ_MAP_ENTRY_CHANNEL_LT, 0),
+        rt=values.get(INJ_MAP_ENTRY_CHANNEL_RT, 0),
+        hat=values.get(INJ_MAP_ENTRY_CHANNEL_HAT, 0),
+    ).to_bytes()
+    await send_rx(
+        ctx,
+        plane,
+        INJ_TYPE_ABSOLUTE,
         payload,
         sequence=sequence & 0xFF if rx_sequence is None else rx_sequence,
     )
@@ -1205,5 +1350,161 @@ def test_a_command_for_a_boot_protocol_endpoint_is_dropped_not_left_blocking_the
         await drive_relative(ctx, plane, x=10, sequence=0x22)
         await push_report(ctx, plane, bytes([5]))
         assert await drain_output(ctx, plane, 1) == bytes([15])
+
+    run_simulation(bench)
+
+
+def test_map_begin_flags_reach_the_store_and_commit_flags_are_ignored() -> None:
+    async def bench(ctx, harness) -> None:
+        plane = harness.plane
+        await initialize(ctx, plane)
+        entry = relative_x_entry(descriptor_generation=ctx.get(harness.store.descriptor_generation))
+        await commit_map(
+            ctx,
+            harness,
+            entry,
+            begin_flags=INJ_MAP_FLAG_NATIVE_ONLY,
+            commit_flags=INJ_MAP_FLAG_NATIVE_ONLY,
+        )
+        assert ctx.get(plane.map_store.active_native_only) == 1
+
+        # Only MAP_BEGIN's flags count: a commit that claims NATIVE_ONLY for a
+        # map begun without it changes nothing.
+        await commit_map(
+            ctx,
+            harness,
+            replace(entry, map_generation=2),
+            sequence_start=4,
+            begin_flags=0,
+            commit_flags=INJ_MAP_FLAG_NATIVE_ONLY,
+        )
+        assert ctx.get(plane.map_store.active_generation) == 2
+        assert ctx.get(plane.map_store.active_native_only) == 0
+
+    run_simulation(bench)
+
+
+def test_absolute_frame_is_decoded_and_offered_to_the_engine() -> None:
+    # Before this an ABSOLUTE drained as invalid_rx, silently.
+    async def bench(ctx, harness) -> None:
+        plane = harness.plane
+        engine = plane.engine
+        await initialize(ctx, plane)
+        entry = relative_x_entry(descriptor_generation=ctx.get(harness.store.descriptor_generation))
+        await commit_map(ctx, harness, entry)
+        before = ctx.get(plane.invalid_rx_count)
+
+        await drive_absolute(
+            ctx,
+            plane,
+            mask=INJ_ABSOLUTE_FLAG_LX | INJ_ABSOLUTE_FLAG_HAT,
+            values={INJ_MAP_ENTRY_CHANNEL_LX: -300, INJ_MAP_ENTRY_CHANNEL_HAT: 8},
+            sequence=0x21,
+        )
+        for _ in range(2):
+            await ctx.tick("usb")
+
+        assert ctx.get(engine.absolute_valid) == 1
+        assert ctx.get(engine.absolute_interface) == 0
+        assert ctx.get(engine.absolute_endpoint) == 1
+        assert ctx.get(engine.absolute_report_id) == 0
+        assert ctx.get(engine.absolute_mask) == INJ_ABSOLUTE_FLAG_LX | INJ_ABSOLUTE_FLAG_HAT
+        assert ctx.get(engine.absolute_values[INJ_MAP_ENTRY_CHANNEL_LX]) == -300
+        assert ctx.get(engine.absolute_values[INJ_MAP_ENTRY_CHANNEL_HAT]) == 8
+        assert ctx.get(engine.absolute_values[INJ_MAP_ENTRY_CHANNEL_RY]) == 0
+        assert ctx.get(engine.absolute_command_sequence) == 0x21
+        assert ctx.get(plane.invalid_rx_count) == before
+
+    run_simulation(bench)
+
+
+def test_an_absolute_for_a_boot_protocol_endpoint_is_dropped_as_stale() -> None:
+    async def bench(ctx, harness) -> None:
+        plane = harness.plane
+        await initialize(ctx, plane)
+        entry = relative_x_entry(descriptor_generation=ctx.get(harness.store.descriptor_generation))
+        await commit_map(ctx, harness, entry)
+        ctx.set(plane.boot_protocol, 1 << 1)
+        await ctx.tick("usb")
+        before = ctx.get(plane.invalid_rx_count)
+
+        await drive_absolute(ctx, plane, mask=INJ_ABSOLUTE_FLAG_LX, sequence=0x21)
+        for _ in range(2):
+            await ctx.tick("usb")
+
+        assert ctx.get(plane.invalid_rx_count) == before + 1
+        assert ctx.get(plane.engine.absolute_valid) == 0
+
+    run_simulation(bench)
+
+
+def test_an_absolute_with_a_stale_map_generation_is_dropped_not_queued() -> None:
+    # command_fresh fails on the generation mismatch, so the frame drains as
+    # invalid_rx instead of waiting for an ack no layout would ever give. A FRESH
+    # command for a layout the active map lacks is a different, pre-existing hazard
+    # shared by every command type: command_fresh checks only link/session/map-generation,
+    # so such a frame waits in command_ready for an ack no record will give.
+    async def bench(ctx, harness) -> None:
+        plane = harness.plane
+        await initialize(ctx, plane)
+        entry = relative_x_entry(descriptor_generation=ctx.get(harness.store.descriptor_generation))
+        await commit_map(ctx, harness, entry)
+        before = ctx.get(plane.invalid_rx_count)
+
+        await drive_absolute(ctx, plane, mask=INJ_ABSOLUTE_FLAG_LX, sequence=0x21, map_generation=2)
+        for _ in range(2):
+            await ctx.tick("usb")
+
+        assert ctx.get(plane.invalid_rx_count) == before + 1
+        assert ctx.get(plane.engine.absolute_valid) == 0
+
+    run_simulation(bench)
+
+
+def test_native_only_absolute_commands_ack_without_a_report_and_never_block_the_queue() -> None:
+    """Two ABSOLUTEs a slot apart on a still NATIVE_ONLY pad both commit.
+
+    The plane's RX staging is one deep: a command that cannot ack blocks every
+    later frame. On a NATIVE_ONLY layout the ack must come with nothing on the
+    wire, within the 125 us (7,500 cycle) slot before the next frame.
+    """
+
+    async def bench(ctx, harness) -> None:
+        plane = harness.plane
+        engine = plane.engine
+        await initialize(ctx, plane)
+        entries = pad_entries(descriptor_generation=ctx.get(harness.store.descriptor_generation))
+        await commit_entries(ctx, harness, entries, begin_flags=INJ_MAP_FLAG_NATIVE_ONLY)
+        assert ctx.get(plane.map_store.active_native_only) == 1
+
+        for sequence, lx in ((0x21, 200), (0x22, 10)):
+            await drive_absolute(
+                ctx,
+                plane,
+                mask=INJ_ABSOLUTE_FLAG_LX,
+                values={INJ_MAP_ENTRY_CHANNEL_LX: lx},
+                sequence=sequence,
+            )
+            ctx.set(plane.sof_tick, 1)
+            await ctx.tick("usb")
+            ctx.set(plane.sof_tick, 0)
+            for _ in range(7_500):
+                assert not ctx.get(plane.output_valid)
+                if not ctx.get(engine.absolute_valid):
+                    break
+                await ctx.tick("usb")
+            else:
+                raise AssertionError(f"ABSOLUTE 0x{sequence:02x} was not acked within one slot")
+
+        assert ctx.get(plane.invalid_rx_count) == 0
+        assert ctx.get(plane.command_commit_count) == 2
+        assert ctx.get(plane.synthesized_report_count) == 0
+        assert ctx.get(plane.accepted_report_count) == 0
+        assert ctx.get(engine.held_mask) == INJ_ABSOLUTE_FLAG_LX
+
+        await push_report(ctx, plane, bytes([0x00, 50, 60, 0x00]))
+        assert await drain_output(ctx, plane, 4) == bytes([0x00, 10, 60, 0x00])
+        assert ctx.get(plane.accepted_report_count) == 1
+        assert ctx.get(plane.mutated_report_count) == 0
 
     run_simulation(bench)

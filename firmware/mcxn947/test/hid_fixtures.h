@@ -208,4 +208,16 @@ static const uint8_t HID_FIXTURE_GAMEPAD_DS4_SHAPED[] = {
     0xC0,                    // End Collection
 };
 
+// The REAL DualShock 4 (VID 054c, PID 09cc) report descriptor, byte-exact from
+// the bench capture (docs/PAD_INJECTION.md section 4). 507 bytes (0x01FB, as
+// its HID descriptor declares). Until the capture lands this is a zero
+// placeholder behind HID_FIXTURE_DS4_CAPTURED. Generate with
+// `python3 tools/ds4_rdesc_to_fixtures.py <rdesc.txt>`, paste, flip the flag.
+// The length and flag/content agreement are checked before compiling it.
+#define HID_FIXTURE_DS4_CAPTURED 0
+static const uint8_t HID_FIXTURE_DS4[507] = {
+    0x00,  // fill from capture: replace this initialiser with ds4_c.txt
+};
+_Static_assert(sizeof(HID_FIXTURE_DS4) == 507u, "the DS4 report descriptor is 507 bytes");
+
 #endif  // HURRA_MCXN947_TEST_HID_FIXTURES_H

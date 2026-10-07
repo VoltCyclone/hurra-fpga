@@ -305,7 +305,42 @@ REQUIRED_NEXTPNR_FLAG = "--placer-heap-timingweight"
 #: descriptor_store.descriptor_memory read-address family (handshake, timer
 #: or setup decoder -> the GET_DESCRIPTOR streamer); the twelfth in a relay IN
 #: endpoint's tx_manager. None ends in the flush logic. Pin 6 -> 10.
-DEFAULT_PLACER_SEED = 10
+#:
+#: Injection on a still device: the map store's ``activated`` pulse and
+#: indexed directory read, the engine's SEED_* walk, button/mask commands
+#: synthesised when unchanged, a 64-bit ``click_restore`` in the state record.
+#: About 330 LUTs. Netlist sha 0e9f458c3177d88e (native), 20,196 LUTs = 83%:
+#:
+#:     4: 71.15   11: 71.06  12: 70.20  7: 70.07   1: 70.01   8: 68.54
+#:     2: 68.25   9: 67.89   5: 67.12   3: 66.99   10: 65.45  6: 65.15
+#:
+#: Median 68.4, worst 65.15 (+8.6%). A first draft of the same logic (one
+#: more FSM state, three more muxes) drew median 72.7, worst +16.3% -- the
+#: spread of placement, not of the logic. 10 of 12 seeds end in the clone's
+#: control endpoint -> a relay IN endpoint's tx_manager buffer read (the G5
+#: family); 2 in map_store.active_bank -> engine.layout_state data / its
+#: write enable (the bank -> commit family), both at +13%. Pin 10 -> 4.
+#:
+#: Pad injection: class-3 absolute map entries with a channel byte, the
+#: ABSOLUTE command, a separate 16 x 119-bit ``pad_state`` memory beside the
+#: state record (written a cycle late from a registered enable), NATIVE_ONLY
+#: suppressed transactions that ack with nothing on the wire, a one-hot
+#: registered RX type decode, the ``pad_hold`` register. About 1,600 LUTs
+#: (the estimate was 300-500). Netlist sha 0c032ea195269285 (native),
+#: 21,824 LUTs = 89%:
+#:
+#:     2: 73.92   1: 73.19   10: 73.18  3: 72.91   4: 72.86   12: 72.53
+#:     9: 72.14   11: 72.08  5: 72.01   8: 70.63   7: 69.97   6: 69.56
+#:
+#: Median 72.3, worst 69.56 (+15.9%) -- the best floor on record, and per
+#: the placement-spread caveat above not evidence the logic got faster. 6 of
+#: 12 seeds end in map_store.active_bank / bank_descriptor_generation ->
+#: engine.layout_state (the state-record memory; pad_state was kept off this
+#: cone on purpose); 4 in the clone (setup decoder, tx_manager, current_speed)
+#: -> descriptor_store.device_lookup_found / shared_payload_read addr; 2 in
+#: device.reset_sequencer.current_speed -> translator.phy_ready. None in the
+#: new logic. Pin 4 -> 2.
+DEFAULT_PLACER_SEED = 2
 
 #: The full option, including the weight and seed that were actually measured.
 #: A caller-supplied ``--seed`` is composed after this one and wins, because
@@ -434,14 +469,10 @@ def require_yosys_version(version: tuple[int, int] | None) -> None:
     have = ".".join(str(part) for part in version)
     want = ".".join(str(part) for part in MINIMUM_YOSYS_VERSION)
     raise SystemExit(
-        f"yosys {have} is too old: below {want} this design closes on only a "
-        "small minority of placer seeds, so a build is a coin toss rather than "
-        "a result. Measured on deterministic netlists, same source, same "
-        "nextpnr, twelve seeds each: 0.48 -> 3 of 12 pass; 0.68 -> 12 of 12. "
-        f"{want} is a reliability floor, not the point at which a bitstream "
-        "first becomes possible. Install oss-cad-suite 2026-09-01 or newer, or "
-        "set YOSYS to a newer binary. See CLAUDE.md, 'The yosys floor, "
-        "measured properly'."
+        f"error: yosys {have} is too old; the build needs {want} or newer. Below "
+        f"{want} this design closes timing on few placer seeds (from the same "
+        "source and nextpnr, 0.48 passed 3 of 12 seeds and 0.68 passed 12 of 12). Install "
+        "oss-cad-suite 2026-09-01 or newer, or set YOSYS to a newer yosys binary."
     )
 
 
@@ -470,9 +501,9 @@ def require_nextpnr_opts(value: str) -> None:
     """
     if REQUIRED_NEXTPNR_FLAG not in value:
         raise SystemExit(
-            f"{NEXTPNR_OPTS_VAR}={value!r} is missing {REQUIRED_NEXTPNR_FLAG}. "
-            "The ECP5 build does not close timing without it; see "
-            "docs/TIMING_CLOSURE.md."
+            f"error: {NEXTPNR_OPTS_VAR}={value!r} is missing {REQUIRED_NEXTPNR_FLAG}, "
+            "and the ECP5 build does not close timing without it. Add "
+            f"'{REQUIRED_NEXTPNR_FLAG} 60' to {NEXTPNR_OPTS_VAR}, or unset it."
         )
 
 

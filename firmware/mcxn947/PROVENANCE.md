@@ -3,7 +3,7 @@
 Target: **FRDM-MCXN947** (MCXN947VDF, dual Cortex-M33), replacing the CH32H417 on
 the PMOD-A injection link. Design: `docs/MCXN947_CONTROLLER.md`.
 
-**This tree implements migration step 7 of that document's section 9** — two
+**This tree implements migration step 7 of that document's section 9**, in two
 images: clock, blink, LPSPI6 as an SPI slave on LP_FLEXCOMM6 driven by a
 self-loading eDMA0 scatter-gather ring that transmits a permanently IDLE slot,
 retirement of every received slot through `src/link_retire.c`, ERR051588
@@ -31,7 +31,7 @@ registers over JTAG, each over a window rather than as a single reading:
 `spi_bad_sof`, `spi_bad_crc`, `spi_bad_length`, `spi_bad_type` and
 `spi_queue_full` were flat in all three, `link_losses` did not move, and no
 counter on the MCU's own console grew during any window. Configuration (a)
-**failed on the first attempt** — see the boot-loop finding below — and passes
+**failed on the first attempt** (see the boot-loop finding below) and passes
 only because of `core1_image_valid()`.
 
 Everything under `vendor/` is imported unmodified and is exempted from the
@@ -39,13 +39,13 @@ repository whitespace gate by `.gitattributes`. Do not reformat it.
 
 ---
 
-## Upstream 1 — MCUXpresso SDK for FRDM-MCXN947
+## Upstream 1: MCUXpresso SDK for FRDM-MCXN947
 
 - **Version: 24.12.00**, revision `871`, dated 2025-01-14. Read from the
   package's own manifest, `FRDM-MCXN947_manifest_v3_15.xml`:
   `<ksdk id="MCUXpresso241200" version="24.12.00" revision="871 2025-01-14"/>`.
   The manifest's own `sdk repo commit` field reads literally `TODO`, so there is
-  **no upstream git commit to record** — the version and revision above are the
+  **no upstream git commit to record**. The version and revision above are the
   whole of the identification NXP ships.
 - **Licence: BSD-3-Clause** (`vendor/mcux-sdk/COPYING-BSD-3`). CMSIS carries
   Apache-2.0 (`vendor/mcux-sdk/CMSIS/LICENSE.txt`).
@@ -69,13 +69,13 @@ Imported unchanged:
 | `vendor/mcux-sdk/devices/MCXN947/drivers/fsl_{clock,spc,gpio}.{c,h}` | `devices/MCXN947/drivers/` |
 | `vendor/mcux-sdk/devices/MCXN947/drivers/fsl_reset.c` | `devices/MCXN947/drivers/` |
 | `vendor/mcux-sdk/devices/MCXN947/drivers/fsl_lpflexcomm.{c,h}` | `devices/MCXN947/drivers/` |
-| `vendor/mcux-sdk/devices/MCXN947/drivers/fsl_edma.{c,h}`, `fsl_edma_core.h`, `fsl_edma_soc.h` | `devices/MCXN947/drivers/` (`fsl_edma_soc.c` **removed at step 3** — see deviation 8) |
+| `vendor/mcux-sdk/devices/MCXN947/drivers/fsl_edma.{c,h}`, `fsl_edma_core.h`, `fsl_edma_soc.h` | `devices/MCXN947/drivers/` (`fsl_edma_soc.c` **removed at step 3**; see deviation 8) |
 | `vendor/mcux-sdk/devices/MCXN947/drivers/fsl_flexio{,_mculcd,_mculcd_edma}.{c,h}` | `devices/MCXN947/drivers/` |
 | `vendor/mcux-sdk/components/video/fsl_video_common.{c,h}` | `components/video/` |
 | `vendor/mcux-sdk/components/video/display/dbi/fsl_dbi.{c,h}` | `components/video/display/dbi/` |
 | `vendor/mcux-sdk/components/video/display/dbi/flexio/fsl_dbi_flexio_edma.{c,h}` | `components/video/display/dbi/flexio/` |
 | `vendor/mcux-sdk/components/display/st7796s/fsl_st7796s.{c,h}` | `components/display/st7796s/` |
-| `vendor/mcux-sdk/devices/MCXN947/drivers/fsl_lpspi.h` | `devices/MCXN947/drivers/` (**header only** — see deviation 4) |
+| `vendor/mcux-sdk/devices/MCXN947/drivers/fsl_lpspi.h` | `devices/MCXN947/drivers/` (**header only**; see deviation 4) |
 | `vendor/mcux-sdk/boards/frdmmcxn947/project_template/{clock_config.c,clock_config.h,board.h}` | same |
 
 `periph/` is taken whole, not pruned: `MCXN947_cm33_core0.h` includes all 78
@@ -92,7 +92,7 @@ price of the guarantee.
   locally rather than importing the rest of `fsl_common_arm.c` (deviation 17).
   Nothing calls `SDK_Malloc` or `InstallIRQHandler`. Both sources were copied in
   while step 2 was being built and then deleted again once the link proved it
-  did not reference either — an unused vendored file is a file nobody has read.
+  did not reference either. An unused vendored file is a file nobody has read.
 
   `fsl_reset.c` **is** now imported: `LP_FLEXCOMM_Init()` calls
   `RESET_ClearPeripheralReset()` to bring FlexComm6 out of reset.
@@ -102,24 +102,24 @@ price of the guarantee.
   deviation below. `pin_mux.c` configures the camera, the display and the
   Arduino headers as well as the LEDs. `board.h` **is** imported, because it is
   the authoritative record of the FRDM LED pinout.
-- **Every driver the design lists for a *later* step** — `fsl_ctimer`,
+- **Every driver the design lists for a *later* step**: `fsl_ctimer`,
   `fsl_wwdt`, `fsl_inputmux*`, `fsl_cache`, `fsl_mailbox`,
   `fsl_sema42`. An unused vendored driver is a file nobody has read; each
   arrives with the step that calls it. `fsl_edma*` and `fsl_lpflexcomm` left
   this list at step 2, and `fsl_flexio*` left it at step 7.
-- **`fsl_lpspi.c` and `fsl_lpspi_edma.c`** — excluded deliberately, not
+- **`fsl_lpspi.c` and `fsl_lpspi_edma.c`**: excluded, not
   deferred; only `fsl_lpspi.h` is imported. See deviation 4.
-- **`fsl_edma_soc.c`** — imported at step 2, **removed at step 3**. Only
+- **`fsl_edma_soc.c`**: imported at step 2, **removed at step 3**. Only
   `fsl_edma_soc.h` remains. See deviation 8; it is a collision, not a
   preference.
-- **`middleware/usb/phy/usb_phy.{c,h}` — REJECTED at step 4, not deferred.**
+- **`middleware/usb/phy/usb_phy.{c,h}`: REJECTED at step 4, not deferred.**
   Design doc section 7 lists it as "the only file from `middleware/usb/`". It
   cannot be that, and the dependency chain was measured rather than guessed:
   `usb_phy.c`'s first include is `usb.h`, which it needs for three enumerators
   (`kUSB_ControllerEhci0`, `kStatus_USB_Success`, `kStatus_USB_Error`), plus
   `kUSB_ControllerIp3516Hs0/1` and `kUSB_ControllerLpcIp3511Hs0/1` in a branch
   that is dead on this part. `middleware/usb/include/usb.h` in turn includes
-  `usb_misc.h`, `usb_spec.h` and `fsl_os_abstraction.h` — 944 lines of the NXP
+  `usb_misc.h`, `usb_spec.h` and `fsl_os_abstraction.h`, 944 lines of the NXP
   USB stack's common headers and the OSA layer, both of which the same section
   excludes by name. So vendoring "one file" would in fact vendor four headers
   plus an OS abstraction, to obtain roughly forty lines of `USBPHY` register
@@ -129,9 +129,9 @@ price of the guarantee.
   `src/usb_console.c`. See deviation 9 for why that is defensible rather than
   a shortcut: two independent upstreams state the same sequence register for
   register.
-- **`boot_multicore_slave.c`** — rejected at step 5 rather than imported; see
+- **`boot_multicore_slave.c`**: rejected at step 5 rather than imported; see
   deviation 13.
-- **`fsl_dbi_flexio_smartdma`** — rejected outright, not deferred. SmartDMA is a
+- **`fsl_dbi_flexio_smartdma`**: rejected outright, not deferred. SmartDMA is a
   third bus master and admitting it would put an engine nobody has reasoned
   about against the link's arbitration budget (design doc section 7).
 - **The NXP USB device stack, FreeRTOS, lwIP, mbedTLS, LVGL/emWin, MCMgr.**
@@ -141,7 +141,7 @@ price of the guarantee.
 
 ---
 
-## Upstream 2 — NXP hal_nxp (mcux-sdk classic layout)
+## Upstream 2: NXP hal_nxp (mcux-sdk classic layout)
 
 - **Commit `9dc7449014a7380355612453b31be479cb3a6833`** (2025-02-25,
   "hal_nxp: Include LP Flexcomm driver using the right Kconfig"). This is the
@@ -157,12 +157,12 @@ Imported unchanged into `vendor/hal_nxp/devices/MCXN947/gcc/`:
 - `startup_MCXN947_cm33_core0.S`
 - `startup_MCXN947_cm33_core1.S`
 
-**Why a second upstream at all — verified, not assumed.** SDK 24.12.00 ships no
+**Why a second upstream at all: verified, not assumed.** SDK 24.12.00 ships no
 GNU linker script and no `.S` startup for this part. `find` over the whole
 unpacked package returns `.ld` files only under `middleware/mcuboot_opensource`
 and `middleware/tfm`, none for MCXN947, and `devices/MCXN947/` has no `gcc/`
-directory at all — only `mcuxpresso/startup_mcxn947_cm33_core{0,1}.{c,cpp}`,
-which are the MCUXpresso-IDE managed-linker startups. The design doc's section 7
+directory at all (only `mcuxpresso/startup_mcxn947_cm33_core{0,1}.{c,cpp}`,
+which are the MCUXpresso-IDE managed-linker startups). The design doc's section 7
 claim is confirmed.
 
 **The core1 pair is linked by migration step 5.** It forms a separate ELF at
@@ -170,7 +170,7 @@ claim is confirmed.
 
 ### Mixing the two upstreams is safe, and this is the check that says so
 
-hal_nxp at this commit is a **different SDK vintage** from 24.12.00 — its
+hal_nxp at this commit is a **different SDK vintage** from 24.12.00: its
 `MCXN947_cm33_core0.h` is a 4.6 MB monolith where 24.12.00's is a 3.4 KB shim
 over `periph/`, and its `fsl_clock.{c,h}` differ by thousands of lines. So only
 the four `gcc/` files are taken from it; every header and driver comes from the
@@ -181,7 +181,7 @@ vintage would put handlers in the wrong NVIC slots and nothing would say so.
 Checked by diffing the hal_nxp `.S` vector block against SDK 24.12.00's own
 `mcuxpresso/startup_mcxn947_cm33_core0.c` `g_pfnVectors[]`: **172 entries, same
 order, no slot inserted or removed.** Four spot-checks of slot index against the
-SDK's `IRQn_Type` all agree — `EDMA_0_CH0` 1, `CTIMER2` 34, `LP_FLEXCOMM6` 41,
+SDK's `IRQn_Type` all agree: `EDMA_0_CH0` 1, `CTIMER2` 34, `LP_FLEXCOMM6` 41,
 `QDC0_COMPARE` 124.
 
 Three naming divergences, all at slots this firmware does not use:
@@ -197,17 +197,17 @@ Three naming divergences, all at slots this firmware does not use:
 
 ---
 
-## Upstream 3 — hathach/tinyusb
+## Upstream 3: hathach/tinyusb
 
 - **Tag `0.20.0`**, commit `3af1bec1a9161ee8dec29487831f7ac7ade9e189`,
-  2025-11-20. A real release tag, as design doc section 7 requires — not the
+  2025-11-20. A real release tag, as design doc section 7 requires, not the
   commit pin its fallback wording allows for.
 - **Licence: MIT** (`vendor/tinyusb/LICENSE`). **This is the third licence in
   this tree**, alongside the SDK's BSD-3-Clause and CMSIS's Apache-2.0. Any
   distribution of this firmware now has to carry all three.
 - **Copied from:** the local clone at `~/code/tinyusb`, read-only, with
-  `git archive`. That clone's working tree was on `0.18.0-309-g2a364ca27` — a
-  mid-development merge, not a release — and it was left exactly where it was.
+  `git archive`. That clone's working tree was on `0.18.0-309-g2a364ca27` (a
+  mid-development merge, not a release), and it was left exactly where it was.
   No checkout, no worktree, no fetch.
 
 ### Why 0.20.0
@@ -216,7 +216,7 @@ It is the newest release tag in that clone (0.19.0 is 2025-10-06, 0.20.0 is
 2025-11-20) and the clone's own HEAD is an ancestor of it, so pinning forward
 to it is a fast-forward rather than a jump onto an unrelated line. All three
 tags carry `src/portable/chipidea/ci_hs/ci_hs_mcx.h`, so MCX HS support is not
-what distinguishes them; taking the newest release is simply the fewest known
+what distinguishes them; taking the newest release means the fewest known
 bugs. Nothing in this firmware depends on a 0.20.0-only API.
 
 ### The extraction, reproducibly
@@ -244,33 +244,33 @@ git -C "$TUSB" archive --format=tar 0.20.0 \
 ```
 
 26 files, ~460 KB. The whole of `src/` is 182 files and 3.5 MB; a subset is
-taken for the same reason the SDK's drivers are — an unused vendored file is a
-file nobody has read — and unlike the SDK's `periph/`, nothing here is a
+taken for the same reason the SDK's drivers are (an unused vendored file is a
+file nobody has read), and unlike the SDK's `periph/`, nothing here is a
 generated header whose includes would break if pruned. Every include in the
 subset is either present or behind a `CFG_TU*` that `src/tusb_config.h` sets
 to 0.
 
 ### Excluded from upstream 3, and why
 
-- **`src/portable/chipidea/ci_fs/`** — the Full Speed device controller.
+- **`src/portable/chipidea/ci_fs/`**: the Full Speed device controller.
   Rejected, not deferred. UM12018: on FRDM-MCXN947 "only the HS USB controller
   and PHY interface is used and it is connected to the USB Type-C connector
-  (J11)"; `USB0_FS` is routed to nothing. Note that `tusb_mcu.h` defines *both*
+  (J11)"; `USB0_FS` is routed to nothing. `tusb_mcu.h` defines *both*
   `TUP_USBIP_CHIPIDEA_FS` and `TUP_USBIP_CHIPIDEA_HS` for `OPT_MCU_MCXN9`, so
   vendoring `dcd_ci_fs.c` as well would compile a second `dcd_init()` and the
-  link would fail — which is the good outcome, but it is worth knowing the
-  exclusion is load-bearing rather than tidiness.
-- **The host stack** (`src/host/`, `hcd_ci_hs.c`, every `*_host.c`) — this is a
+  link would fail, which is the good outcome; the exclusion is
+  load-bearing rather than tidiness.
+- **The host stack** (`src/host/`, `hcd_ci_hs.c`, every `*_host.c`): this is a
   device, and the FPGA owns the host role in this product.
-- **Every class except CDC** — HID, MSC, MIDI, audio, video, net, DFU, vendor,
+- **Every class except CDC**: HID, MSC, MIDI, audio, video, net, DFU, vendor,
   bth, usbtmc, mtp. `CFG_TUD_*` is 0 for all of them, so they would compile to
   nothing; they are absent so that nobody has to check.
-- **`src/typec/`** — USB-PD. The board's Type-C CC logic is a separate
+- **`src/typec/`**: USB-PD. The board's Type-C CC logic is a separate
   PTN5150A in DRP mode (UM12018 Table 11); the MCU does not participate.
-- **All OSAL backends except `osal_none.h`** — no RTOS on CPU0.
-- **`hw/`, `examples/`, `tools/`, `docs/`, `test/`** — the whole of TinyUSB's
+- **All OSAL backends except `osal_none.h`**: no RTOS on CPU0.
+- **`hw/`, `examples/`, `tools/`, `docs/`, `test/`**: the whole of TinyUSB's
   own build and board-support tree. `hw/bsp/mcx/family.c` was *read* while
-  writing `usb_console_hardware_init()` (deviation 9) and deliberately not
+  writing `usb_console_hardware_init()` (deviation 9) and not
   imported: it is board glue for TinyUSB's example build system, it configures
   LEDs and a UART this firmware already owns, and it would arrive with
   `board.h`, `pin_mux.c` and `clock_config.c` for a different clock profile
@@ -280,7 +280,7 @@ to 0.
 
 ## Local deviations
 
-Each is a change *we* made, or a vendor behaviour we deliberately did not adopt.
+Each is a change *we* made, or a vendor behaviour we chose not to adopt.
 
 1. **`BOARD_PowerMode_OD()` is reimplemented in `src/platform.c`, not vendored.**
    The SDK's version lives in `boards/frdmmcxn947/project_template/board.c`
@@ -289,7 +289,7 @@ Each is a change *we* made, or a vendor behaviour we deliberately did not adopt.
    `SPC_SetSRAMOperateVoltage` to `kSPC_sramOperateAt1P2V` with
    `requestVoltageUpdate`. `board.c` as a whole includes `fsl_debug_console.h`,
    `fsl_lpi2c.h` and `fsl_lpflexcomm.h` and carries the camera, codec and
-   accelerometer I2C helpers — none of which step 1 has any use for.
+   accelerometer I2C helpers, none of which step 1 has any use for.
    `platform_power_mode_overdrive()` performs exactly the same two calls with
    the same arguments. If `board.c` is ever vendored for another reason, delete
    ours and call theirs.
@@ -298,14 +298,14 @@ Each is a change *we* made, or a vendor behaviour we deliberately did not adopt.
    with `AT(__DATA_ROM)`, so its load address in `m_text` (RX) and its virtual
    address in `m_data` (RW) end up in one LOAD segment, which `ld` 14.2.1
    reports as RWX on every link. The script is byte-exact and the layout is
-   deliberate, so the flag is suppressed at the link rather than the script
+   intended, so the flag is suppressed at the link rather than the script
    being patched.
 
 3. **`-Wl,--defsym,__use_shmem__=1`.** Both vendored scripts already declare
    `RPMSG_SHMEM_SIZE = DEFINED(__use_shmem__) ? 0x2000 : 0`, reserve
    `rpmsg_sh_mem` at `0x2004E000 - RPMSG_SHMEM_SIZE`, exclude it from `m_data`,
    and emit a `.noinit_rpmsg_sh_mem (NOLOAD)` section. We set the symbol to
-   reuse **RPMsg's address reservation, not RPMsg** — the CPU0 -> CPU1 snapshot
+   reuse **RPMsg's address reservation, not RPMsg**. The CPU0 -> CPU1 snapshot
    goes there at step 6, and reserving it from step 1 stops CPU0's data growing
    into it in the meantime. Both `.ld` files stay byte-exact.
    `make check`'s `shared-window-reserved` rung asserts the defsym survived.
@@ -316,7 +316,7 @@ Each is a change *we* made, or a vendor behaviour we deliberately did not adopt.
 
    `LPSPI_SlaveInit()` is close to what we want but not close enough to adopt:
    it writes `TCR` wholesale from four fields (`CPOL | CPHA | LSBF | FRAMESZ`),
-   which clears `TCR[BYSW]`, and it ends by enabling the module — so using it
+   which clears `TCR[BYSW]`, and it ends by enabling the module, so using it
    would mean calling it, disabling the module again, rewriting `TCR`, and
    re-enabling, for no gain over the fifteen register writes `link_spi_init()`
    performs in a single documented order. Excluding the `.c` also keeps its
@@ -342,7 +342,7 @@ Each is a change *we* made, or a vendor behaviour we deliberately did not adopt.
    the two controllers can be diffed against each other until step 10 retires
    `firmware/ch32h417/`. `spi_frame.c` is 141 lines with no MMIO and includes
    only `spi_frame.h` and `<stddef.h>`, so it ports unchanged rather than being
-   reimplemented — the CRC-16, slot pack/unpack and sequence classification are
+   reimplemented. The CRC-16, slot pack/unpack and sequence classification are
    hand-written per language and a second hand-written C copy would be a third
    implementation to keep in step, not a second.
 
@@ -354,14 +354,14 @@ Each is a change *we* made, or a vendor behaviour we deliberately did not adopt.
    the repository would notice a divergence here.
 
 7. **`fsl_edma_soc.c` is not vendored; only `fsl_edma_soc.h` is.** Removed at
-   step 3, and not as tidying — it made the link fail.
+   step 3, and not as tidying: it made the link fail.
 
    The file defines **nothing but** 32 strong
    `EDMA_<n>_CH<m>_DriverIRQHandler` wrappers around
    `EDMA_DriverIRQHandler(instance, channel)`, which dispatches through the
    transactional handle array `s_EDMAHandle[][]`. Verified with `nm`: every
    symbol it defines is one of those 32, and its only undefined reference is
-   `EDMA_DriverIRQHandler` itself. Nothing else in the tree needs it —
+   `EDMA_DriverIRQHandler` itself. Nothing else in the tree needs it;
    `EDMA_SetChannelMux` and the rest are `static inline` in `fsl_edma.h`.
 
    Step 3's RX retirement ISR must be named `EDMA_0_CH1_DriverIRQHandler`,
@@ -369,12 +369,12 @@ Each is a change *we* made, or a vendor behaviour we deliberately did not adopt.
    that branches to the Driver name and it is the Driver name that
    `startup_MCXN947_cm33_core0.S` `.set`s to `DefaultISR` (see the step-1
    findings below). The vendor's strong definition of that same symbol makes
-   the link fail outright — which is the good outcome. Taking the trampoline
+   the link fail outright, which is the good outcome. Taking the trampoline
    name instead would have linked silently and left the other 31 in place.
 
    Those 31 were never inert. `EDMA_HandleIRQ()` opens with
    `assert(handle != NULL)`, SDK `assert()` is live in this image, and
-   `nosys.specs` makes newlib's failure path hang rather than reset — so every
+   `nosys.specs` makes newlib's failure path hang rather than reset, so every
    one of those vectors was a latent hang behind any eDMA interrupt a later
    step enabled with the transactional API unused. Step 2 enabled none, so
    nothing showed. The weak `.set`-to-`DefaultISR` entries in the startup file
@@ -405,7 +405,7 @@ Each is a change *we* made, or a vendor behaviour we deliberately did not adopt.
    `CLOCK_EnableUsbhsPhyPllClock(kCLOCK_Usbphy480M, 24000000)`;
    `CLOCK_EnableUsbhsClock()`. TinyUSB then inlines exactly the body of
    `USB_EhciPhyInit()` for a part with neither `FSL_FEATURE_SOC_ANATOP_COUNT`
-   nor `FSL_FEATURE_SOC_CCM_ANALOG_COUNT` — `TRIM_OVERRIDE_EN = 0x1f`,
+   nor `FSL_FEATURE_SOC_CCM_ANALOG_COUNT`: `TRIM_OVERRIDE_EN = 0x1f`,
    `CTRL |= ENUTMILEVEL2 | ENUTMILEVEL3`, `PWD = 0`, then the `TX` trim. Ours
    is that same body.
 
@@ -418,7 +418,7 @@ Each is a change *we* made, or a vendor behaviour we deliberately did not adopt.
    **One interaction worth flagging to whoever touches power management next.**
    That `ACTIVE_CFG` write happens *after* `platform_init()` has already taken
    the part to overdrive for LPSPI6's 30 MHz slave ceiling. The levels it
-   writes — `DCDC_VDD_LVL(3)`, `CORELDO_VDD_LVL(3)` — are the same overdrive
+   writes (`DCDC_VDD_LVL(3)`, `CORELDO_VDD_LVL(3)`) are the same overdrive
    levels, so it neither raises nor lowers the rail the link depends on; what
    it adds is `SYSLDO_VDD_DS` and `ACTIVE_VDELAY` for the PHY's analogue
    supply. If the core voltage policy is ever changed, these two writes have to
@@ -426,15 +426,15 @@ Each is a change *we* made, or a vendor behaviour we deliberately did not adopt.
    optimisation here silently becomes a protocol violation on the link.
 
 10. **`src/usb_descriptors.c` and `src/usb_console.c` are built with
-    `GLUE_WARNINGS`, not `APP_WARNINGS` — `-Wconversion` is dropped for those
+    `GLUE_WARNINGS`, not `APP_WARNINGS`; `-Wconversion` is dropped for those
     two objects only.** Both include `tusb.h`, and the warning fires inside
     TinyUSB's own descriptor macros (`TUD_CDC_DESCRIPTOR` packs 16-bit fields
-    through `U16_TO_U8S_LE`, and `tu_htole16` and friends narrow deliberately).
+    through `U16_TO_U8S_LE`, and `tu_htole16` and friends narrow on purpose).
     They are vendored and may not be edited, and `-isystem` does not suppress a
     warning raised by a macro expanded in our translation unit. Everything else
     in the app set still applies, `-Werror` included. Nothing in the app's own
-    code needed the relaxation; `src/console.c` — the half that carries the
-    logic — is built with the full `APP_WARNINGS` and has no TinyUSB include at
+    code needed the relaxation; `src/console.c`, the half that carries the
+    logic, is built with the full `APP_WARNINGS` and has no TinyUSB include at
     all.
 
 11. **The debug UART survives step 4.** `src/dbg_uart.c`'s own header says it
@@ -442,7 +442,7 @@ Each is a change *we* made, or a vendor behaviour we deliberately did not adopt.
     comment said the same. It stays, for two measured reasons rather than
     sentiment. The console is carried on the USB that the console is the
     instrument for debugging, so a USB fault removes the instrument exactly
-    when it is needed — while the UART is a different peripheral, a different
+    when it is needed, while the UART is a different peripheral, a different
     connector and a different host cable (MCU-Link VCOM on J17, not J11). And
     step 4's gates are *boot-rate* measurements against the 20% boot hazard, so
     the channel that reports them has to be live from `link_init()` onward,
@@ -450,7 +450,7 @@ Each is a change *we* made, or a vendor behaviour we deliberately did not adopt.
     a one-line USB status report on that UART at 1 Hz for the same reason: a
     console cannot report its own absence.
 
-12. **The vendored `system_MCXN947_cm33_core1.c` is deliberately not linked.**
+12. **The vendored `system_MCXN947_cm33_core1.c` is not linked.**
     It remains byte-exact in the tree as the reference we deviated from. Its
     weak `SystemInit()` does not merely initialize CPU1: it writes ten
     chip-wide locations in SYSCON, SPC0, GDET0/1 and ITRC0, including an RMW of
@@ -463,7 +463,7 @@ Each is a change *we* made, or a vendor behaviour we deliberately did not adopt.
 
 13. **`boot_multicore_slave.c` is reimplemented as `src/core1_release.c`, not
     vendored.** The design doc says it is already in the vendor set; it is not.
-    More importantly, the SDK file is gated on `__MULTICORE_MASTER` and refers
+    The SDK file is also gated on `__MULTICORE_MASTER` and refers
     to `__core_m33slave_START__`, which the byte-exact core0 linker script does
     not define because this build uses two separate images. Our module performs
     the same CPBOOT/CPUCTRL transaction from one CPUCTRL read, using the
@@ -589,12 +589,12 @@ observed on the board.
   with an eDMA1 transfer potentially in flight to the panel. Over the following
   40 s the link was untouched: `spi_slots` 8026.10/s, every `spi_bad_*` and
   `spi_queue_full` at +0, `link_losses` 0, no console counter growth.
-  `snapshot_seq` kept advancing at 15,376/s with no reader at all — §5's
+  `snapshot_seq` kept advancing at 15,376/s with no reader at all; that is §5's
   requirement that the writer never wait on CPU1, shown rather than argued.
 
-- **`panel=` distinguishes ABSENT from ok.** CPU1 deliberately keeps its
+- **`panel=` distinguishes ABSENT from ok.** CPU1 keeps its
   heartbeat, echo and LED running when `display_init()` fails, which is correct
-  — those are how CPU0 observes CPU1 at all — but it also means a blank screen
+  (those are how CPU0 observes CPU1 at all), but it also means a blank screen
   with a live heartbeat is otherwise indistinguishable from a panel that was
   never detected. The flag word costs nothing and removes that ambiguity.
 
@@ -650,18 +650,18 @@ track on the console while the blue LED cycles. No result is claimed here.
   on hardware 2026-09-16 over a 43 s window, CPU0 publishing at ~8 kHz and CPU1
   reading at ~20 Hz: CPU1's echoed `slot_counter` tracked CPU0's live value
   continuously, lagging 105 slots (13.1 ms, which is the sampling interval and
-  not staleness), with **`snapshot_fail = 0`** — not one bounded read gave up.
+  not staleness), with **`snapshot_fail = 0`**. Not one bounded read gave up.
   LPCAC stayed enabled and the window stayed at 0x2004C000; none of §5's
   escalation steps (`__DSB()`, disabling LPCAC, moving to SRAMX) were needed.
 
 - **The echo beats the LED as an instrument.** §5 proposed watching
   `slot_counter` on the panel, and §9 step 6 proposes the RGB LED. Both need a
-  human looking at the board and yield no number. `cpu1_seen_slot_counter` — a
-  word CPU1 writes with the value it actually read — turns the coherency
+  human looking at the board and yield no number. `cpu1_seen_slot_counter`, a
+  word CPU1 writes with the value it actually read, turns the coherency
   question into two numbers on the console that either track or do not. It is
   the same category as the CPU1 heartbeat that §3 already endorses: data CPU0
   observes and never waits on. The LED is still there and still
-  animates from the slot counter; it is simply no longer the only evidence.
+  animates from the slot counter; it is no longer the only evidence.
 
 - **§5's snapshot struct does not add up to the size it claims.** The named
   fields total 28 bytes, so the `_pad[3]` shown gives 28 and not the 32 the
@@ -680,14 +680,14 @@ track on the console while the blue LED cycles. No result is claimed here.
 
 - **Both cores necessarily share the clock-gate registers, and the boot ladder
   is what makes that safe.** CPU1 calling `CLOCK_EnableClock(kCLOCK_Port1)` is a
-  read-modify-write on a chip-wide SYSCON register — the same *category* of
+  read-modify-write on a chip-wide SYSCON register, the same *category* of
   write step 5 rejected in CPU1's SystemInit. The difference is real: enabling a
   gate for a peripheral CPU1 exclusively owns affects nothing CPU0 uses, whereas
   SystemInit re-ran chip policy (core LDO, glitch detect, RAM ECC, flash cache)
   that CPU0 had already set. It is race-free specifically because §4(a) releases
   CPU1 at rung 8, strictly after CPU0 has finished all of its own clock setup.
   **This gets sharper at step 7**, where §2's display pins put CS (P0_12),
-  D/C (P0_7), WR (P0_9) and RD (P0_8) on Port 0 — the port whose GPIO registers
+  D/C (P0_7), WR (P0_9) and RD (P0_8) on Port 0, the port whose GPIO registers
   CPU0's LED code is still writing at 1 Hz. §2 notes that no J8 pin is on Port 3
   "so there is zero physical overlap with the link", which is true and is not
   the same claim as §4(b)'s "disjoint pins": the *pins* are disjoint, the *port
@@ -722,7 +722,7 @@ track on the console while the blue LED cycles. No result is claimed here.
   This was found by the real target compile, not inferred from the core name;
   deviation 14 records the safe resolution.
 
-- **The release checker must inspect emitted code, not source intent — and it
+- **The release checker must inspect emitted code, not source intent, and it
   is the checker that must bend.** GCC 14.2.1 at `-Os` encodes both 0x50000000
   and 0x000C0000 as Thumb-2 modified immediates, so neither reaches the literal
   pool, and a rung 6 that read only `.word` entries failed a perfectly correct
@@ -749,15 +749,15 @@ track on the console while the blue LED cycles. No result is claimed here.
   written. Section 4 claims that if CPU1 "was never flashed at all, the FPGA
   link runs normally"; measured on the bench, it does not. With the core1
   region blank, both vector words read 0xFFFFFFFF, CPU1 faults on its first
-  fetch, escalates to LOCKUP, and takes CPU0 down with it — **CPU0 boot-looped
+  fetch, escalates to LOCKUP, and takes CPU0 down with it. **CPU0 boot-looped
   continuously**, re-running `link_init()` forever, with the link never
   reaching steady state. Configuration (a) of section 9 step 5 failed outright
   on the first attempt.
 
   `core1_image_valid()` (deviation 15) is the fix: CPU0 reads the two vector
   words and declines to release CPU1 unless they are a plausible pair. That is
-  a validity check on a flash image, not a handshake — it reads two words and
-  waits for nothing — so section 8's objection to MCMgr does not apply. With
+  a validity check on a flash image, not a handshake (it reads two words and
+  waits for nothing), so section 8's objection to MCMgr does not apply. With
   the check in place configuration (a) passes with every counter flat.
 
   **The lockup-to-reset path itself is inferred, not confirmed against the RM.**
@@ -768,7 +768,7 @@ track on the console while the blue LED cycles. No result is claimed here.
 - **A halted MCU is indistinguishable from the boot-random frame offset, from
   the FPGA side.** When LinkServer leaves the part stopped, `mcu_ready` floats
   high, so the FPGA believes the link is up, validates every returned slot, and
-  gets nothing — producing `spi_bad_sof` saturated 1:1 with `spi_slots`, which
+  gets nothing, producing `spi_bad_sof` saturated 1:1 with `spi_slots`, which
   section 10 documents as the signature of the boot-random frame offset. The
   two are told apart by the debug UART: a mis-framed board still reaches its
   foreground loop and still prints its periodic report, and a halted one prints
@@ -786,9 +786,9 @@ track on the console while the blue LED cycles. No result is claimed here.
 
 - **`cpu1halt` / `cpu1start` exist because the debugger could not do it.**
   Section 9 step 5 configuration (c) asks for CPU1 halted in the debugger.
-  LinkServer's gdbserver attached to `cm33_core1` without ever stopping it —
-  the heartbeat kept advancing at 720/s through a supposed halt, so an early
-  (c) "pass" was really a second measurement of (b) — and it reported
+  LinkServer's gdbserver attached to `cm33_core1` without ever stopping it.
+  The heartbeat kept advancing at 720/s through a supposed halt, so an early
+  (c) "pass" was really a second measurement of (b). It also reported
   `pc = 0x00000000` while reading the shared window correctly over the same
   connection. CPU0 re-asserting CPU1's reset is deterministic, repeatable,
   needs no debugger, and is harsher than a debugger halt because reset is
@@ -797,11 +797,11 @@ track on the console while the blue LED cycles. No result is claimed here.
   data-only IPC rule. Section 3 asks for re-release to sit behind an explicit
   console command in any case; `cpu1start` is that command.
 
-- **Every hardware reading must come from a board you just deliberately reset,
+- **Every hardware reading must come from a board you have just reset yourself,
   captured from the moment of reset.** A board whose recent history includes a
   debugger attach reports nonsense: one mid-session sample showed no UART
   output, no USB enumeration and saturated `spi_bad_sof`, which read as a hard
-  failure and was simply a part left halted by an earlier attach. The same
+  failure and was a part left halted by an earlier attach. The same
   configuration measured clean immediately afterwards when the capture started
   at the reset. This is the step-5 restatement of section 10's rule that a
   single reading is one draw from a distribution.
@@ -813,7 +813,7 @@ track on the console while the blue LED cycles. No result is claimed here.
 - **The USB vector on this board is `USB1_HS`, not `USB0`.** Worth stating
   because "USB0" is the obvious guess and it is wrong twice over. UM12018: "only
   the HS USB controller and PHY interface is used and it is connected to the USB
-  Type-C connector (J11)" — `USB0_FS` (vector 50) is routed to nothing on the
+  Type-C connector (J11)". `USB0_FS` (vector 50) is routed to nothing on the
   FRDM board. The vector that matters is `USB1_HS_IRQn`, 67, and the retention
   root is `USB1_HS_DriverIRQHandler`, not the weak trampoline
   `USB1_HS_IRQHandler` that the table actually names. `make check` reports it as
@@ -831,7 +831,7 @@ track on the console while the blue LED cycles. No result is claimed here.
   The trap is that **`ci_hs_mcx.h` ignores the number**. `CI_HS_REG(port)` casts
   `(void) port` away and returns `_ci_controller[0]` unconditionally, and
   `CI_DCD_INT_ENABLE`/`DISABLE` do the same. So the DCD would work with rhport
-  0; what breaks is everything above it — `TUD_OPT_RHPORT` is derived from which
+  0; what breaks is everything above it: `TUD_OPT_RHPORT` is derived from which
   `CFG_TUSB_RHPORTn_MODE` is defined, `tusb_int_handler()` range-checks against
   `TUP_USBIP_CONTROLLER_NUM` (2, from `tusb_private.h`), and the ISR's argument
   has to match the port the stack was initialised on. A wrong number here fails
@@ -849,9 +849,9 @@ track on the console while the blue LED cycles. No result is claimed here.
   exist: `firmware/ch32h417/src/usb_cdc_fs.c` is 644 lines of pure USBFS
   endpoint transport with no parser, its header describes the channel as
   carrying "kmbox-style injection text" that was never written, and
-  `main_v5f.c` calls only `cdc_fs_init()` / `cdc_fs_poll()` — it never reads a
+  `main_v5f.c` calls only `cdc_fs_init()` / `cdc_fs_poll()`; it never reads a
   byte out of the RX ring. The actual precedent for what a console should say
-  is step 3's `link_report()` on the debug UART, so `stats` deliberately mirrors
+  is step 3's `link_report()` on the debug UART, so `stats` mirrors
   that line's field names and grouping.
 
 - **The collapse is real but it is not 17 lines, and the useful number is a
@@ -866,7 +866,7 @@ track on the console while the blue LED cycles. No result is claimed here.
 
 - **Two comments in `link.c` asserted something step 3's own experiment had
   already disproved, and are corrected here.** Both said, in different words,
-  that the framing monitor plus the section 4 ladder repair a mis-framed boot —
+  that the framing monitor plus the section 4 ladder repair a mis-framed boot,
   one of them concluding "alignment converges rather than depending on a lucky
   boot". The 20-boot experiment that closed step 3 found the opposite and this
   file records it: the ladder ran ~220 times against one mis-framed boot without
@@ -882,13 +882,16 @@ track on the console while the blue LED cycles. No result is claimed here.
   `spi_slots` 8000.00/s, `spi_bad_sof` / `spi_bad_crc` / `spi_bad_length` /
   `spi_bad_type` / `spi_queue_full` / `link_losses` / `rx_invalid` all zero over
   a 14.9 s window, `link_ready=1`, `map_active=0`. This isolates the clock and
-  PHY bring-up — which touches `SPC0->ACTIVE_CFG`, the core rail the link's
-  30 MHz slave ceiling depends on — from anything the host does later.
+  PHY bring-up (which touches `SPC0->ACTIVE_CFG`, the core rail the link's
+  30 MHz slave ceiling depends on) from anything the host does later.
 
-- **Any step-4 gate must be measured at least ~70 s after boot, because step 3's
-  provocation demo deliberately breaks the link before then.** `link_demo_step()`
-  arms at `LINK_DEMO_ARM_SLOTS` = 160,000 slots (~20 s at 8 kHz) and then runs
-  two provocation phases of `LINK_DEMO_HOLD_SLOTS` = 80,000 slots (~10 s) each.
+- **On a demo image, any step-4 gate must be measured at least ~70 s after boot,
+  because step 3's provocation demo breaks the link on purpose before then.** The
+  provocation is compiled only when the firmware is built with `make DEMO=1`
+  (`-DHURRA_DEMO=1`). The production image never runs it, and its automatic fault
+  monitor is armed at all times. In a demo image `link_demo_step()` arms at
+  `LINK_DEMO_ARM_SLOTS` = 160,000 slots (~20 s at 8 kHz) and then runs two
+  provocation phases of `LINK_DEMO_HOLD_SLOTS` = 80,000 slots (~10 s) each.
   Measured, the cost of getting this wrong: a 22.9 s FPGA window started ~30 s
   after a reflash read `spi_bad_sof` at 173.97/s and `link_losses` 6 and
   verdicted FAIL, while the identical measurement taken after the demo had
@@ -902,17 +905,17 @@ track on the console while the blue LED cycles. No result is claimed here.
   on this board is one draw from a distribution with a 20% failure mode, so the
   step-4 image was re-flashed and re-measured six times with the step-3 method
   (`vcom.py` across the flash, anchored on the boot banner, verdict from the
-  last report inside the window and before the deliberate provocations at
+  last report inside the window and before the provocations at
   ~41 s). Every trial: `sof=0 recov=0 framing=0`, ~109,310 slots retired in
   13.7 s (7,964/s MCU-side), and `init=ok` on the USB line. Against step 3's
   20/20 with the gap wait this is consistent and adds no evidence of harm,
-  though six trials cannot detect a small change in a 20% rate — it rules out a
+  though six trials cannot detect a small change in a 20% rate; it rules out a
   gross regression, not a subtle one.
 
 - **`OTGSC[BSV]` is the field that tells you whether J11 has a cable**, and
   having it on the debug UART is the difference between two diagnoses that look
-  identical from the host. With no cable: `otgsc=0x0021100a` — BSV (bit 11) = 0,
-  BSE (bit 12) = 1 — `PORTSC1[CCS] = 0`, and nothing appears in `/dev`. With a
+  identical from the host. With no cable: `otgsc=0x0021100a`, with BSV (bit 11) = 0 and
+  BSE (bit 12) = 1; `PORTSC1[CCS] = 0`; and nothing appears in `/dev`. With a
   firmware fault the host sees exactly the same nothing. The board does route
   VBUS (UM12018 Table 11: J11 "provides the 5 V power supply (P5V_USB_HS)
   source to the board"), so a 0 there is a bench condition, not a limitation.
@@ -927,8 +930,8 @@ doc. The first contradicts a claim the design doc makes.
   changed, came up 69 bits out and then perfectly aligned. The offset does not
   decay; it held for the entire 20 s the board ran.
 
-  Nothing in any status register says so. No underrun, no overrun, no DMA error
-  — SR reads exactly as it does on a healthy link, because from the
+  Nothing in any status register says so. No underrun, no overrun, no DMA error;
+  SR reads exactly as it does on a healthy link, because from the
   peripheral's point of view nothing went wrong. On the FPGA the only symptom is
   `spi_bad_sof` at 1:1 with `spi_slots`, which step 2 already recorded as the
   saturated, non-discriminating signature of *any* whole-slot corruption. It was
@@ -940,7 +943,7 @@ doc. The first contradicts a claim the design doc makes.
   looked. It was one boot.
 
   `link_spi_enable_aligned()` waits for the inter-frame gap on the chip-select
-  pad before setting `CR[MEN]`, reading it out of `GPIO3->PDIR` — which reflects
+  pad before setting `CR[MEN]`, reading it out of `GPIO3->PDIR`, which reflects
   the pad whatever the PORT mux selects, so the pin is readable as an input at
   the same time as it is wired to PCS0, which `SR[MBF]` cannot do with the
   module disabled.
@@ -953,7 +956,7 @@ doc. The first contradicts a claim the design doc makes.
   | gap wait present | **20 / 20** | 0 |
   | gap wait removed | 16 / 20 | **4 (20%)** |
 
-  Fisher's exact, one-tailed: **p = 0.053** — well supported, and *just* short
+  Fisher's exact, one-tailed: **p = 0.053**: well supported, and *just* short
   of the conventional threshold, so state it as evidence rather than proof. Put
   the other way: if the wait did nothing, twenty clean boots in a row would
   happen 1.1% of the time. An earlier 7-of-7 against 1-of-2 is NOT pooled in;
@@ -961,7 +964,7 @@ doc. The first contradicts a claim the design doc makes.
   combining non-comparable runs to reach significance is how the repo's old
   four-row yosys table became worthless.
 
-  The mechanism is still **not** established — see the next item.
+  The mechanism is still **not** established; see the next item.
 
 - **Three deliberate attempts to reproduce that offset at run time all failed,
   and the link self-heals from every mid-run perturbation tried.** Each was held
@@ -974,14 +977,15 @@ doc. The first contradicts a claim the design doc makes.
   | starve the transmit FIFO (`ERQ` off, 1 s) | sets `SR[TEF]`, then self-heals |
   | steal 3 words from the receive FIFO | receive path re-synchronises |
 
-  So the boundary is **not** simply latched at `CR[MEN]`, and the boot case has
+  So the boundary is **not** set by `CR[MEN]` alone, and the boot case has
   a cause none of these reproduces. The transmit result also qualifies
   ERR051588's "does not self-heal" as the design doc states it: the erratum's
-  own trigger fires — `SR[TEF]` latches, measured three times — but on this part
+  own trigger fires (`SR[TEF]` latches, measured three times), but on this part
   a one-second underrun did not leave the transmit stream corrupt.
 
-  The perturbation is kept in `link.c` as a labelled negative control. A
-  provocation nobody records having tried gets tried again.
+  The perturbation is kept in `link.c` as a labelled negative control,
+  compiled only into a `make DEMO=1` build. A provocation nobody records having
+  tried gets tried again.
 
 - **The framing monitor DETECTS a mis-framed boot but does NOT repair it.**
   This corrects an earlier claim in this file that it was "the backstop that
@@ -1003,13 +1007,13 @@ doc. The first contradicts a claim the design doc makes.
   ```
 
   Every slot failing for the whole window, with the ladder firing once per
-  ~53 ms monitor pass — about 220 times — and never succeeding. **A mis-framed
+  ~53 ms monitor pass, about 220 times, and never succeeding. **A mis-framed
   boot is not recoverable in software on this part; it requires a reset.**
 
   The monitor's one observed success was repairing a *recovery's own* bad
   re-arm: detected and fixed 60 ms later at a cost of 480 bad slots, FPGA-side
   123.9 `spi_bad_sof`/s during the window and 0.0/s after, flat thereafter.
-  That is a real result and worth keeping — but it is a different fault from
+  That is a real result and worth keeping, but it is a different fault from
   the boot offset, and generalising from it was the error.
 
   Consequence for anyone building on this: the gap wait is doing the real work
@@ -1024,7 +1028,7 @@ doc. The first contradicts a claim the design doc makes.
   same reason: rung 5 does not return until the transmit FIFO holds a whole slot
   again, and rung 6 clears `SR` immediately before raising `mcu_ready`. The
   window between the FIFO reset and the refill is one in which the FPGA is still
-  clocking an empty transmit FIFO, so it sets `SR[TEF]` *by construction* — a
+  clocking an empty transmit FIFO, so it sets `SR[TEF]` *by construction*, a
   fault manufactured by the recovery rather than found by it. Leaving it latched
   had the monitor read it on its very next pass and recover forever.
 
@@ -1037,11 +1041,11 @@ doc. The first contradicts a claim the design doc makes.
   one counter and reading the other, at 8 slots per millisecond).
 
 - **The FPGA is not only sending keepalives.** About 1 in 8 slots is a real
-  `INJ_TYPE_REPORT_FRAGMENT` (0x03) carrying a live sequence byte, at ~1 kHz —
+  `INJ_TYPE_REPORT_FRAGMENT` (0x03) carrying a live sequence byte, at ~1 kHz,
   the mouse report rate, matching `native_reports`. Over 68,000 of them the
   classifier reported one sequence gap (across a recovery) and zero duplicates
-  or stales. The design doc describes this direction as telemetry; it is worth
-  recording that it is *populated* from step 3 onwards, because it means the
+  or stales. The design doc describes this direction as telemetry. It is
+  *populated* from step 3 onwards, so the
   sequence classifier is exercised by real traffic rather than only by tests.
 
 - **Printing a shared buffer a byte at a time manufactures evidence.** A 32-byte
@@ -1059,7 +1063,7 @@ Four of these change what the firmware does, and none of them is in the design
 doc. Each was settled from files this tree imports, not from the Reference
 Manual, which is still login-gated and not on disk.
 
-- **`TCR[BYSW]` = 1** — design doc section 10 lists the byte order as "derived,
+- **`TCR[BYSW]` = 1**: design doc section 10 lists the byte order as "derived,
   not measured" and says it resolves at step 2. It resolves to *set*, and the
   vendor states the case directly. The eDMA moves 32-bit words out of a byte
   array on a little-endian core, so the word reaching the FIFO for slot bytes
@@ -1069,8 +1073,8 @@ Manual, which is still login-gated and not on disk.
   "4 3 2 1 8 7 6 5" without the flag and "1 2 3 4 5 6 7 8" with it.
 
   `fsl_lpspi_edma.c` is the corroborating case rather than the same claim
-  twice: on the DMA path there is no software marshalling at all — the engine
-  reads memory straight into `TDR` — and the driver sets `TCR[BYSW]` from that
+  twice: on the DMA path there is no software marshalling at all (the engine
+  reads memory straight into `TDR`), and the driver sets `TCR[BYSW]` from that
   same flag (lines 237-238 and 834-836). That is our situation exactly.
   Confirmed in the built image: `TCR` is the literal `0x004000FF`, i.e.
   `BYSW` set and `FRAMESZ` 255.
@@ -1080,7 +1084,7 @@ Manual, which is still login-gated and not on disk.
   net lands on P3_20 = `FC6_P0` = the LPSPI **SOUT** pad, and its MISO net on
   P3_22 = `FC6_P2` = the **SIN** pad. (`FCn_P0` is SOUT: the SDK's own LPSPI
   slave example labels `PIO0_24/FC1_P0/...` as `LPSPI1_SOUT`.) We are the
-  slave, so we must *read* the MOSI net and *drive* the MISO net — the opposite
+  slave, so we must *read* the MOSI net and *drive* the MISO net, the opposite
   of the default. `PINCFG` 0b11 is "SOUT is used for input data; SIN is used
   for output data", which is precisely that swap. Left at the default 0b00 the
   MCU would drive P3_20 into the FPGA's own driver and listen on a wire nobody
@@ -1103,35 +1107,35 @@ Manual, which is still login-gated and not on disk.
   P3_20/21/22 each list FC8 before FC6, so FC6 is **ALT3** on all three.
   P3_23 lists FC6 *only*, so there FC6_P3 is **ALT2**. Getting that one pin
   wrong leaves PCS0 unconnected, the slave never frames, and the symptom is not
-  an error but total silence with every FPGA counter flat — indistinguishable
+  an error but total silence with every FPGA counter flat, indistinguishable
   from the link never having been attempted.
 
 - **FlexComm6 cannot be clocked from FRO_HF.** `BOARD_BootClockPLL150M` leaves
-  FRO_HF at **48 MHz** — its own YAML header says `{id: FRO_HF_clock.outFreq,
+  FRO_HF at **48 MHz**: its own YAML header says `{id: FRO_HF_clock.outFreq,
   value: 48 MHz}` and its body calls `CLOCK_SetupFROHFClocking(48000000U)`. LP2
   requires SCK <= f_periph/4, so 48 MHz caps SCK at 12 MHz against the 15 MHz
   the FPGA clocks: `kFRO_HF_DIV_to_FLEXCOMM6` would be a silent protocol
   violation, and it is the attach ID someone reaching for "the fast FRO" would
   pick. PLL0 is already at 150 MHz from the same profile, so `link_spi_init()`
-  routes it through PLLCLKDIV — which the board profile does not touch, hence
-  set explicitly — and halves it to 75 MHz. `link.h` static-asserts the
+  routes it through PLLCLKDIV (which the board profile does not touch, hence
+  set explicitly) and halves it to 75 MHz. `link.h` static-asserts the
   >= 4x SCK relation so a later divider edit cannot quietly break it.
 
 - **PORT5/GPIO5 have no clock gate to enable.** `mcu_ready` is P5_7, and
-  `fsl_clock.h`'s `clock_ip_name_t` stops at `kCLOCK_Port4` / `kCLOCK_Gpio4` —
+  `fsl_clock.h`'s `clock_ip_name_t` stops at `kCLOCK_Port4` / `kCLOCK_Gpio4`;
   there is no `kCLOCK_Port5`. This is consistent with design doc section 2
   calling P5_7 "an always-on VDD_BAT pad" when it rejects the pin for timer
   capture, and with the SDK's own `mc_pmsm` example writing `PORT5->PCR[]` with
   no clock enable anywhere. `link.c` therefore enables nothing for this pin.
   **If that turns out to be wrong the failure is silent**: `mcu_ready` stays
-  low, the FPGA latches `transfer_ready` low, and every counter stays flat —
+  low, the FPGA latches `transfer_ready` low, and every counter stays flat,
   which is what a *passing* gate looks like. Read `injection_link.link_ready`
   over JTAG to tell the two apart; it is driven straight from the synchronised
   `mcu_ready` pad (`gateware.py:805`).
 
 - **eDMA errata 51327 does not apply here, which is a near-miss worth
   recording.** That erratum requires `NBYTES` to be a multiple of 8 when
-  scatter-gather is used, and our minor loop is 4 bytes — exactly the value it
+  scatter-gather is used, and our minor loop is 4 bytes, exactly the value it
   would forbid. `MCXN947_cm33_core0_features.h:535` defines
   `FSL_FEATURE_EDMA_HAS_ERRATA_51327 (0)`, so `EDMA_CheckErrata()` compiles out
   and the pattern is legal on this part. The 4-byte minor loop is not
@@ -1154,7 +1158,7 @@ Manual, which is still login-gated and not on disk.
 Recorded here because the design doc's section 10 lists them as unverified and
 these were resolved by reading files this commit imports.
 
-- **CTIMER2's IRQ symbol name is `CTIMER2_IRQHandler`** — but rooting *that*
+- **CTIMER2's IRQ symbol name is `CTIMER2_IRQHandler`**, but rooting *that*
   name proves nothing. `startup_MCXN947_cm33_core0.S` uses a **two-level**
   dispatch for every peripheral vector: the table entry `<NAME>_IRQHandler` is a
   weak trampoline that branches to `<NAME>_DriverIRQHandler`, and it is the
@@ -1178,11 +1182,11 @@ these were resolved by reading files this commit imports.
   10 asks whether one exists before step 2. It does not: `*(NonCacheable.init)`
   and `*(NonCacheable)` are collected into the ordinary `.data` output section
   in `m_data`, alongside `CodeQuickAccess` and `DataQuickAccess`. The attribute
-  therefore buys nothing on this part as the script stands — anything relying on
+  therefore buys nothing on this part as the script stands; anything relying on
   it for DMA coherency needs an MPU region or a different placement, decided
   explicitly.
 
-- **`SystemInit()` enables LPCAC** — `SYSCON->LPCAC_CTRL &= ~DIS_LPCAC_MASK`
+- **`SystemInit()` enables LPCAC**: `SYSCON->LPCAC_CTRL &= ~DIS_LPCAC_MASK`
   (`system_MCXN947_cm33_core0.c:99`). It is on by default from reset of every
   image, which is the starting condition for section 5's LPCAC question at
   step 6. It also disables RAM ECC to recover the full RAM size, disables the
@@ -1201,27 +1205,27 @@ these were resolved by reading files this commit imports.
 - **`board.h` puts `BOARD_LCD_DC_GPIO_PIN` on P0_10, the red LED**, while design
   doc section 2 assigns display D/C to P0_7. **Resolved: P0_7 is correct.**
   Zephyr's `boards/nxp/frdm_mcxn947/frdm_mcxn947.dtsi` names every J8 signal
-  machine-readably — `rs-gpios = <&gpio0 7>`, `cs-gpios = <&gpio0 12>`,
+  machine-readably (`rs-gpios = <&gpio0 7>`, `cs-gpios = <&gpio0 12>`,
   `reset-gpios = <&gpio4 7>`, `enwr-pin = <1>`, `rd-pin = <0>`,
-  `data-pin-start = <16>` — and UM12018 Table 21 agrees. `board.h`'s P0_10 is
+  `data-pin-start = <16>`), and UM12018 Table 21 agrees. `board.h`'s P0_10 is
   unrelated to J8; P0_10 is ARD_D9 on the Arduino header. Our pin assignments
   match NXP's own `pin_mux.c` field for field, PCR values included, so **pin
-  assignment is not a candidate for display faults — stop re-deriving it.**
+  assignment is not a candidate for display faults; stop re-deriving it.**
 
 - **`~/git/dm-mcx-streamdeck/` is a different, older SDK and must not be used as
   a source for this tree.** Every overlapping file differs from 24.12.00: its
   CMSIS is Core(M) 5.4 against 24.12.00's 6.1, its `MCXN947_cm33_core0.h` is the
   5.0 MB monolithic form, its `clock_config.c` has *empty function bodies* (the
   generated code was stripped, so `BOARD_BootClockPLL150M` is declared and never
-  defined), and its `board.h` maps the RGB LED to GPIO3[2:4] active-high — the
-  MCX-N9XX-EVK pinout — under `BOARD_NAME "FRDM-MCXN947"`. Nothing in this tree
+  defined), and its `board.h` maps the RGB LED to GPIO3[2:4] active-high (the
+  MCX-N9XX-EVK pinout) under `BOARD_NAME "FRDM-MCXN947"`. Nothing in this tree
   came from it.
 
 ## Step 7 display, actually working (2026-09-17)
 
 - **CPU1 cannot touch GPIO until CPU0 hands it each pin, and the failure is
   silent.** GPIO is TrustZone-aware and carries its own per-pin secure filter,
-  `PCNS` ("pin control nonsecure", GPIO offset 0x10), which **resets to 0 —
+  `PCNS` ("pin control nonsecure", GPIO offset 0x10), which **resets to 0,
   every pin secure-access-only**. CPU1 has no SAU and can only issue non-secure
   transactions: `AHBSC->MASTER_SEC_LEVEL` (offset 0xFD0) resets to 0x80000000,
   putting CPU1's field [3:2] at 00b, non-secure and non-privileged. RGPIO
@@ -1229,11 +1233,11 @@ these were resolved by reading files this commit imports.
   fault and no status bit anywhere.
 
   Measured from CPU1 before the fix: `GPIO0->PDDR` read 0x00000000 while CPU0
-  was visibly driving P0_27, and all four views behaved identically —
+  was visibly driving P0_27, and all four views behaved identically:
   non-secure, ALIAS1, and both secure aliases. Meanwhile `PORT0->PCR[7]` read
   0x1000, `PORT2->PCR[8]` read 0x1600 and `FLEXIO0->CTRL` read 0xC0000005, all
   correct. **PORT and FLEXIO have no equivalent per-pin filter**, which is
-  exactly why they worked and GPIO did not. Not AHBSC slave rules — GPIO0 and
+  exactly why they worked and GPIO did not. Not AHBSC slave rules: GPIO0 and
   PORT0 both reset to 0b11, and `MISC_CTRL_REG[3:2]` leaves bus checking
   disabled after the boot ROM. Not clocks: `SYSCON->AHBCLKCTRL0` read
   0x04DBE7FF, bits 19/20/23 set.
@@ -1249,9 +1253,9 @@ these were resolved by reading files this commit imports.
   correct throughout, feeding a panel that was never selected and never reset.
   **The cheap diagnostic is the blue LED**, with one caveat that post-dates this
   finding. CPU1 drives P1_2 via GPIO1, so a blue LED that never animates while
-  `stats` shows CPU1 alive means CPU1's GPIO is dead — check it before anything
+  `stats` shows CPU1 alive means CPU1's GPIO is dead; check it before anything
   else. **But "dark" is no longer the test.** The LED was a 50% square wave when
-  this was written; it is now a two-beat pulse that is deliberately dark 78% of
+  this was written; it is now a two-beat pulse that is dark 78% of
   the time, so a dark instant proves nothing. **Watch a full 2.048 s cycle and
   look for the double-beat.** A stalled `slot_counter` freezes the waveform at
   whatever level it held, and the low duty makes that far more likely to be dark
@@ -1264,7 +1268,7 @@ these were resolved by reading files this commit imports.
   **byte** array as `uint16_t`. **A one-byte parameter becomes ZERO bus beats
   and is never transmitted.** `COLMOD`, `MADCTL`, `TEON` and the `CSCON` unlock
   keys all vanished; `CASET`/`RASET` sent 2 beats instead of 4, losing both end
-  addresses. Only `param_len == 0` commands survived — `SWRESET`, `SLPOUT`,
+  addresses. Only `param_len == 0` commands survived: `SWRESET`, `SLPOUT`,
   `INVON`, `TEOFF`, `DISPON`/`DISPOFF`.
 
   So the panel woke and lit but was never configured, and displayed its
@@ -1287,8 +1291,8 @@ these were resolved by reading files this commit imports.
   Through both of the faults above, `panel=ok`, `blitrej=0`, blits climbed and
   every eDMA transfer completed. `frames` cannot answer it either. The only
   honest checks are a flat full-screen fill and a command with a visible effect
-  (`DISPOFF`/`DISPON`). Note that `DISPON` is **parameterless**, so it proves
-  the command phase only — it was obeyed for the entire time the data phase was
+  (`DISPOFF`/`DISPON`). `DISPON` is **parameterless**, so it proves
+  the command phase only; it was obeyed for the entire time the data phase was
   dead.
 
 - **Measured after both fixes:** ~7 fps at 25 blits/frame, below section 9's

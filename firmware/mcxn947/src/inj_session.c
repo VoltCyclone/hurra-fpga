@@ -53,7 +53,14 @@ static void fill_map_meta(const inj_session_t *s, inj_map_begin_payload_t *meta)
     meta->map_generation = s->map_generation;
     meta->entry_count = s->entry_count;
     meta->layout_count = 1u;  // one report layout; every field shares it
+    // A pad map is NATIVE_ONLY: commands commit to the layout's state and ack
+    // with nothing on the wire; the pad's own reports carry the held values.
+    // Nothing is ever synthesised, so a DS4's counter and IMU are never
+    // replayed. The commit mirrors this (it copies the begin metadata).
     meta->flags = 0u;
+    if (s->device_class == INJ_DEVICE_CLASS_PAD) {
+        meta->flags = (uint16_t)INJ_MAP_FLAG_NATIVE_ONLY;
+    }
     meta->entries_crc32 = s->entries_crc32;
 }
 
@@ -75,6 +82,8 @@ static void forget_device(inj_session_t *s, uint16_t generation)
     s->have_generation = true;
     memset(&s->layout, 0, sizeof(s->layout));
     s->have_layout = false;
+    s->device_class = (uint8_t)INJ_DEVICE_CLASS_UNKNOWN;
+    s->abs_release_slots = 0u;
     s->complete_mask = 0u;
     s->judged_mask = 0u;
     s->settle_slots = 0u;
@@ -132,8 +141,10 @@ void inj_session_set_link(inj_session_t *s, bool up)
         s->active_map_generation = 0u;
         // A queued request is void too: it was counted against a session and an
         // RX sequence window that no longer exist, so replaying it into a fresh
-        // session would land a stale move at an unpredictable moment.
+        // session would land a stale move at an unpredictable moment. The hold
+        // timer goes with it: the FPGA's held state is gone.
         s->req_pending = INJ_SESSION_REQ_NONE;
+        s->abs_release_slots = 0u;
         return;
     }
     if (s->phase == INJ_PHASE_WAIT_LINK) {
@@ -166,7 +177,7 @@ void inj_session_sync_descriptors(inj_session_t *s, uint16_t generation, uint8_t
 }
 
 void inj_session_offer_layout(inj_session_t *s, uint16_t generation, uint8_t slot,
-                              uint8_t interface_number, const hid_mouse_layout_t *layout)
+                              uint8_t interface_number, const hid_layout_t *layout)
 {
     if (!is_current_generation(s, generation) || slot >= INJ_MAX_INTERFACES) {
         return;  // a verdict on a device that is gone
@@ -180,6 +191,10 @@ void inj_session_offer_layout(inj_session_t *s, uint16_t generation, uint8_t slo
     }
     s->layout = *layout;
     s->have_layout = true;
+    s->device_class = (uint8_t)INJ_DEVICE_CLASS_MOUSE;
+    if (layout->device_class == HID_DEVICE_CLASS_PAD) {
+        s->device_class = (uint8_t)INJ_DEVICE_CLASS_PAD;
+    }
     s->interface_number = interface_number;
     if (s->phase == INJ_PHASE_WAIT_DESCRIPTOR || s->phase == INJ_PHASE_NO_MOUSE) {
         s->phase = INJ_PHASE_WAIT_REPORT;
@@ -283,6 +298,9 @@ static uint8_t relative_flags(int16_t x, int16_t y, int16_t wheel, int16_t pan)
 // The RELATIVE enable bits this session's map can honour.
 static uint8_t layout_relative_flags(const inj_session_t *s)
 {
+    if (s->device_class != INJ_DEVICE_CLASS_MOUSE) {
+        return 0u;
+    }
     uint8_t flags = 0u;
     if ((s->layout.axes & HID_MOUSE_AXIS_BIT(HID_MOUSE_X)) != 0u) {
         flags |= (uint8_t)INJ_RELATIVE_FLAG_X;
@@ -299,14 +317,30 @@ static uint8_t layout_relative_flags(const inj_session_t *s)
     return flags;
 }
 
+// Both classes keep their button runs at the same kind number's meaning but
+// different numbers (HID_MOUSE_BUTTONS = 4, HID_PAD_KIND_BUTTONS = 7).
 static bool layout_has_buttons(const inj_session_t *s)
 {
+    const uint8_t buttons = (uint8_t)((s->device_class == INJ_DEVICE_CLASS_PAD)
+                                          ? HID_PAD_KIND_BUTTONS
+                                          : HID_MOUSE_BUTTONS);
     for (uint8_t i = 0u; i < s->layout.field_count; ++i) {
-        if (s->layout.fields[i].kind == HID_MOUSE_BUTTONS) {
+        if (s->layout.fields[i].kind == buttons) {
             return true;
         }
     }
     return false;
+}
+
+inj_device_class_t inj_session_device_class(const inj_session_t *s)
+{
+    if (s->phase == INJ_PHASE_WAIT_LINK) {
+        return INJ_DEVICE_CLASS_UNKNOWN;  // nothing can be commanded either way
+    }
+    if (s->have_layout) {
+        return (inj_device_class_t)s->device_class;
+    }
+    return s->phase == INJ_PHASE_NO_MOUSE ? INJ_DEVICE_CLASS_NONE : INJ_DEVICE_CLASS_UNKNOWN;
 }
 
 // Every command payload opens with the same addressing and identity fields.
@@ -366,7 +400,36 @@ static void emit_relative(inj_session_t *s, uint8_t slot[INJ_FRAME_SIZE], uint8_
     s->command_sequence = header.command_sequence;
 }
 
-// Shared admission for all three request kinds. INJECTING is the MCU-side
+// Build one ABSOLUTE into `slot` and advance both sequence numbers. Shared by
+// the request path and the hold timer's release, as emit_relative is by the
+// drift and its request path. `mask` bit 7 is undefined on the wire and is
+// never sent.
+static void emit_absolute(inj_session_t *s, uint8_t slot[INJ_FRAME_SIZE], uint8_t mask,
+                          const int16_t values[INJ_SESSION_PAD_CHANNELS])
+{
+    const command_header_t header = command_header(s);
+    inj_absolute_payload_t abs;
+    memset(&abs, 0, sizeof(abs));
+    abs.lease_generation = header.lease_generation;
+    abs.map_generation = header.map_generation;
+    abs.command_sequence = header.command_sequence;
+    abs.hold_reports = 0u;  // v1: the FPGA ignores it; the hold is MCU-timed
+    abs.interface_number = header.interface_number;
+    abs.endpoint_number = header.endpoint_number;
+    abs.report_id = header.report_id;
+    abs.flags = (uint8_t)(mask & 0x7Fu);
+    abs.lx = values[INJ_MAP_ENTRY_CHANNEL_LX];
+    abs.ly = values[INJ_MAP_ENTRY_CHANNEL_LY];
+    abs.rx = values[INJ_MAP_ENTRY_CHANNEL_RX];
+    abs.ry = values[INJ_MAP_ENTRY_CHANNEL_RY];
+    abs.lt = values[INJ_MAP_ENTRY_CHANNEL_LT];
+    abs.rt = values[INJ_MAP_ENTRY_CHANNEL_RT];
+    abs.hat = values[INJ_MAP_ENTRY_CHANNEL_HAT];
+    (void)inj_build_absolute(slot, next_frame_seq(s), &abs);
+    s->command_sequence = header.command_sequence;
+}
+
+// Shared admission for all four request kinds. INJECTING is the MCU-side
 // mirror of the FPGA's command_fresh, and a non-empty slot means the one-deep
 // queue is still occupied -- either way the answer is a refusal the caller can
 // retry, never an overwrite that loses a command silently.
@@ -382,6 +445,10 @@ static bool request_slot_free(inj_session_t *s)
 bool inj_session_request_relative(inj_session_t *s, int16_t x, int16_t y,
                                   int16_t wheel, int16_t pan)
 {
+    if (s->device_class != INJ_DEVICE_CLASS_MOUSE) {
+        s->requests_refused++;  // a pad map has no relative entries
+        return false;
+    }
     if (!request_slot_free(s)) {
         return false;
     }
@@ -411,6 +478,41 @@ bool inj_session_request_physical_mask(inj_session_t *s, uint64_t button_mask)
     }
     s->req_button_mask = button_mask;
     s->req_pending = INJ_SESSION_REQ_PHYSICAL_MASK;
+    return true;
+}
+
+bool inj_session_request_absolute(inj_session_t *s, uint8_t mask,
+                                  const int16_t values[INJ_SESSION_PAD_CHANNELS])
+{
+    if (s->device_class != INJ_DEVICE_CLASS_PAD) {
+        s->requests_refused++;  // a mouse map has no absolute entries
+        return false;
+    }
+    if (!request_slot_free(s)) {
+        return false;
+    }
+    s->abs_release_slots = 0u;
+    // layout.axes is the bitmask of channels the map carries (a pad kind IS
+    // its channel). A held channel with no entry would be harmless to the
+    // FPGA and a lie to the caller, so it is dropped and counted here.
+    const uint8_t wanted = (uint8_t)(mask & 0x7Fu);
+    const uint8_t carried = (uint8_t)(wanted & s->layout.axes);
+    if (carried != wanted) {
+        s->axis_drops++;
+    }
+    s->req_abs_mask = carried;
+    memcpy(s->req_abs_values, values, sizeof(s->req_abs_values));
+    s->req_pending = INJ_SESSION_REQ_ABSOLUTE;
+    return true;
+}
+
+bool inj_session_request_absolute_release_in(inj_session_t *s, uint32_t slots)
+{
+    if (s->phase != INJ_PHASE_INJECTING || s->device_class != INJ_DEVICE_CLASS_PAD) {
+        s->requests_refused++;
+        return false;
+    }
+    s->abs_release_slots = slots;
     return true;
 }
 
@@ -477,6 +579,13 @@ bool inj_session_fill_tx(inj_session_t *s, uint8_t slot[INJ_FRAME_SIZE])
             const uint8_t kind = s->req_pending;
             s->req_pending = INJ_SESSION_REQ_NONE;
 
+            if (kind == INJ_SESSION_REQ_ABSOLUTE) {
+                // Mask 0 is a real command (release), never a no-op to drop.
+                emit_absolute(s, slot, s->req_abs_mask, s->req_abs_values);
+                s->requests_sent++;
+                return true;
+            }
+
             if (kind != INJ_SESSION_REQ_RELATIVE && !layout_has_buttons(s)) {
                 // Nothing in the map for a button state or mask to act on.
                 // Dropped here and counted rather than refused at request
@@ -541,6 +650,24 @@ bool inj_session_fill_tx(inj_session_t *s, uint8_t slot[INJ_FRAME_SIZE])
             return true;
         }
 
+        // pad.hold's release: counted per retired slot, emitted when it reaches
+        // 0 with the request slot free (a request above took this slot).
+        if (s->abs_release_slots != 0u) {
+            s->abs_release_slots--;
+            if (s->abs_release_slots == 0u) {
+                static const int16_t released[INJ_SESSION_PAD_CHANNELS] = {0};
+                emit_absolute(s, slot, 0u, released);
+                s->absolute_releases++;
+                return true;
+            }
+        }
+
+        // The demo drift is a RELATIVE(X|Y): a pad map has no relative entries
+        // to carry it, so it would only flood the one-deep queue with frames
+        // the FPGA ignores.
+        if (s->device_class != INJ_DEVICE_CLASS_MOUSE) {
+            return false;
+        }
         if (s->inject_x == 0 && s->inject_y == 0) {
             return false;  // drift silenced; see inj_session_set_drift
         }
@@ -561,4 +688,3 @@ bool inj_session_fill_tx(inj_session_t *s, uint8_t slot[INJ_FRAME_SIZE])
         return false;
     }
 }
-

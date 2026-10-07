@@ -594,6 +594,17 @@ def report_injection_register_map() -> RegisterMap:
         [("resync_ok", 16), ("resync_failed", 16)],
         "SET_PROTOCOL(report) replays after a PC reset of the clone: accepted / refused",
     )
+    # Pad injection, appended after boot_resync. held_mask is the engine's live
+    # register (bit k = MAP_ENTRY_CHANNEL k held on the last committed layout);
+    # native_only is the active map's MAP_BEGIN flag; absolute_commits counts
+    # ABSOLUTE acks -- on a NATIVE_ONLY map those carry no report, so
+    # command_commits is the only other place they show.
+    m.status(
+        "pad_hold",
+        [("held_mask", 7), ("native_only", 1), ("absolute_commits", 16)],
+        "held absolute channels of the last committed layout; active map is NATIVE_ONLY; "
+        "committed ABSOLUTE commands",
+    )
     return m
 
 

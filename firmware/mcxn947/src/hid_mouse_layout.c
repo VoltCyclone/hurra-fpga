@@ -217,7 +217,7 @@ static void append_field(hid_mouse_layout_t *out, const hid_mouse_field_t *field
 }
 
 hid_mouse_status_t hid_mouse_compile(const uint8_t *descriptor, size_t length,
-                                     hid_mouse_layout_t *out)
+                                     hid_layout_t *out)
 {
     memset(out, 0, sizeof(*out));
     memset(&s_work, 0, sizeof(s_work));
@@ -245,6 +245,7 @@ hid_mouse_status_t hid_mouse_compile(const uint8_t *descriptor, size_t length,
 
     out->report_id = report_id;
     out->report_length = (uint8_t)report_bytes;
+    out->device_class = HID_DEVICE_CLASS_MOUSE;
     // Axes first, in kind order, then button runs in report order: the upload
     // CRC depends on the order, so it must not depend on the descriptor's.
     for (uint8_t kind = HID_MOUSE_X; kind <= HID_MOUSE_PAN; ++kind) {
