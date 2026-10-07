@@ -255,6 +255,11 @@ The MCU link's wire format lives in `protocol/report_injection_wire.json`. Edit 
 `src/hurra_cynthion/injection_wire.py` and both firmware `injection_wire.h` headers. Never edit
 those by hand; `tests/test_injection_wire.py` fails when they drift.
 
+`make -C firmware/mcxn947 DEMO=1 check` builds the bench image instead of the shipping one. It
+drifts a mouse cursor up and left at about 80 counts per second, and 20 seconds after boot it
+breaks the SPI link on purpose and lets the fault monitor repair it. Rebuild without `DEMO=1`
+before flashing a board anyone else will use.
+
 ## Layout
 
 | Path | Contents |
