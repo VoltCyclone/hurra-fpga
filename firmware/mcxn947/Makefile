@@ -363,7 +363,7 @@ CORE1_OBJECTS := \
 	test-console test-kmcmd test-core1-release test-shared-window test-link-snapshot test-status-led \
 	test-text-grid test-glyphs test-display-panel test-display \
 	test-hid-descriptor-reassembly test-hid-report-decoder \
-	test-hid-item test-hid-fields test-hid-mouse-layout test-inj-map-build \
+	test-hid-item test-hid-fields test-hid-mouse-layout test-hid-pad-layout test-inj-map-build \
 	test-hid-descriptor-set test-inj-command test-inj-session test-link-fault-classify \
 	test-merge-images
 
@@ -450,6 +450,10 @@ build/core0/hid_fields.o: src/hid_fields.c src/hid_fields.h src/hid_item.h | bui
 
 build/core0/hid_mouse_layout.o: src/hid_mouse_layout.c src/hid_mouse_layout.h \
 		src/hid_layout.h src/hid_fields.h include/injection_wire.h | build/core0
+	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
+
+build/core0/hid_pad_layout.o: src/hid_pad_layout.c src/hid_pad_layout.h src/hid_layout.h \
+		src/hid_fields.h include/injection_wire.h | build/core0
 	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
 build/core0/inj_map_build.o: src/inj_map_build.c src/inj_map_build.h src/hid_mouse_layout.h \
@@ -748,7 +752,7 @@ test: test-platform test-heartbeat test-spi-frame test-link test-link-retire \
 	test-link-snapshot test-status-led test-text-grid test-glyphs \
 	test-display-panel test-display test-inj-command test-inj-session \
 	test-hid-descriptor-reassembly test-hid-report-decoder \
-	test-hid-item test-hid-fields test-hid-mouse-layout test-inj-map-build \
+	test-hid-item test-hid-fields test-hid-mouse-layout test-hid-pad-layout test-inj-map-build \
 	test-hid-descriptor-set \
 	test-merge-images
 
@@ -987,6 +991,16 @@ build/host/hid_mouse_layout_test: test/hid_mouse_layout_test.c test/hid_fixtures
 		src/hid_item.c src/hid_item.h src/kmcmd.h include/injection_wire.h | build/host
 	$(HOST_CC) $(APP_WARNINGS) -Isrc -Itest -isystem include test/hid_mouse_layout_test.c \
 		src/hid_mouse_layout.c src/hid_fields.c src/hid_item.c -o $@
+
+test-hid-pad-layout: build/host/hid_pad_layout_test
+	./build/host/hid_pad_layout_test
+
+build/host/hid_pad_layout_test: test/hid_pad_layout_test.c test/hid_fixtures.h \
+		src/hid_pad_layout.c src/hid_pad_layout.h src/hid_layout.h src/hid_mouse_layout.h \
+		src/hid_fields.c src/hid_fields.h src/hid_item.c src/hid_item.h \
+		include/injection_wire.h | build/host
+	$(HOST_CC) $(APP_WARNINGS) -Isrc -Itest -isystem include test/hid_pad_layout_test.c \
+		src/hid_pad_layout.c src/hid_fields.c src/hid_item.c -o $@
 
 test-inj-map-build: build/host/inj_map_build_test
 	./build/host/inj_map_build_test
