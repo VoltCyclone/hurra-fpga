@@ -152,6 +152,8 @@ async def drain_report(ctx, engine, length: int) -> tuple[bytes, set[str]]:
                 acknowledgements.add("mask")
             if ctx.get(engine.clear_ready):
                 acknowledgements.add("clear")
+            if ctx.get(engine.absolute_ready):
+                acknowledgements.add("absolute")
             if len(result) == length:
                 assert ctx.get(engine.output_last)
                 await ctx.tick("usb")

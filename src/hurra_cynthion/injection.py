@@ -12,6 +12,7 @@ from .injection_wire import (
     INJ_CLEAR_FLAG_BUTTONS,
     INJ_CLEAR_FLAG_MOTION,
     INJ_CLEAR_FLAG_PHYSICAL_MASKS,
+    INJ_MAP_ENTRY_CHANNEL_HAT,
     INJ_MAP_ENTRY_FLAG_BUTTON,
     INJ_MAP_ENTRY_FLAG_RELATIVE,
     INJ_MAP_ENTRY_FLAG_SIGNED,
@@ -49,6 +50,9 @@ STATE_LAYOUT = StructLayout(
         "click_restore": unsigned(64),
     }
 )
+
+#: Channels an ABSOLUTE command can hold, indexed by MAP_ENTRY_CHANNEL (LX .. HAT).
+ABSOLUTE_CHANNELS = INJ_MAP_ENTRY_CHANNEL_HAT + 1
 
 
 class ReportInjectionEngine(Elaboratable):
@@ -131,6 +135,24 @@ class ReportInjectionEngine(Elaboratable):
         self.mask_buttons = Signal(64)
         self.mask_command_sequence = Signal(16)
 
+        # Decoded absolute "set" command (pads: sticks, triggers, hat). While a
+        # channel is held, every report of its layout carries the held value in
+        # place of the physical one. The mask is the FULL held set, as
+        # BUTTON_STATE's is: a clear bit releases the channel and its value is
+        # ignored. Values are written masked to the field's width, never
+        # clamped -- the MCU owns the logical range (a hat's null is 8 in a
+        # 0..7 field).
+        self.absolute_valid = Signal()
+        self.absolute_ready = Signal()
+        self.absolute_interface = Signal(8)
+        self.absolute_endpoint = Signal(8)
+        self.absolute_report_id = Signal(8)
+        self.absolute_mask = Signal(ABSOLUTE_CHANNELS)
+        self.absolute_values = [
+            Signal(signed(16), name=f"absolute_value{k}") for k in range(ABSOLUTE_CHANNELS)
+        ]
+        self.absolute_command_sequence = Signal(16)
+
         # Decoded clear command. Clear is global and is committed with the next
         # mapped report transaction; later integration can fan it out across
         # cached layouts when stationary scheduling is added.
@@ -146,6 +168,10 @@ class ReportInjectionEngine(Elaboratable):
         self.pending_pan = Signal(signed(32))
         self.injected_buttons = Signal(64)
         self.physical_mask = Signal(64)
+        #: Held channels of the most recently committed transaction's layout.
+        self.held_mask = Signal(ABSOLUTE_CHANNELS)
+        #: One cycle per committed ABSOLUTE transaction (debug counter source).
+        self.absolute_commit_pulse = Signal()
         self.last_committed_command_sequence = Signal(16)
         self.command_committed = Signal()
         self.command_overflow = Signal(32)
@@ -742,6 +768,7 @@ class ReportInjectionEngine(Elaboratable):
             self.button_ready.eq(0),
             self.mask_ready.eq(0),
             self.clear_ready.eq(0),
+            self.absolute_ready.eq(0),
             template_cache_write_enable.eq(0),
             state_memory_read_address.eq(selected_state),
             state_memory_write_enable.eq(0),
@@ -764,6 +791,7 @@ class ReportInjectionEngine(Elaboratable):
         ]
 
         m.d.usb += self.command_committed.eq(0)
+        m.d.usb += self.absolute_commit_pulse.eq(0)
 
         with m.FSM(domain="usb"):
             with m.State("CAPTURE"):

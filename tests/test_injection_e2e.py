@@ -9,6 +9,15 @@ from hurra_cynthion.descriptors import DescriptorStore
 from hurra_cynthion.gateware import ReportInjectionDataPlane
 from hurra_cynthion.injection_map import MapError
 from hurra_cynthion.injection_wire import (
+    INJ_ABSOLUTE_FLAG_HAT,
+    INJ_ABSOLUTE_FLAG_LX,
+    INJ_MAP_ENTRY_CHANNEL_HAT,
+    INJ_MAP_ENTRY_CHANNEL_LT,
+    INJ_MAP_ENTRY_CHANNEL_LX,
+    INJ_MAP_ENTRY_CHANNEL_LY,
+    INJ_MAP_ENTRY_CHANNEL_RT,
+    INJ_MAP_ENTRY_CHANNEL_RX,
+    INJ_MAP_ENTRY_CHANNEL_RY,
     INJ_MAP_ENTRY_FLAG_RELATIVE,
     INJ_MAP_ENTRY_FLAG_SIGNED,
     INJ_MAP_ENTRY_FLAG_X,
@@ -16,6 +25,7 @@ from hurra_cynthion.injection_wire import (
     INJ_MAP_STATUS_ERROR_NONE,
     INJ_MAP_STATUS_STATUS_COMMIT_ACCEPTED,
     INJ_RELATIVE_FLAG_X,
+    INJ_TYPE_ABSOLUTE,
     INJ_TYPE_DESCRIPTOR_FRAGMENT,
     INJ_TYPE_MAP_BEGIN,
     INJ_TYPE_MAP_COMMIT,
@@ -24,6 +34,7 @@ from hurra_cynthion.injection_wire import (
     INJ_TYPE_RELATIVE,
     INJ_TYPE_REPORT_FRAGMENT,
     INJ_TYPE_TELEMETRY_CONFIG,
+    AbsolutePayload,
     DescriptorFragmentPayload,
     MapBeginPayload,
     MapCommitPayload,
@@ -263,6 +274,44 @@ async def drive_relative(
         ctx,
         plane,
         INJ_TYPE_RELATIVE,
+        payload,
+        sequence=sequence & 0xFF if rx_sequence is None else rx_sequence,
+    )
+
+
+async def drive_absolute(
+    ctx,
+    plane,
+    *,
+    mask: int,
+    values: dict[int, int] | None = None,
+    sequence: int = 1,
+    rx_sequence: int | None = None,
+    map_generation: int = 1,
+) -> None:
+    """Offer one ABSOLUTE frame. ``values`` is keyed by MAP_ENTRY_CHANNEL."""
+    values = values or {}
+    payload = AbsolutePayload(
+        lease_generation=1,
+        map_generation=map_generation,
+        command_sequence=sequence,
+        hold_reports=0,
+        interface_number=0,
+        endpoint_number=1,
+        report_id=0,
+        flags=mask,
+        lx=values.get(INJ_MAP_ENTRY_CHANNEL_LX, 0),
+        ly=values.get(INJ_MAP_ENTRY_CHANNEL_LY, 0),
+        rx=values.get(INJ_MAP_ENTRY_CHANNEL_RX, 0),
+        ry=values.get(INJ_MAP_ENTRY_CHANNEL_RY, 0),
+        lt=values.get(INJ_MAP_ENTRY_CHANNEL_LT, 0),
+        rt=values.get(INJ_MAP_ENTRY_CHANNEL_RT, 0),
+        hat=values.get(INJ_MAP_ENTRY_CHANNEL_HAT, 0),
+    ).to_bytes()
+    await send_rx(
+        ctx,
+        plane,
+        INJ_TYPE_ABSOLUTE,
         payload,
         sequence=sequence & 0xFF if rx_sequence is None else rx_sequence,
     )
@@ -1268,5 +1317,81 @@ def test_map_begin_flags_reach_the_store_and_commit_flags_are_ignored() -> None:
         )
         assert ctx.get(plane.map_store.active_generation) == 2
         assert ctx.get(plane.map_store.active_native_only) == 0
+
+    run_simulation(bench)
+
+
+def test_absolute_frame_is_decoded_and_offered_to_the_engine() -> None:
+    # Before this an ABSOLUTE drained as invalid_rx, silently.
+    async def bench(ctx, harness) -> None:
+        plane = harness.plane
+        engine = plane.engine
+        await initialize(ctx, plane)
+        entry = relative_x_entry(descriptor_generation=ctx.get(harness.store.descriptor_generation))
+        await commit_map(ctx, harness, entry)
+        before = ctx.get(plane.invalid_rx_count)
+
+        await drive_absolute(
+            ctx,
+            plane,
+            mask=INJ_ABSOLUTE_FLAG_LX | INJ_ABSOLUTE_FLAG_HAT,
+            values={INJ_MAP_ENTRY_CHANNEL_LX: -300, INJ_MAP_ENTRY_CHANNEL_HAT: 8},
+            sequence=0x21,
+        )
+        for _ in range(2):
+            await ctx.tick("usb")
+
+        assert ctx.get(engine.absolute_valid) == 1
+        assert ctx.get(engine.absolute_interface) == 0
+        assert ctx.get(engine.absolute_endpoint) == 1
+        assert ctx.get(engine.absolute_report_id) == 0
+        assert ctx.get(engine.absolute_mask) == INJ_ABSOLUTE_FLAG_LX | INJ_ABSOLUTE_FLAG_HAT
+        assert ctx.get(engine.absolute_values[INJ_MAP_ENTRY_CHANNEL_LX]) == -300
+        assert ctx.get(engine.absolute_values[INJ_MAP_ENTRY_CHANNEL_HAT]) == 8
+        assert ctx.get(engine.absolute_values[INJ_MAP_ENTRY_CHANNEL_RY]) == 0
+        assert ctx.get(engine.absolute_command_sequence) == 0x21
+        assert ctx.get(plane.invalid_rx_count) == before
+
+    run_simulation(bench)
+
+
+def test_an_absolute_for_a_boot_protocol_endpoint_is_dropped_as_stale() -> None:
+    async def bench(ctx, harness) -> None:
+        plane = harness.plane
+        await initialize(ctx, plane)
+        entry = relative_x_entry(descriptor_generation=ctx.get(harness.store.descriptor_generation))
+        await commit_map(ctx, harness, entry)
+        ctx.set(plane.boot_protocol, 1 << 1)
+        await ctx.tick("usb")
+        before = ctx.get(plane.invalid_rx_count)
+
+        await drive_absolute(ctx, plane, mask=INJ_ABSOLUTE_FLAG_LX, sequence=0x21)
+        for _ in range(2):
+            await ctx.tick("usb")
+
+        assert ctx.get(plane.invalid_rx_count) == before + 1
+        assert ctx.get(plane.engine.absolute_valid) == 0
+
+    run_simulation(bench)
+
+
+def test_an_absolute_with_a_stale_map_generation_is_dropped_not_queued() -> None:
+    # command_fresh fails on the generation mismatch, so the frame drains as
+    # invalid_rx instead of waiting for an ack no layout would ever give. (A
+    # FRESH command for a layout the map lacks is a different, pre-existing
+    # hazard shared by every command type; see the plan's "Flagged" section.)
+    async def bench(ctx, harness) -> None:
+        plane = harness.plane
+        await initialize(ctx, plane)
+        entry = relative_x_entry(descriptor_generation=ctx.get(harness.store.descriptor_generation))
+        await commit_map(ctx, harness, entry)
+        before = ctx.get(plane.invalid_rx_count)
+
+        await drive_absolute(ctx, plane, mask=INJ_ABSOLUTE_FLAG_LX, sequence=0x21, map_generation=2)
+        for _ in range(2):
+            await ctx.tick("usb")
+
+        assert ctx.get(plane.invalid_rx_count) == before + 1
+        assert ctx.get(plane.engine.absolute_valid) == 0
 
     run_simulation(bench)
