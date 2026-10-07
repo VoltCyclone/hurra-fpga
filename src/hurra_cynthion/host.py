@@ -1,4 +1,4 @@
-"""Integrated bounded full-speed USB mouse host."""
+"""Integrated bounded USB HID host: enumeration, polling and report merging."""
 
 # Ruff's context-manager simplification obscures nested Amaranth control-flow DSL structure.
 # ruff: noqa: SIM117

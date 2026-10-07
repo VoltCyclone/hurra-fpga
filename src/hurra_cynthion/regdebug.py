@@ -42,8 +42,8 @@ class RegisterDebugLink:
             from apollo_fpga import ApolloDebugger
         except ImportError as exc:  # pragma: no cover - depends on host env
             raise RegisterDebugError(
-                "apollo_fpga is not installed; install the 'debug' extra "
-                "(pip install -e '.[debug]') to use the register-debug tool"
+                "apollo_fpga is not installed; it comes with the cynthion package "
+                "(pip install -e .), which the register-debug tool needs"
             ) from exc
 
         try:
