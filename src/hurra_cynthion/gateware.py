@@ -1152,6 +1152,17 @@ class CynthionMouseHostTop(Elaboratable):
             resync_ok=debug.counter(tracker.resync_ok, name="resync_ok", width=16),
             resync_failed=debug.counter(tracker.resync_fail, name="resync_failed", width=16),
         )
+        # Pad injection. Every source is a register: the engine's held_mask and
+        # commit pulse, the store's active_native_only.
+        engine = injection_plane.engine
+        debug.status(
+            "pad_hold",
+            held_mask=engine.held_mask,
+            native_only=map_store.active_native_only,
+            absolute_commits=debug.counter(
+                engine.absolute_commit_pulse, name="absolute_commits", width=16
+            ),
+        )
         debug.set_led(0, host.connected)
         debug.set_led(1, host.enumerating)
         debug.set_led(2, host.enumerated)
