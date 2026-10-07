@@ -33,9 +33,12 @@
 // The hat is only injectable when 0..7 are the eight directions and 8 is the
 // null (centred) value the MCU sends for "released" -- the FPGA writes a held
 // value unclamped, so any other convention would need a translation this
-// version does not have.
+// version does not have. The field must also be wide enough to carry the 8:
+// the FPGA masks the held value to the field width, so on a 3-bit hat 8 would
+// land as 0, "up".
 #define HAT_MINIMUM 0
 #define HAT_MAXIMUM 7
+#define HAT_MIN_BITS 4u
 
 // Every axis and button run of a real pad (adjacent buttons merge as they are
 // collected). Unlike the mouse compiler, running out of room here is an error
@@ -151,7 +154,8 @@ static void collect_buttons(workspace_t *w, const hid_field_t *f)
 
 static bool hat_range_ok(const hid_field_t *f)
 {
-    return f->logical_minimum == HAT_MINIMUM && f->logical_maximum == HAT_MAXIMUM;
+    return f->logical_minimum == HAT_MINIMUM && f->logical_maximum == HAT_MAXIMUM &&
+           f->bit_size >= HAT_MIN_BITS;
 }
 
 static void collect_axes(workspace_t *w, const hid_field_t *f)

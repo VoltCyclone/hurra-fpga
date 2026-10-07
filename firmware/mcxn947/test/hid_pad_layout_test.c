@@ -122,6 +122,26 @@ static void test_hat_outside_0_to_7_is_not_mapped(void)
     assert((l.axes & HID_LAYOUT_AXIS_BIT(HID_PAD_KIND_HAT)) == 0u);
 }
 
+// A 3-bit hat can hold 0..7 but not the 8 that pad.hat(8) and pad.release()
+// send for "centred"; the FPGA would mask it to 0, "up". Such a hat is skipped
+// the same way as one with the wrong range, and the fields after it still land.
+static void test_hat_narrower_than_four_bits_is_not_mapped(void)
+{
+    uint8_t d[sizeof(HID_FIXTURE_GAMEPAD_DS4_SHAPED)];
+    memcpy(d, HID_FIXTURE_GAMEPAD_DS4_SHAPED, sizeof(d));
+    // Hat: Report Size (4) is 0x75 0x04 at 33..34, right after Logical Maximum (7).
+    assert(d[31] == 0x25u && d[32] == 0x07u && d[33] == 0x75u && d[34] == 0x04u);
+    d[34] = 0x03u;
+    hid_layout_t l;
+    assert(hid_pad_compile(d, sizeof(d), &l) == HID_PAD_OK);
+    assert(find(&l, HID_PAD_KIND_HAT, 0u) == NULL);
+    assert(l.field_count == 7u);
+    assert((l.axes & HID_LAYOUT_AXIS_BIT(HID_PAD_KIND_HAT)) == 0u);
+    // The button run moved up by the bit the hat gave back.
+    const hid_layout_field_t *buttons = find(&l, HID_PAD_KIND_BUTTONS, 0u);
+    assert(buttons != NULL && buttons->bit_offset == 43u);
+}
+
 // Simulation-page Accelerator/Brake fill LT/RT when the pad has no Rx/Ry: a
 // racing wheel's pedals are its triggers.
 static void test_simulation_triggers_fill_lt_rt_when_rx_ry_absent(void)
@@ -239,6 +259,7 @@ int main(void)
     test_null_state_flag_is_the_input_items_bit_6();
     test_mouse_and_keyboard_are_not_pads();
     test_hat_outside_0_to_7_is_not_mapped();
+    test_hat_narrower_than_four_bits_is_not_mapped();
     test_simulation_triggers_fill_lt_rt_when_rx_ry_absent();
     test_too_many_fields_is_unsupported_not_truncated();
     test_real_ds4_compiles_like_the_shaped_fixture();

@@ -784,10 +784,15 @@ static void link_descriptor_service(void)
     }
 
     // Mouse first, then pad on NOT_MOUSE -- both against the same snapshot and
-    // validated once below, so the verdict is about one set of bytes. Mouse
-    // first is the composite-device rule made explicit: a device declaring
-    // both is a mouse. NO_AXES/UNSUPPORTED mean it IS a mouse collection, just
-    // not an injectable one, so the pad compiler is not consulted.
+    // validated once below, so the verdict is about one set of bytes. Within
+    // one descriptor a device declaring both collections is a mouse.
+    // NO_AXES/UNSUPPORTED mean it IS a mouse collection, just not an
+    // injectable one, so the pad compiler is not consulted. Across interfaces
+    // the rule is different and older: slots are judged in dirty order and
+    // inj_session_offer_layout() keeps the first injectable layout of either
+    // class, so a pad interface ahead of a mouse interface wins. No device on
+    // the bench has both; a later mouse displacing an adopted pad would mean
+    // tearing down a live session, which is a worse default than refusing km.*.
     const hid_mouse_status_t verdict = hid_mouse_compile(snap.bytes, snap.length, &s_compiled);
     bool injectable = verdict == HID_MOUSE_OK;
     if (verdict == HID_MOUSE_NOT_MOUSE) {
