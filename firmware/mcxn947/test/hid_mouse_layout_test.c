@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "hid_fields.h"
 #include "hid_fixtures.h"
 #include "hid_mouse_layout.h"
 #include "kmcmd.h"
@@ -62,6 +63,26 @@ static void test_boot_mouse(void)
     // Order is fixed -- the upload CRC depends on it.
     assert(l.fields[0].kind == HID_MOUSE_X && l.fields[1].kind == HID_MOUSE_Y &&
            l.fields[2].kind == HID_MOUSE_BUTTONS);
+}
+
+// A compiled mouse layout says what it is, so inj_map_build.c can read `kind`
+// as a mouse kind and never as a pad channel. The class byte sits in the
+// header's padding: the struct is exactly the header plus the field array.
+static void test_mouse_layout_reports_its_class(void)
+{
+    hid_layout_t l;
+    assert(hid_mouse_compile(HID_FIXTURE_BOOT_MOUSE, sizeof(HID_FIXTURE_BOOT_MOUSE), &l) ==
+           HID_MOUSE_OK);
+    assert(l.device_class == HID_DEVICE_CLASS_MOUSE);
+    assert(HID_LAYOUT_MAX_FIELDS == 16u && HID_MOUSE_MAX_FIELDS == HID_LAYOUT_MAX_FIELDS);
+    assert(sizeof(hid_layout_field_t) == 20u);
+    assert(sizeof(hid_layout_t) == 8u + HID_LAYOUT_MAX_FIELDS * sizeof(hid_layout_field_t));
+    assert((HID_FIELD_NULL_STATE) == 0x40u);
+
+    memset(&l, 0xA5, sizeof(l));
+    assert(hid_mouse_compile(HID_FIXTURE_BOOT_KEYBOARD, sizeof(HID_FIXTURE_BOOT_KEYBOARD), &l) ==
+           HID_MOUSE_NOT_MOUSE);
+    assert(l.device_class == HID_DEVICE_CLASS_NONE);  // zeroed with the rest on failure
 }
 
 static void test_report_id_mouse_with_16bit_axes_wheel_and_pan(void)
@@ -298,6 +319,7 @@ static void test_button_range_tail_is_not_mapped(void)
 int main(void)
 {
     test_boot_mouse();
+    test_mouse_layout_reports_its_class();
     test_report_id_mouse_with_16bit_axes_wheel_and_pan();
     test_12bit_axes_straddling_bytes();
     test_keyboard_and_gamepad_are_not_mice();

@@ -30,6 +30,7 @@
 #define HID_FIELD_CONSTANT 0x01u  // 0 = Data
 #define HID_FIELD_VARIABLE 0x02u  // 0 = Array
 #define HID_FIELD_RELATIVE 0x04u  // 0 = Absolute
+#define HID_FIELD_NULL_STATE 0x40u  // 0 = No Null position
 
 typedef struct {
     uint8_t report_id;         // 0 = the descriptor declares no report IDs

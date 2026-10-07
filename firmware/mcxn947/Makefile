@@ -423,6 +423,7 @@ build/core0/link.o: src/link.c src/link.h src/link_retire.h src/link_recovery.h 
 		src/spi_frame.h src/platform.h src/dbg_uart.h src/shared_window.h \
 		src/link_snapshot.h src/inj_command.h src/inj_session.h src/reset_cause.h \
 		src/hid_descriptor_set.h src/hid_descriptor_reassembly.h src/hid_mouse_layout.h \
+		src/hid_layout.h \
 		include/injection_wire.h | build/core0
 	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
@@ -434,7 +435,7 @@ build/core0/inj_command.o: src/inj_command.c src/inj_command.h src/spi_frame.h \
 	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
 build/core0/inj_session.o: src/inj_session.c src/inj_session.h src/inj_command.h \
-		src/spi_frame.h src/inj_map_build.h src/hid_mouse_layout.h \
+		src/spi_frame.h src/inj_map_build.h src/hid_mouse_layout.h src/hid_layout.h \
 		include/injection_wire.h | build/core0
 	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
@@ -448,11 +449,11 @@ build/core0/hid_fields.o: src/hid_fields.c src/hid_fields.h src/hid_item.h | bui
 	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
 build/core0/hid_mouse_layout.o: src/hid_mouse_layout.c src/hid_mouse_layout.h \
-		src/hid_fields.h include/injection_wire.h | build/core0
+		src/hid_layout.h src/hid_fields.h include/injection_wire.h | build/core0
 	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
 build/core0/inj_map_build.o: src/inj_map_build.c src/inj_map_build.h src/hid_mouse_layout.h \
-		src/inj_command.h include/injection_wire.h | build/core0
+		src/hid_layout.h src/inj_command.h include/injection_wire.h | build/core0
 	$(CC) $(COMMON_CFLAGS) $(APP_WARNINGS) -c $< -o $@
 
 # The portable transport half of step 3. Neither of these compiles a single
@@ -787,6 +788,7 @@ test-inj-session: build/host/inj_session_test
 build/host/inj_session_test: test/inj_session_test.c test/hid_fixtures.h src/inj_session.c \
 		src/inj_command.c src/spi_frame.c src/inj_session.h src/inj_command.h src/spi_frame.h \
 		src/inj_map_build.c src/inj_map_build.h src/hid_mouse_layout.c src/hid_mouse_layout.h \
+		src/hid_layout.h \
 		src/hid_fields.c src/hid_fields.h src/hid_item.c src/hid_item.h \
 		include/injection_wire.h | build/host
 	$(HOST_CC) $(APP_WARNINGS) -Isrc -Itest -isystem include test/inj_session_test.c \
@@ -980,7 +982,8 @@ test-hid-mouse-layout: build/host/hid_mouse_layout_test
 	./build/host/hid_mouse_layout_test
 
 build/host/hid_mouse_layout_test: test/hid_mouse_layout_test.c test/hid_fixtures.h \
-		src/hid_mouse_layout.c src/hid_mouse_layout.h src/hid_fields.c src/hid_fields.h \
+		src/hid_mouse_layout.c src/hid_mouse_layout.h src/hid_layout.h \
+		src/hid_fields.c src/hid_fields.h \
 		src/hid_item.c src/hid_item.h src/kmcmd.h include/injection_wire.h | build/host
 	$(HOST_CC) $(APP_WARNINGS) -Isrc -Itest -isystem include test/hid_mouse_layout_test.c \
 		src/hid_mouse_layout.c src/hid_fields.c src/hid_item.c -o $@
@@ -991,6 +994,7 @@ test-inj-map-build: build/host/inj_map_build_test
 build/host/inj_map_build_test: test/inj_map_build_test.c test/hid_fixtures.h \
 		src/inj_map_build.c src/inj_map_build.h src/inj_command.c src/inj_command.h \
 		src/spi_frame.c src/spi_frame.h src/hid_mouse_layout.c src/hid_mouse_layout.h \
+		src/hid_layout.h \
 		src/hid_fields.c src/hid_fields.h src/hid_item.c src/hid_item.h \
 		include/injection_wire.h | build/host
 	$(HOST_CC) $(APP_WARNINGS) -Isrc -Itest -isystem include test/inj_map_build_test.c \
