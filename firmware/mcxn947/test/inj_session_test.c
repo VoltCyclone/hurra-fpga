@@ -15,6 +15,7 @@
 
 #include "hid_fixtures.h"
 #include "hid_mouse_layout.h"
+#include "hid_pad_layout.h"
 #include "inj_command.h"
 #include "inj_session.h"
 #include "injection_wire.h"
@@ -959,6 +960,237 @@ static void test_button_requests_on_a_buttonless_mouse_are_dropped(void)
     assert(s.button_drops == 2u);
 }
 
+// --- pad layouts ---------------------------------------------------------------
+
+// The DS4-shaped pad on interface 3, endpoint 4: report ID 1, 64 bytes.
+static inj_report_fragment_payload_t pad_fragment(void)
+{
+    inj_report_fragment_payload_t frag;
+    memset(&frag, 0, sizeof(frag));
+    frag.descriptor_generation = 3u;
+    frag.interface_number = 3u;
+    frag.endpoint_number = 4u;
+    frag.total = 64u;
+    frag.data[0] = 1u;  // the report ID, as the device sends it
+    return frag;
+}
+
+static void offer_pad(inj_session_t *s)
+{
+    hid_layout_t layout;
+    assert(hid_pad_compile(HID_FIXTURE_GAMEPAD_DS4_SHAPED, sizeof(HID_FIXTURE_GAMEPAD_DS4_SHAPED),
+                           &layout) == HID_PAD_OK);
+    deliver(s, 3u, 3u, &layout);
+}
+
+// A pad map is NATIVE_ONLY, in BEGIN and mirrored into COMMIT; its entries are
+// the compiled layout's eight.
+static void reach_injecting_pad(inj_session_t *s)
+{
+    inj_session_init(s);
+    inj_session_set_link(s, true);
+    offer_pad(s);
+    assert(inj_session_device_class(s) == INJ_DEVICE_CLASS_PAD);
+    inj_report_fragment_payload_t frag = pad_fragment();
+    inj_session_observe_report(s, &frag);
+    assert(inj_session_phase(s) == INJ_PHASE_SEND_BEGIN);
+
+    uint8_t type = 0u;
+    uint8_t p[INJ_FRAME_PAYLOAD_SIZE];
+    (void)next_frame(s, &type, p);
+    assert(type == INJ_TYPE_MAP_BEGIN);
+    inj_map_begin_payload_t begin;
+    memcpy(&begin, p, sizeof(begin));
+    assert(begin.flags == INJ_MAP_FLAG_NATIVE_ONLY);
+    assert(begin.entry_count == 8u);
+    for (uint8_t i = 0u; i < 8u; ++i) {
+        (void)next_frame(s, &type, p);
+        assert(type == INJ_TYPE_MAP_ENTRY);
+        inj_map_entry_payload_t entry;
+        memcpy(&entry, p, sizeof(entry));
+        assert(entry.report_id == 1u && entry.report_length == 64u);
+        assert(entry.interface_number == 3u && entry.endpoint_number == 4u);
+    }
+    (void)next_frame(s, &type, p);
+    assert(type == INJ_TYPE_MAP_COMMIT);
+    inj_map_commit_payload_t commit;
+    memcpy(&commit, p, sizeof(commit));
+    assert(commit.flags == INJ_MAP_FLAG_NATIVE_ONLY);
+    assert(commit.entries_crc32 == begin.entries_crc32);
+
+    inj_map_status_payload_t ok = commit_status(1u, INJ_MAP_STATUS_STATUS_COMMIT_ACCEPTED);
+    inj_session_observe_map_status(s, &ok);
+    assert(inj_session_phase(s) == INJ_PHASE_INJECTING);
+}
+
+static void test_pad_map_is_native_only_and_a_mouse_map_is_not(void)
+{
+    inj_session_t s;
+    reach_injecting_pad(&s);
+
+    inj_session_t m;
+    reach_injecting(&m);  // run_upload asserted the boot mouse's entries
+    assert(inj_session_device_class(&m) == INJ_DEVICE_CLASS_MOUSE);
+    // The mouse's BEGIN carried flags 0: re-run its upload and look.
+    inj_session_init(&m);
+    inj_session_set_link(&m, true);
+    offer_boot_mouse(&m);
+    inj_report_fragment_payload_t frag = boot_fragment();
+    inj_session_observe_report(&m, &frag);
+    uint8_t type = 0u;
+    uint8_t p[INJ_FRAME_PAYLOAD_SIZE];
+    (void)next_frame(&m, &type, p);
+    inj_map_begin_payload_t begin;
+    memcpy(&begin, p, sizeof(begin));
+    assert(type == INJ_TYPE_MAP_BEGIN && begin.flags == 0u);
+}
+
+// The demo drift is RELATIVE(X|Y); a pad map cannot carry it. With a pad
+// adopted the session stays silent across many pace periods.
+static void test_drift_is_silent_on_a_pad(void)
+{
+    inj_session_t s;
+    reach_injecting_pad(&s);
+    assert(s.inject_x != 0 || s.inject_y != 0);  // the default drift is live
+    tick(&s, INJ_SESSION_DEFAULT_PACE * 3u);
+    assert(s.relatives_sent == 0u);
+}
+
+// request_absolute emits one ABSOLUTE citing the active generation, with the
+// mask and seven values as given, and advances command_sequence.
+static void test_requested_absolute_emits_absolute(void)
+{
+    inj_session_t s;
+    reach_injecting_pad(&s);
+
+    const int16_t values[INJ_SESSION_PAD_CHANNELS] = {200, 0, 0, 0, 0, 0, 8};
+    assert(inj_session_request_absolute(&s, INJ_ABSOLUTE_FLAG_LX | INJ_ABSOLUTE_FLAG_HAT, values));
+    assert(inj_session_pending_request(&s));
+
+    uint8_t type = 0u;
+    uint8_t p[INJ_FRAME_PAYLOAD_SIZE];
+    const uint8_t seq = next_frame(&s, &type, p);
+    assert(type == INJ_TYPE_ABSOLUTE);
+    assert(seq == 11u);  // BEGIN, eight ENTRYs, COMMIT used 1..10
+    inj_absolute_payload_t abs;
+    memcpy(&abs, p, sizeof(abs));
+    assert(abs.lease_generation == 1u && abs.map_generation == 1u);
+    assert(abs.command_sequence == 1u);
+    assert(abs.hold_reports == 0u);
+    assert(abs.interface_number == 3u && abs.endpoint_number == 4u && abs.report_id == 1u);
+    assert(abs.flags == (INJ_ABSOLUTE_FLAG_LX | INJ_ABSOLUTE_FLAG_HAT));
+    assert(abs.lx == 200 && abs.ly == 0 && abs.hat == 8);
+    assert(s.command_sequence == 1u && s.requests_sent == 1u);
+    assert(!inj_session_pending_request(&s));
+
+    // Mask 0 is a real command: the release goes out.
+    assert(inj_session_request_absolute(&s, 0u, values));
+    (void)next_frame(&s, &type, p);
+    memcpy(&abs, p, sizeof(abs));
+    assert(type == INJ_TYPE_ABSOLUTE && abs.flags == 0u && abs.command_sequence == 2u);
+
+    // The one request slot is shared with the other kinds.
+    assert(inj_session_request_absolute(&s, INJ_ABSOLUTE_FLAG_LY, values));
+    assert(!inj_session_request_buttons(&s, 0x1u, 0u));
+    assert(!inj_session_request_absolute(&s, INJ_ABSOLUTE_FLAG_LY, values));
+}
+
+// A channel the layout does not carry is dropped from the mask and counted; a
+// mouse layout refuses the request outright.
+static void test_absolute_drops_unmapped_channels_and_refuses_on_a_mouse(void)
+{
+    inj_session_t s;
+    reach_injecting_pad(&s);
+    // Remove the hat from the adopted layout's channel set to simulate a pad
+    // without one (the map was built before; only the request filter reads axes).
+    s.layout.axes = (uint8_t)(s.layout.axes & ~HID_LAYOUT_AXIS_BIT(HID_PAD_KIND_HAT));
+    const int16_t values[INJ_SESSION_PAD_CHANNELS] = {1, 2, 3, 4, 5, 6, 7};
+    assert(inj_session_request_absolute(&s, INJ_ABSOLUTE_FLAG_RX | INJ_ABSOLUTE_FLAG_HAT, values));
+    assert(s.axis_drops == 1u);
+    uint8_t type = 0u;
+    uint8_t p[INJ_FRAME_PAYLOAD_SIZE];
+    (void)next_frame(&s, &type, p);
+    inj_absolute_payload_t abs;
+    memcpy(&abs, p, sizeof(abs));
+    assert(abs.flags == INJ_ABSOLUTE_FLAG_RX);
+
+    inj_session_t m;
+    reach_injecting(&m);
+    assert(!inj_session_request_absolute(&m, INJ_ABSOLUTE_FLAG_LX, values));
+    assert(m.requests_refused == 1u);
+    assert(!inj_session_request_absolute_release_in(&m, 8u));
+}
+
+// pad.hold: release_in(3) emits ABSOLUTE flags 0 on the third fill, with no
+// request occupying the slot; a pending request takes its slot first.
+static void test_release_timer_emits_mask_zero_when_it_expires(void)
+{
+    inj_session_t s;
+    reach_injecting_pad(&s);
+    assert(inj_session_request_absolute_release_in(&s, 3u));
+    assert(!inj_session_pending_request(&s));  // the timer is not a request
+    assert_idle(&s);
+    assert_idle(&s);
+    uint8_t type = 0u;
+    uint8_t p[INJ_FRAME_PAYLOAD_SIZE];
+    (void)next_frame(&s, &type, p);
+    inj_absolute_payload_t abs;
+    memcpy(&abs, p, sizeof(abs));
+    assert(type == INJ_TYPE_ABSOLUTE && abs.flags == 0u);
+    assert(abs.lx == 0 && abs.hat == 0);
+    assert(abs.command_sequence == 1u);
+    assert(s.absolute_releases == 1u && s.requests_sent == 0u);
+    assert(s.abs_release_slots == 0u);
+    tick(&s, 4u);  // disarmed: nothing more
+
+    // A request landing on the expiry slot goes first; the release follows.
+    assert(inj_session_request_absolute_release_in(&s, 1u));
+    const int16_t values[INJ_SESSION_PAD_CHANNELS] = {9, 0, 0, 0, 0, 0, 0};
+    assert(inj_session_request_absolute(&s, INJ_ABSOLUTE_FLAG_LX, values));
+    (void)next_frame(&s, &type, p);
+    memcpy(&abs, p, sizeof(abs));
+    assert(abs.flags == INJ_ABSOLUTE_FLAG_LX);
+    (void)next_frame(&s, &type, p);
+    memcpy(&abs, p, sizeof(abs));
+    assert(abs.flags == 0u);
+
+    // release_in(0) disarms; a link drop disarms too.
+    assert(inj_session_request_absolute_release_in(&s, 5u));
+    assert(inj_session_request_absolute_release_in(&s, 0u));
+    tick(&s, 8u);
+    assert(inj_session_request_absolute_release_in(&s, 5u));
+    inj_session_set_link(&s, false);
+    assert(s.abs_release_slots == 0u);
+}
+
+// inj_session_device_class in every phase: UNKNOWN with the link down or no
+// verdict, NONE on the NO_MOUSE verdict, MOUSE / PAD once a layout is adopted.
+static void test_device_class_follows_the_verdict(void)
+{
+    inj_session_t s;
+    inj_session_init(&s);
+    assert(inj_session_device_class(&s) == INJ_DEVICE_CLASS_UNKNOWN);
+    inj_session_set_link(&s, true);
+    assert(inj_session_device_class(&s) == INJ_DEVICE_CLASS_UNKNOWN);
+    deliver(&s, 3u, 0u, NULL);
+    tick(&s, INJ_SESSION_SETTLE_SLOTS);
+    assert(inj_session_device_class(&s) == INJ_DEVICE_CLASS_NONE);
+    assert(inj_session_no_mouse(&s));  // the wrapper still answers
+    inj_session_set_link(&s, false);
+    assert(inj_session_device_class(&s) == INJ_DEVICE_CLASS_UNKNOWN);
+    inj_session_set_link(&s, true);
+    assert(inj_session_device_class(&s) == INJ_DEVICE_CLASS_NONE);
+
+    offer_pad(&s);  // a late pad overturns NO_MOUSE as a late mouse does
+    assert(inj_session_device_class(&s) == INJ_DEVICE_CLASS_PAD);
+    inj_session_observe_descriptor(&s, 4u, 0u, false);  // re-enumeration forgets it
+    assert(inj_session_device_class(&s) == INJ_DEVICE_CLASS_UNKNOWN);
+
+    inj_session_t m;
+    reach_injecting(&m);
+    assert(inj_session_device_class(&m) == INJ_DEVICE_CLASS_MOUSE);
+}
+
 int main(void)
 {
     test_full_lifecycle();
@@ -990,6 +1222,12 @@ int main(void)
     test_a_withdrawn_descriptor_does_not_block_the_verdict();
     test_commit_timeout_retries_with_a_new_generation();
     test_button_requests_on_a_buttonless_mouse_are_dropped();
+    test_pad_map_is_native_only_and_a_mouse_map_is_not();
+    test_drift_is_silent_on_a_pad();
+    test_requested_absolute_emits_absolute();
+    test_absolute_drops_unmapped_channels_and_refuses_on_a_mouse();
+    test_release_timer_emits_mask_zero_when_it_expires();
+    test_device_class_follows_the_verdict();
 
     printf("inj_session_test: ok\n");
     return 0;

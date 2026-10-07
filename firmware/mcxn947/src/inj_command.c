@@ -75,3 +75,13 @@ spi_frame_result_t inj_build_physical_mask(uint8_t slot[INJ_FRAME_SIZE], uint8_t
     return spi_frame_pack(slot, INJ_TYPE_PHYSICAL_MASK, frame_sequence, (const uint8_t *)payload,
                           INJ_FRAME_PAYLOAD_SIZE);
 }
+
+// ABSOLUTE (0x89) sits next to TELEMETRY_CONFIG (0x88) and shares RELATIVE's
+// 12-byte header. The same adjacent-type argument as above applies, so the
+// test pins the type byte and the first value's offset.
+spi_frame_result_t inj_build_absolute(uint8_t slot[INJ_FRAME_SIZE], uint8_t frame_sequence,
+                                      const inj_absolute_payload_t *payload)
+{
+    return spi_frame_pack(slot, INJ_TYPE_ABSOLUTE, frame_sequence, (const uint8_t *)payload,
+                          INJ_FRAME_PAYLOAD_SIZE);
+}

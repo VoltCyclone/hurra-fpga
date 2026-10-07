@@ -34,7 +34,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#include "hid_mouse_layout.h"
+#include "hid_layout.h"
 #include "injection_wire.h"
 
 // How long descriptor traffic must be quiet, in retired slots (~8 kHz, so
@@ -64,12 +64,25 @@
 // it. Still far below the FPGA's one-deep command queue retire rate.
 #define INJ_SESSION_DEFAULT_PACE 200u
 
-// Which kind of command occupies the single request slot. All three share it
+// Which kind of command occupies the single request slot. All four share it
 // because the FPGA's command queue is one deep.
 #define INJ_SESSION_REQ_NONE 0u
 #define INJ_SESSION_REQ_RELATIVE 1u
 #define INJ_SESSION_REQ_BUTTONS 2u
 #define INJ_SESSION_REQ_PHYSICAL_MASK 3u
+#define INJ_SESSION_REQ_ABSOLUTE 4u
+
+// Held pad channels in an ABSOLUTE, indexed by MAP_ENTRY_CHANNEL.
+#define INJ_SESSION_PAD_CHANNELS 7u
+
+// What the adopted layout is, as the console needs to know it. UNKNOWN until a
+// verdict; NONE is the NO_MOUSE verdict (nothing injectable: a keyboard).
+typedef enum {
+    INJ_DEVICE_CLASS_UNKNOWN = 0,
+    INJ_DEVICE_CLASS_NONE,
+    INJ_DEVICE_CLASS_MOUSE,
+    INJ_DEVICE_CLASS_PAD,
+} inj_device_class_t;
 
 typedef enum {
     INJ_PHASE_WAIT_LINK = 0,   // Transport down; nothing to send.
@@ -92,10 +105,13 @@ typedef struct {
     uint16_t descriptor_generation;
     bool have_generation;
 
-    // The adopted mouse layout and the interface it came from. Composite
-    // devices: the FIRST interface offered with a mouse layout wins.
-    hid_mouse_layout_t layout;
+    // The adopted layout (mouse or pad; layout.device_class says which) and
+    // the interface it came from. Composite devices: the FIRST interface
+    // offered with a layout wins -- link.c compiles mouse before pad, so a
+    // device with both is a mouse.
+    hid_layout_t layout;
     bool have_layout;
+    uint8_t device_class;  // inj_device_class_t of `layout`; UNKNOWN until adopted
     // Descriptor-set slots (hid_descriptor_set.h), not interface numbers:
     uint8_t complete_mask;  // slots whose descriptor completed this generation
     uint8_t judged_mask;    // ... and have been offered a verdict
@@ -110,7 +126,7 @@ typedef struct {
     uint8_t endpoint_number;
 
     // The map being uploaded, built once per attempt (and its CRC with it).
-    inj_map_entry_payload_t entries[HID_MOUSE_MAX_FIELDS];
+    inj_map_entry_payload_t entries[HID_LAYOUT_MAX_FIELDS];
     uint8_t entry_count;
     uint32_t entries_crc32;
 
@@ -145,7 +161,7 @@ typedef struct {
     // retirement interrupt around the whole request, because a request is only
     // consistent once every req_* field and the kind tag are written together.
     //
-    // req_pending is a KIND, not a bitmask: all three request kinds share the
+    // req_pending is a KIND, not a bitmask: all four request kinds share the
     // one slot, so at most one can ever be in flight and a bitmask would imply
     // otherwise.
     int16_t req_x;
@@ -155,7 +171,14 @@ typedef struct {
     uint64_t req_buttons;
     uint64_t req_button_mask;
     uint16_t req_hold_reports;
+    int16_t req_abs_values[INJ_SESSION_PAD_CHANNELS];  // in the fields' logical units
+    uint8_t req_abs_mask;
     uint8_t req_pending;  // INJ_SESSION_REQ_*
+
+    // pad.hold: slots until fill_tx emits an ABSOLUTE with mask 0 by itself.
+    // 0 = disarmed. Written by the foreground (masked), counted down in the
+    // ISR; a pending request at expiry delays the release by one slot.
+    uint32_t abs_release_slots;
 
     // Diagnostics (monotonic; cleared only by init).
     uint32_t requests_sent;
@@ -176,6 +199,8 @@ typedef struct {
     uint32_t button_drops;
     // MAP_COMMITs abandoned for want of a MAP_STATUS.
     uint32_t commit_timeouts;
+    // ABSOLUTE frames emitted by the hold timer (not counted in requests_sent).
+    uint32_t absolute_releases;
 } inj_session_t;
 
 // Reset to WAIT_LINK and load the default pattern/pacing.
@@ -207,10 +232,11 @@ void inj_session_sync_descriptors(inj_session_t *s, uint16_t generation, uint8_t
 
 // The foreground's verdict on one slot's compiled descriptor, which belongs to
 // interface `interface_number`; call it with the retirement ISR masked.
-// `layout` is NULL for "not injectable". A verdict for any generation but the
-// current one is stale and ignored.
+// `layout` is NULL for "not injectable"; otherwise its device_class (MOUSE or
+// PAD) is adopted with it. A verdict for any generation but the current one is
+// stale and ignored.
 void inj_session_offer_layout(inj_session_t *s, uint16_t generation, uint8_t slot,
-                              uint8_t interface_number, const hid_mouse_layout_t *layout);
+                              uint8_t interface_number, const hid_layout_t *layout);
 
 // Stage the next TX slot. Returns true and writes a command frame into `slot`
 // when the session has one to send this slot; returns false when the caller
@@ -252,7 +278,21 @@ bool inj_session_request_buttons(inj_session_t *s, uint64_t mask, uint16_t hold_
 // why axis locks cannot be expressed on this link at all.
 bool inj_session_request_physical_mask(inj_session_t *s, uint64_t button_mask);
 
-// True while a queued request has not yet been emitted. All three request kinds
+// Queue the held pad vector (ABSOLUTE). `mask` bit k holds channel k at
+// values[k], already scaled to that field's logical range by the caller (the
+// link sink, which has the layout); a clear bit releases the channel and its
+// value is ignored. Channels the layout does not map are dropped from the mask
+// and counted in axis_drops. Mask 0 is a real command: it is how every channel
+// is released. Refused unless the adopted layout is a pad.
+bool inj_session_request_absolute(inj_session_t *s, uint8_t mask,
+                                  const int16_t values[INJ_SESSION_PAD_CHANNELS]);
+
+// Arm (or with 0, disarm) the release timer: after `slots` retired slots
+// (125 us each) fill_tx emits an ABSOLUTE with mask 0 on its own. Refused
+// unless INJECTING with a pad layout. Does not occupy the request slot.
+bool inj_session_request_absolute_release_in(inj_session_t *s, uint32_t slots);
+
+// True while a queued request has not yet been emitted. All four request kinds
 // share the one slot, so this is what a caller checks before queuing any of
 // them.
 bool inj_session_pending_request(const inj_session_t *s);
@@ -269,10 +309,15 @@ static inline inj_phase_t inj_session_phase(const inj_session_t *s)
     return s->phase;
 }
 
+// What is attached, as far as the session knows: UNKNOWN while the link is
+// down or no verdict has landed, NONE on the NO_MOUSE verdict, else the
+// adopted layout's class.
+inj_device_class_t inj_session_device_class(const inj_session_t *s);
+
 // The attached device is known to have nothing to inject into.
 static inline bool inj_session_no_mouse(const inj_session_t *s)
 {
-    return s->phase == INJ_PHASE_NO_MOUSE;
+    return inj_session_device_class(s) == INJ_DEVICE_CLASS_NONE;
 }
 
 #endif  // INJ_SESSION_H

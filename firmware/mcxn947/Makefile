@@ -792,12 +792,12 @@ test-inj-session: build/host/inj_session_test
 build/host/inj_session_test: test/inj_session_test.c test/hid_fixtures.h src/inj_session.c \
 		src/inj_command.c src/spi_frame.c src/inj_session.h src/inj_command.h src/spi_frame.h \
 		src/inj_map_build.c src/inj_map_build.h src/hid_mouse_layout.c src/hid_mouse_layout.h \
-		src/hid_layout.h \
+		src/hid_pad_layout.c src/hid_pad_layout.h src/hid_layout.h \
 		src/hid_fields.c src/hid_fields.h src/hid_item.c src/hid_item.h \
 		include/injection_wire.h | build/host
 	$(HOST_CC) $(APP_WARNINGS) -Isrc -Itest -isystem include test/inj_session_test.c \
 		src/inj_session.c src/inj_command.c src/spi_frame.c src/inj_map_build.c \
-		src/hid_mouse_layout.c src/hid_fields.c src/hid_item.c -o $@
+		src/hid_mouse_layout.c src/hid_pad_layout.c src/hid_fields.c src/hid_item.c -o $@
 
 test-link: build/host/link_test
 	./build/host/link_test
