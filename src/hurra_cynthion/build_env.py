@@ -469,14 +469,10 @@ def require_yosys_version(version: tuple[int, int] | None) -> None:
     have = ".".join(str(part) for part in version)
     want = ".".join(str(part) for part in MINIMUM_YOSYS_VERSION)
     raise SystemExit(
-        f"yosys {have} is too old: below {want} this design closes on only a "
-        "small minority of placer seeds, so a build is a coin toss rather than "
-        "a result. Measured on deterministic netlists, same source, same "
-        "nextpnr, twelve seeds each: 0.48 -> 3 of 12 pass; 0.68 -> 12 of 12. "
-        f"{want} is a reliability floor, not the point at which a bitstream "
-        "first becomes possible. Install oss-cad-suite 2026-09-01 or newer, or "
-        "set YOSYS to a newer binary. See CLAUDE.md, 'The yosys floor, "
-        "measured properly'."
+        f"error: yosys {have} is too old; the build needs {want} or newer. Below "
+        f"{want} this design closes timing on few placer seeds (from the same "
+        "source and nextpnr, 0.48 passed 3 of 12 seeds and 0.68 passed 12 of 12). Install "
+        "oss-cad-suite 2026-09-01 or newer, or set YOSYS to a newer yosys binary."
     )
 
 
@@ -505,9 +501,9 @@ def require_nextpnr_opts(value: str) -> None:
     """
     if REQUIRED_NEXTPNR_FLAG not in value:
         raise SystemExit(
-            f"{NEXTPNR_OPTS_VAR}={value!r} is missing {REQUIRED_NEXTPNR_FLAG}. "
-            "The ECP5 build does not close timing without it; see "
-            "docs/TIMING_CLOSURE.md."
+            f"error: {NEXTPNR_OPTS_VAR}={value!r} is missing {REQUIRED_NEXTPNR_FLAG}, "
+            "and the ECP5 build does not close timing without it. Add "
+            f"'{REQUIRED_NEXTPNR_FLAG} 60' to {NEXTPNR_OPTS_VAR}, or unset it."
         )
 
 

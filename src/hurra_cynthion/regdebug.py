@@ -42,14 +42,17 @@ class RegisterDebugLink:
             from apollo_fpga import ApolloDebugger
         except ImportError as exc:  # pragma: no cover - depends on host env
             raise RegisterDebugError(
-                "apollo_fpga is not installed; it comes with the cynthion package "
-                "(pip install -e .), which the register-debug tool needs"
+                "apollo_fpga is not installed; it comes with the cynthion package, "
+                "so run `python3 -m pip install -e .` from the repository root"
             ) from exc
 
         try:
             self._debugger = ApolloDebugger(force_offline=force_offline)
         except Exception as exc:  # pragma: no cover - depends on hardware
-            raise RegisterDebugError(f"could not connect to Apollo debugger: {exc}") from exc
+            raise RegisterDebugError(
+                f"cannot connect to the Apollo debugger ({exc}); check that CONTROL is "
+                "plugged into this machine"
+            ) from exc
         _spi, self._regs = self._debugger.create_jtag_spi(self._debugger.jtag)
 
     def read_raw(self, address: int) -> int:
@@ -78,7 +81,9 @@ class RegisterDebugLink:
         reg = self.resolve(name_or_addr)
         if reg is None:
             if isinstance(name_or_addr, str) and not name_or_addr.isdigit():
-                raise RegisterDebugError(f"unknown register {name_or_addr!r}")
+                raise RegisterDebugError(
+                    f"no register {name_or_addr!r} in the {self.regmap.name!r} map; check --map"
+                )
             addr = int(str(name_or_addr), 0)
             return None, self.read_raw(addr), {}
         raw = self.read_raw(reg.address)
@@ -143,7 +148,8 @@ def _connect(args) -> RegisterDebugLink:
 
 def _cmd_magic(link: RegisterDebugLink, args) -> int:
     raw, ok = link.check_magic()
-    print(f"magic = 0x{raw:08x} ({'OK' if ok else 'MISMATCH — wrong bitstream/register map'})")
+    status = "OK" if ok else "MISMATCH; wrong bitstream or register map"
+    print(f"magic = 0x{raw:08x} ({status})")
     return 0 if ok else 1
 
 
@@ -206,39 +212,45 @@ def _cmd_watch(link: RegisterDebugLink, args) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="hurra-regdebug",
-        description="Read/write hurra-cynthion JTAG debug registers over Apollo.",
+        prog="python3 -m hurra_cynthion.regdebug",
+        description="Read and write hurra-cynthion debug registers over JTAG through Apollo.",
     )
     parser.add_argument(
         "--no-force-offline",
         action="store_true",
-        help="do not force the FPGA offline before connecting (default: force offline)",
+        help="leave the FPGA running while connecting (default: force it offline, "
+        "which stops the relay)",
     )
     parser.add_argument(
         "--map",
         choices=REGISTER_MAP_NAMES,
         default="capture",
-        help="register schema exposed by the loaded diagnostic (default: capture)",
+        help="register map to decode against; the production bitstream needs "
+        "report-injection (default: capture)",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("magic", help="sanity-check the register readback path")
+    sub.add_parser("magic", help="read the magic register to check the readback path")
 
-    p_read = sub.add_parser("read", help="read one register (decoded)")
-    p_read.add_argument("register", help="register name or address (0x.. ok)")
+    p_read = sub.add_parser("read", help="read one register and decode its fields")
+    p_read.add_argument("register", help="register name, or address in decimal or 0x hex")
 
-    p_write = sub.add_parser("write", help="write one register (name or address)")
-    p_write.add_argument("register", help="register name or address")
-    p_write.add_argument("value", help="value to write (0x.. / decimal)")
+    p_write = sub.add_parser("write", help="write one register")
+    p_write.add_argument("register", help="register name, or address in decimal or 0x hex")
+    p_write.add_argument("value", help="value to write, in decimal or 0x hex")
 
-    sub.add_parser("dump", help="read and decode all status registers")
+    sub.add_parser("dump", help="read and decode every status register")
 
-    p_mem = sub.add_parser("mem", help="dump a memory-readback buffer as bytes")
-    p_mem.add_argument("name", help="memory name (e.g. rx, tx, ls)")
+    p_mem = sub.add_parser("mem", help="print a memory readback buffer as hex bytes")
+    p_mem.add_argument("name", help="memory name, such as rx, tx or ls")
 
-    p_watch = sub.add_parser("watch", help="live-poll registers and print on change")
-    p_watch.add_argument("registers", nargs="*", help="register names (default: all status)")
-    p_watch.add_argument("--interval", type=float, default=0.5, help="poll interval seconds")
+    p_watch = sub.add_parser("watch", help="poll registers and print each change")
+    p_watch.add_argument(
+        "registers", nargs="*", help="register names (default: every status register)"
+    )
+    p_watch.add_argument(
+        "--interval", type=float, default=0.5, help="seconds between polls (default: 0.5)"
+    )
 
     return parser
 

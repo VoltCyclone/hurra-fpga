@@ -1392,7 +1392,7 @@ static void link_demo_step(uint32_t slots)
             dbg_puts("-- TX request back on, monitor still OFF. SR=");
             dbg_hex32(sr);
             dbg_puts((sr & LPSPI_SR_TEF_MASK) != 0u ? "  TEF SET (underrun)\n"
-                                                    : "  TEF CLEAR (no underrun!)\n");
+                                                    : "  TEF CLEAR (no underrun)\n");
             s_demo_mark = slots;
             s_demo_phase = LINK_DEMO_UNDERRUN_HELD;
         }
@@ -1421,7 +1421,7 @@ static void link_demo_step(uint32_t slots)
             // Nothing is called here. The monitor is simply armed, and the
             // repair has to happen on its own -- that is the whole point. A
             // ladder someone has to invoke by hand is not a recovery path.
-            dbg_puts("-- monitor ARMED; a link still broken must now repair itself --\n");
+            dbg_puts("-- monitor ARMED; a link that is still broken should now repair itself --\n");
             s_demo_phase = LINK_DEMO_DONE;
         }
         break;
