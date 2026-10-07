@@ -155,6 +155,7 @@ static void test_full_lifecycle(void)
 {
     inj_session_t s;
     inj_session_init(&s);
+    inj_session_set_drift(&s, -2, -2);
     assert(inj_session_phase(&s) == INJ_PHASE_WAIT_LINK);
     assert_idle(&s);
 
@@ -200,8 +201,8 @@ static void test_full_lifecycle(void)
     assert(rel.command_sequence == 1u);
     assert(rel.endpoint_number == 1u);
     assert(rel.flags == (INJ_RELATIVE_FLAG_X | INJ_RELATIVE_FLAG_Y));
-    assert(rel.x == INJ_SESSION_DEFAULT_X);
-    assert(rel.y == INJ_SESSION_DEFAULT_Y);
+    assert(rel.x == -2);
+    assert(rel.y == -2);
     assert(s.relatives_sent == 1u);
 
     // Second RELATIVE increments both the command and frame sequences.
@@ -337,6 +338,7 @@ static void test_requested_relative_preempts_the_paced_drift(void)
 {
     inj_session_t s;
     reach_injecting(&s);
+    inj_session_set_drift(&s, -2, -2);
 
     assert(inj_session_request_relative(&s, 64, -3, 0, 0));
 
@@ -446,6 +448,23 @@ static void test_zero_drift_emits_no_paced_relative(void)
     uint8_t payload[INJ_FRAME_PAYLOAD_SIZE];
     (void)next_frame(&s, &type, payload);
     assert(type == INJ_TYPE_RELATIVE);
+}
+
+// Production defaults must not move a user's pointer. A mouse session remains
+// fully injectable, but it emits no unsolicited paced RELATIVE commands until
+// a caller explicitly enables drift.
+static void test_default_drift_is_zero(void)
+{
+    inj_session_t s;
+    inj_session_init(&s);
+    assert(s.inject_x == 0 && s.inject_y == 0);
+
+    reach_injecting(&s);
+    assert(s.inject_x == 0 && s.inject_y == 0);
+    for (uint32_t i = 0u; i < (INJ_SESSION_DEFAULT_PACE * 3u); i++) {
+        assert_idle(&s);
+    }
+    assert(s.relatives_sent == 0u);
 }
 
 // A click's press half is an injected button mask with a hold; its release half
@@ -1051,7 +1070,8 @@ static void test_drift_is_silent_on_a_pad(void)
 {
     inj_session_t s;
     reach_injecting_pad(&s);
-    assert(s.inject_x != 0 || s.inject_y != 0);  // the default drift is live
+    inj_session_set_drift(&s, -2, -2);
+    assert(s.inject_x == -2 && s.inject_y == -2);
     tick(&s, INJ_SESSION_DEFAULT_PACE * 3u);
     assert(s.relatives_sent == 0u);
 }
@@ -1228,6 +1248,7 @@ int main(void)
     test_request_is_refused_before_injecting();
     test_link_drop_discards_a_pending_request();
     test_zero_drift_emits_no_paced_relative();
+    test_default_drift_is_zero();
     test_requested_buttons_emit_button_state();
     test_requested_physical_mask_emits_physical_mask();
     test_one_request_slot_is_shared_across_kinds();

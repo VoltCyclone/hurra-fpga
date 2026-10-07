@@ -35,6 +35,10 @@ OBJCOPY := $(CROSS_COMPILE)objcopy
 SIZE    := $(CROSS_COMPILE)size
 HOST_CC ?= cc
 
+DEMO ?= 0
+DEMO_CFLAGS := $(if $(filter 1,$(DEMO)),-DHURRA_DEMO=1)
+DEMO_CONFIG_STAMP := build/.demo-config
+
 # Cortex-M33 with the single-precision FPU and DSP extension the part
 # implements (__FPU_PRESENT / __DSP_PRESENT in
 # vendor/mcux-sdk/devices/MCXN947/MCXN947_cm33_core0_COMMON.h).
@@ -83,7 +87,8 @@ INCLUDES := -Isrc -isystem include \
 	-isystem $(VENDOR_SDK)/components/display/st7796s \
 	-isystem $(VENDOR_TUSB)/src
 
-COMMON_CFLAGS := $(CORE0_ARCH) $(CORE0_DEFINES) $(INCLUDES) $(EXTRA_CFLAGS) -Os \
+COMMON_CFLAGS := $(CORE0_ARCH) $(CORE0_DEFINES) $(INCLUDES) $(DEMO_CFLAGS) \
+	$(EXTRA_CFLAGS) -Os \
 	-ffunction-sections -fdata-sections -fno-common
 # MCUX_DBI_LEGACY stays at its default of 1, and that is load-bearing.
 #
@@ -99,7 +104,7 @@ COMMON_CFLAGS := $(CORE0_ARCH) $(CORE0_DEFINES) $(INCLUDES) $(EXTRA_CFLAGS) -Os 
 # (fsl_st7796s.c: `uint16_t param_data = params[i]`), which is correct, and is
 # the path NXP's own working frdmmcxn947 display examples use.
 CORE1_CFLAGS := $(CORE1_ARCH) $(CORE1_DEFINES) \
-	$(INCLUDES) $(EXTRA_CFLAGS) -Os \
+	$(INCLUDES) $(DEMO_CFLAGS) $(EXTRA_CFLAGS) -Os \
 	-ffunction-sections -fdata-sections -fno-common
 APP_WARNINGS      := -std=c11 -Wall -Wextra -Werror -Wconversion -Wshadow
 # Vendor sources are byte-exact imports and are not held to the app's warning
@@ -357,6 +362,13 @@ CORE1_OBJECTS := \
 	build/core1/display.o \
 	build/core1/main_core1.o
 
+# Make does not otherwise know that a command-line flag changed. Keep the
+# effective target-only demo flags in one stamp and make every target object
+# depend on it, so changing DEMO rebuilds both cores instead of silently
+# reusing objects from the other configuration. Host tests intentionally do
+# not depend on this stamp and continue to compile production behavior.
+$(CORE0_OBJECTS) $(CORE1_OBJECTS): $(DEMO_CONFIG_STAMP)
+
 .PHONY: all check check-copies clean flash flash-core0-only flash-merged \
 	verify-core1-blank probes test test-platform \
 	test-heartbeat test-link test-link-retire test-link-recovery test-spi-frame \
@@ -366,7 +378,7 @@ CORE1_OBJECTS := \
 	test-hid-descriptor-reassembly test-hid-report-decoder \
 	test-hid-item test-hid-fields test-hid-mouse-layout test-hid-pad-layout test-inj-map-build \
 	test-hid-descriptor-set test-inj-command test-inj-session test-link-fault-classify \
-	test-merge-images
+	test-merge-images FORCE
 
 all: build/hurra-mcxn947.bin
 
@@ -679,6 +691,14 @@ build/core1/main_core1.o: src/main_core1.c src/fault.h src/shared_window.h \
 
 build/core0 build/core1 build/host:
 	mkdir -p $@
+
+$(DEMO_CONFIG_STAMP): FORCE
+	@mkdir -p $(dir $@)
+	@if [ ! -f $@ ] || ! grep -Fqx -- '$(DEMO_CFLAGS)' $@; then \
+		printf '%s\n' '$(DEMO_CFLAGS)' > $@; \
+	fi
+
+FORCE:
 
 # --- the gate ---------------------------------------------------------------
 

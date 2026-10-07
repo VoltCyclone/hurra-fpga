@@ -24,9 +24,10 @@
 // when it would otherwise stage an IDLE slot, and feeds observed telemetry in
 // through the observe_* entry points.
 //
-// The injected drift is intentionally static (a steady counter-drift, tunable
-// below): it proves injection reaches live traffic, and a fixed value keeps the
-// effect and the tests deterministic.
+// The optional bench-demo drift is intentionally static (a steady
+// counter-drift, tunable below): it proves injection reaches live traffic, and
+// a fixed value keeps the effect and the tests deterministic. Shipped images
+// leave it off unless HURRA_DEMO is enabled at build time.
 
 #ifndef INJ_SESSION_H
 #define INJ_SESSION_H
@@ -49,19 +50,25 @@
 // would otherwise park the session in WAIT_COMMIT until the link dropped.
 #define INJ_SESSION_COMMIT_TIMEOUT_SLOTS 4096u
 
-// Steady injected deltas, added to every targeted report's X/Y: a slow
-// up-and-left drift laid over the test mouse's motion. Additive with per-field
-// overflow rejection, so an out-of-range sum simply passes that report through.
-// Kept small on purpose -- see the pace note for why, at 8 kHz, small is fast.
+// Steady injected deltas, added to every targeted report's X/Y. The bench demo
+// opts into a slow up-and-left drift; production defaults to no unsolicited
+// motion. Additive with per-field overflow rejection, so an out-of-range sum
+// simply passes that report through.
+#if HURRA_DEMO
 #define INJ_SESSION_DEFAULT_X (-2)
 #define INJ_SESSION_DEFAULT_Y (-2)
+#else
+#define INJ_SESSION_DEFAULT_X 0
+#define INJ_SESSION_DEFAULT_Y 0
+#endif
 
 // Emit one RELATIVE every Nth fill_tx opportunity. At 8 kHz any sustained delta
 // accumulates hard: a period of 4 would be ~2000 injections/s (~4000 counts/s per axis)
-// and fling the cursor off-screen. Period 200 is ~40/s, so the -2 deltas above
-// give ~-80 counts/s per axis -- a gentle drift comparable to the slow-circle
-// test mouse, so the injection visibly pushes the cursor rather than blurring
-// it. Still far below the FPGA's one-deep command queue retire rate.
+// and fling the cursor off-screen. Period 200 is ~40/s; when the bench demo is
+// enabled, its -2 deltas give ~-80 counts/s per axis -- a gentle drift
+// comparable to the slow-circle test mouse. The pace also applies to any drift
+// a caller sets and remains far below the FPGA's one-deep command queue retire
+// rate.
 #define INJ_SESSION_DEFAULT_PACE 200u
 
 // Which kind of command occupies the single request slot. All four share it

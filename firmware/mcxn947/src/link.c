@@ -970,8 +970,8 @@ void EDMA_0_CH1_DriverIRQHandler(void)
 //
 // EVIDENCE FOR IT: 7 of 7 boots clean with this wait, against 1 of 2 without.
 // Suggestive, not proven -- n = 2 on the control side -- and three deliberate
-// attempts to reproduce the offset at run time all failed (see
-// link_demo_perturb_rx). The mechanism is NOT established, and a claim resting
+// attempts to reproduce the offset at run time all failed (see the opt-in RX
+// FIFO perturbation below). The mechanism is NOT established, and a claim resting
 // on "the boundary is latched at CR[MEN]" should not be built on this.
 //
 // WHAT THE FRAMING MONITOR DOES AND DOES NOT BUY, corrected against the
@@ -1243,6 +1243,8 @@ static void link_recover(const link_fault_t *fault)
     dbg_puts("\n");
 }
 
+#if HURRA_DEMO
+
 // --- The one-shot ERR051588 provocation ------------------------------------
 //
 // Design doc section 9 step 3: "Includes deliberately provoking ERR051588 by
@@ -1305,13 +1307,21 @@ static const char *link_demo_phase_name(void)
     }
 }
 
-// The automatic monitor is suppressed for exactly the windows the provocation
-// owns. Everywhere else -- including before the provocation, so a fault
-// inherited from the boot or from a flash cycle is caught -- it is armed.
+#endif
+
+// The automatic monitor is always armed in production. In a demo image it is
+// suppressed only for the windows the provocation owns; before and after them
+// it is armed, so a fault inherited from boot or a flash cycle is still caught.
 static bool link_fault_monitor_armed(void)
 {
+#if HURRA_DEMO
     return s_demo_phase == LINK_DEMO_ARMED || s_demo_phase == LINK_DEMO_DONE;
+#else
+    return true;
+#endif
 }
+
+#if HURRA_DEMO
 
 // A NEGATIVE CONTROL, and it is labelled one because it is what it measured.
 //
@@ -1421,6 +1431,8 @@ static void link_demo_step(uint32_t slots)
         break;
     }
 }
+
+#endif
 
 // --- Framing monitor -------------------------------------------------------
 //
@@ -1681,7 +1693,11 @@ static void link_report(void)
     const link_retire_counters_t *c = link_retire_counters();
 
     dbg_puts("[");
+#if HURRA_DEMO
     dbg_puts(link_demo_phase_name());
+#else
+    dbg_puts("steady");
+#endif
     dbg_puts("] slots=");
     dbg_dec32(c->slots);
     dbg_puts(" idle=");
@@ -1761,7 +1777,9 @@ void link_poll(void)
     // reports nor recovery messages can stall the fault monitor.
     dbg_uart_poll();
 
+#if HURRA_DEMO
     const uint32_t slots = link_retire_counters()->slots;
+#endif
 
     // Sampled unconditionally, acted on only when armed. Sampling inside the
     // armed branch instead would leave s_framing_previous stale across a
@@ -1769,7 +1787,9 @@ void link_poll(void)
     // against a sample from minutes earlier.
     const bool framing_lost = link_framing_poll();
 
+#if HURRA_DEMO
     link_demo_step(slots);
+#endif
 
     // At most one descriptor compile per pass; the ISR only marks them dirty.
     link_descriptor_service();
