@@ -18,6 +18,7 @@ from hurra_cynthion.injection_wire import (
     INJ_MAP_ENTRY_CHANNEL_RT,
     INJ_MAP_ENTRY_CHANNEL_RX,
     INJ_MAP_ENTRY_CHANNEL_RY,
+    INJ_MAP_ENTRY_FLAG_BUTTON,
     INJ_MAP_ENTRY_FLAG_RELATIVE,
     INJ_MAP_ENTRY_FLAG_SIGNED,
     INJ_MAP_ENTRY_FLAG_X,
@@ -90,6 +91,68 @@ def relative_x_entry(*, descriptor_generation: int, report_length: int = 1) -> M
         report_length=report_length,
         channel=0,
     )
+
+
+def pad_entries(*, descriptor_generation: int) -> list[MapEntryPayload]:
+    """Buttons @0, unsigned LX @8 and LY @16, 4-bit hat @24; report length 4."""
+    common = {
+        "descriptor_generation": descriptor_generation,
+        "map_generation": 1,
+        "interface_number": 0,
+        "endpoint_number": 1,
+        "report_id": 0,
+        "report_length": 4,
+    }
+    return [
+        MapEntryPayload(
+            entry_index=0,
+            usage_page=0x09,
+            usage=1,
+            bit_offset=0,
+            bit_width=8,
+            flags=INJ_MAP_ENTRY_FLAG_BUTTON,
+            logical_minimum=0,
+            logical_maximum=1,
+            channel=0,
+            **common,
+        ),
+        MapEntryPayload(
+            entry_index=1,
+            usage_page=0x01,
+            usage=0x30,
+            bit_offset=8,
+            bit_width=8,
+            flags=0,
+            logical_minimum=0,
+            logical_maximum=255,
+            channel=INJ_MAP_ENTRY_CHANNEL_LX,
+            **common,
+        ),
+        MapEntryPayload(
+            entry_index=2,
+            usage_page=0x01,
+            usage=0x31,
+            bit_offset=16,
+            bit_width=8,
+            flags=0,
+            logical_minimum=0,
+            logical_maximum=255,
+            channel=INJ_MAP_ENTRY_CHANNEL_LY,
+            **common,
+        ),
+        MapEntryPayload(
+            entry_index=3,
+            usage_page=0x01,
+            usage=0x39,
+            bit_offset=24,
+            bit_width=4,
+            flags=0,
+            logical_minimum=0,
+            logical_maximum=7,
+            channel=INJ_MAP_ENTRY_CHANNEL_HAT,
+            **common,
+        ),
+    ]
 
 
 async def initialize(ctx, plane, *, link_ready: int = 1) -> None:
@@ -1393,5 +1456,54 @@ def test_an_absolute_with_a_stale_map_generation_is_dropped_not_queued() -> None
 
         assert ctx.get(plane.invalid_rx_count) == before + 1
         assert ctx.get(plane.engine.absolute_valid) == 0
+
+    run_simulation(bench)
+
+
+def test_native_only_absolute_commands_ack_without_a_report_and_never_block_the_queue() -> None:
+    """Two ABSOLUTEs a slot apart on a still NATIVE_ONLY pad both commit.
+
+    The plane's RX staging is one deep: a command that cannot ack blocks every
+    later frame. On a NATIVE_ONLY layout the ack must come with nothing on the
+    wire, within the 125 us (7,500 cycle) slot before the next frame.
+    """
+
+    async def bench(ctx, harness) -> None:
+        plane = harness.plane
+        engine = plane.engine
+        await initialize(ctx, plane)
+        entries = pad_entries(descriptor_generation=ctx.get(harness.store.descriptor_generation))
+        await commit_entries(ctx, harness, entries, begin_flags=INJ_MAP_FLAG_NATIVE_ONLY)
+        assert ctx.get(plane.map_store.active_native_only) == 1
+
+        for sequence, lx in ((0x21, 200), (0x22, 10)):
+            await drive_absolute(
+                ctx,
+                plane,
+                mask=INJ_ABSOLUTE_FLAG_LX,
+                values={INJ_MAP_ENTRY_CHANNEL_LX: lx},
+                sequence=sequence,
+            )
+            ctx.set(plane.sof_tick, 1)
+            await ctx.tick("usb")
+            ctx.set(plane.sof_tick, 0)
+            for _ in range(7_500):
+                assert not ctx.get(plane.output_valid)
+                if not ctx.get(engine.absolute_valid):
+                    break
+                await ctx.tick("usb")
+            else:
+                raise AssertionError(f"ABSOLUTE 0x{sequence:02x} was not acked within one slot")
+
+        assert ctx.get(plane.invalid_rx_count) == 0
+        assert ctx.get(plane.command_commit_count) == 2
+        assert ctx.get(plane.synthesized_report_count) == 0
+        assert ctx.get(plane.accepted_report_count) == 0
+        assert ctx.get(engine.held_mask) == INJ_ABSOLUTE_FLAG_LX
+
+        await push_report(ctx, plane, bytes([0x00, 50, 60, 0x00]))
+        assert await drain_output(ctx, plane, 4) == bytes([0x00, 10, 60, 0x00])
+        assert ctx.get(plane.accepted_report_count) == 1
+        assert ctx.get(plane.mutated_report_count) == 0
 
     run_simulation(bench)

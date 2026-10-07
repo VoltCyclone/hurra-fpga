@@ -23,6 +23,7 @@ from hurra_cynthion.injection_wire import (
     INJ_MAP_ENTRY_FLAG_SIGNED,
     INJ_MAP_ENTRY_FLAG_X,
     INJ_MAP_ENTRY_FLAG_Y,
+    INJ_MAP_FLAG_NATIVE_ONLY,
     INJ_RELATIVE_FLAG_X,
     INJ_RELATIVE_FLAG_Y,
     MapEntryPayload,
@@ -82,7 +83,9 @@ def map_entry(
     )
 
 
-async def commit_map(ctx, store, entries: list[MapEntryPayload], *, generation: int = 1) -> None:
+async def commit_map(
+    ctx, store, entries: list[MapEntryPayload], *, generation: int = 1, native_only: bool = False
+) -> None:
     canonical = b"".join(entry.to_bytes() for entry in entries)
     layouts = {
         (entry.interface_number, entry.endpoint_number, entry.report_id) for entry in entries
@@ -93,9 +96,11 @@ async def commit_map(ctx, store, entries: list[MapEntryPayload], *, generation: 
     ctx.set(store.candidate_entry_count, len(entries))
     ctx.set(store.candidate_layout_count, len(layouts))
     ctx.set(store.candidate_entries_crc32, zlib.crc32(canonical))
+    ctx.set(store.begin_flags, INJ_MAP_FLAG_NATIVE_ONLY if native_only else 0)
     ctx.set(store.begin, 1)
     await ctx.tick("usb")
     ctx.set(store.begin, 0)
+    ctx.set(store.begin_flags, 0)
 
     for entry in entries:
         ctx.set(store.entry.as_value(), int.from_bytes(entry.to_bytes(), "little"))
@@ -2647,3 +2652,113 @@ def test_pad_state_is_one_bounded_synchronous_memory_beside_the_state_record() -
     assert PAD_STATE_LAYOUT.size == 119
     assert "held_mask_0" not in converted
     assert "held_value0_0" not in converted
+
+
+# --- NATIVE_ONLY: ack without a report ---------------------------------------------
+#
+# On a NATIVE_ONLY map a command commits to the layout's record and is acked at
+# once through a suppressed stationary transaction; nothing is synthesised, the
+# next native report carries the held state, residuals ride natives.
+
+
+async def _wait_for_silent_ack(ctx, engine, ready, *, cycles: int = 400) -> None:
+    """Tick until ``ready`` pulses, asserting nothing was offered downstream."""
+    for elapsed in range(cycles):
+        assert not ctx.get(engine.output_valid), f"a report was synthesised at +{elapsed}"
+        if ctx.get(ready):
+            await ctx.tick("usb")
+            return
+        await ctx.tick("usb")
+    raise AssertionError("command was not acked")
+
+
+def test_native_only_absolute_acks_a_still_device_with_nothing_on_the_wire() -> None:
+    # The inverse of test_zero_delta_relative_command_waits_for_native_report.
+    harness = InjectionHarness()
+    engine = harness.engine
+    simulation = Simulator(harness)
+    simulation.add_clock(1e-6, domain="usb")
+
+    async def bench(ctx) -> None:
+        await commit_map(ctx, harness.map_store, _absolute_entries(), native_only=True)
+        _set_absolute(
+            ctx,
+            engine,
+            mask=INJ_ABSOLUTE_FLAG_LX,
+            values={INJ_MAP_ENTRY_CHANNEL_LX: 200},
+            sequence=0xA1,
+        )
+        await pulse_sof(ctx, engine)
+        await _wait_for_silent_ack(ctx, engine, engine.absolute_ready)
+        ctx.set(engine.absolute_valid, 0)
+        assert ctx.get(engine.absolute_commit_pulse) == 1
+        assert ctx.get(engine.held_mask) == INJ_ABSOLUTE_FLAG_LX
+        assert ctx.get(engine.last_committed_command_sequence) == 0xA1
+
+        await pulse_sof(ctx, engine)
+        for _ in range(64):
+            await ctx.tick("usb")
+            assert not ctx.get(engine.output_valid)
+
+        await push_report(ctx, engine, bytes([0x01, 50, 60, 0x02]))
+        emitted, acknowledgements = await drain_report(ctx, engine, PAD_REPORT_LENGTH)
+        assert emitted == bytes([0x01, 200, 60, 0x02])
+        assert not acknowledgements
+
+    simulation.add_testbench(bench)
+    simulation.run()
+
+
+def test_native_only_button_state_acks_with_nothing_on_the_wire() -> None:
+    harness = InjectionHarness()
+    engine = harness.engine
+    simulation = Simulator(harness)
+    simulation.add_clock(1e-6, domain="usb")
+
+    async def bench(ctx) -> None:
+        await commit_map(ctx, harness.map_store, _buttons_x_entries(), native_only=True)
+        _set_button_state(ctx, engine, 0b1, sequence=0xA2)
+        await pulse_sof(ctx, engine)
+        await _wait_for_silent_ack(ctx, engine, engine.button_ready)
+        ctx.set(engine.button_valid, 0)
+        assert ctx.get(engine.injected_buttons) == 0b1
+
+        await push_report(ctx, engine, bytes([0x00, 10]))
+        emitted, acknowledgements = await drain_report(ctx, engine, 2)
+        assert emitted == bytes([0x01, 10])
+        assert not acknowledgements
+
+    simulation.add_testbench(bench)
+    simulation.run()
+
+
+def test_native_only_relative_residual_is_acked_and_rides_the_next_native() -> None:
+    harness = InjectionHarness()
+    engine = harness.engine
+    simulation = Simulator(harness)
+    simulation.add_clock(1e-6, domain="usb")
+
+    async def bench(ctx) -> None:
+        await commit_map(ctx, harness.map_store, _buttons_x_entries(), native_only=True)
+        _set_relative_x(ctx, engine, 5, sequence=0xA3)
+        await pulse_sof(ctx, engine)
+        await _wait_for_silent_ack(ctx, engine, engine.relative_ready)
+        ctx.set(engine.relative_valid, 0)
+        # Committed as a residual, not consumed: no field pipeline ran.
+        assert ctx.get(engine.pending_x) == 5
+        assert ctx.get(engine.last_committed_command_sequence) == 0xA3
+
+        # Residual synthesis is off on a NATIVE_ONLY layout.
+        await pulse_sof(ctx, engine)
+        for _ in range(64):
+            await ctx.tick("usb")
+            assert not ctx.get(engine.output_valid)
+
+        await push_report(ctx, engine, bytes([0x00, 10]))
+        emitted, acknowledgements = await drain_report(ctx, engine, 2)
+        assert emitted == bytes([0x00, 15])
+        assert not acknowledgements
+        assert ctx.get(engine.pending_x) == 0
+
+    simulation.add_testbench(bench)
+    simulation.run()

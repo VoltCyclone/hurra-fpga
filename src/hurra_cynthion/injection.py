@@ -479,6 +479,11 @@ class ReportInjectionEngine(Elaboratable):
         transaction_mask = Signal()
         transaction_clear = Signal()
         transaction_absolute = Signal()
+        # A NATIVE_ONLY layout's stationary transaction: committed and acked
+        # through the final-byte handshake like any other, with output_valid
+        # held low so nothing reaches the relay. Registered in STATIONARY_SCAN
+        # from the store's plain active_native_only register.
+        transaction_suppressed = Signal()
         transaction_relative_admitted = Signal()
         transaction_relative_overflow = Signal()
         transaction_click_release = Signal()
@@ -914,6 +919,7 @@ class ReportInjectionEngine(Elaboratable):
                         # device changes protocol is wholly one or the other.
                         captured_boot.eq((self.boot_protocol >> self.report_endpoint)[0]),
                         transaction_stationary.eq(0),
+                        transaction_suppressed.eq(0),
                     ]
                     with m.If(self.report_last):
                         m.d.usb += [
@@ -1031,7 +1037,11 @@ class ReportInjectionEngine(Elaboratable):
                 m.d.usb += [
                     stationary_scan_index.eq(scan_next),
                     stationary_predicate_valid_q.eq(1),
-                    stationary_predicate_motion_q.eq(scan_motion_pending),
+                    # Residuals ride native reports on a NATIVE_ONLY layout; every
+                    # command kind still acks.
+                    stationary_predicate_motion_q.eq(
+                        scan_motion_pending & ~store.active_native_only
+                    ),
                     stationary_predicate_relative_q.eq(scan_relative_pending),
                     stationary_predicate_button_q.eq(scan_button_pending),
                     stationary_predicate_mask_q.eq(scan_mask_pending),
@@ -1084,6 +1094,7 @@ class ReportInjectionEngine(Elaboratable):
                         report_length.eq(stationary_decision_report_length),
                         transaction_mapped.eq(1),
                         transaction_stationary.eq(1),
+                        transaction_suppressed.eq(store.active_native_only),
                         stationary_load_index.eq(0),
                         stationary_fetch_index.eq(0),
                     ]
@@ -1376,7 +1387,9 @@ class ReportInjectionEngine(Elaboratable):
                     ),
                     entry_index.eq(0),
                 ]
-                with m.If(snapshot_entry_count == 0):
+                # A suppressed transaction runs no field pipeline: relative
+                # residuals are left in the record for the next native report.
+                with m.If((snapshot_entry_count == 0) | transaction_suppressed):
                     m.d.usb += [
                         output_index.eq(0),
                         output_started.eq(0),
@@ -1590,6 +1603,7 @@ class ReportInjectionEngine(Elaboratable):
                         transaction_absolute.eq(0),
                         transaction_click_release.eq(0),
                         transaction_stationary.eq(0),
+                        transaction_suppressed.eq(0),
                         transaction_mapped.eq(0),
                         transaction_invalidated.eq(0),
                     ]
@@ -1605,6 +1619,7 @@ class ReportInjectionEngine(Elaboratable):
                         transaction_button.eq(0),
                         transaction_mask.eq(0),
                         transaction_clear.eq(0),
+                        transaction_suppressed.eq(0),
                         transaction_absolute.eq(0),
                         transaction_click_release.eq(0),
                         transaction_mapped.eq(0),
@@ -1627,8 +1642,14 @@ class ReportInjectionEngine(Elaboratable):
             with m.State("OUTPUT"):
                 snapshot_lost = transaction_mapped & ~snapshot_matches
                 commit_allowed = transaction_mapped & ~transaction_invalidated & ~snapshot_lost
-                m.d.comb += self.output_valid.eq(~(snapshot_lost & ~output_started))
-                output_accept = self.output_ready & ~(snapshot_lost & ~output_started)
+                # Suppressed: nothing is offered, every byte "accepts" itself, and
+                # the final-byte handshake still commits the record and acks.
+                m.d.comb += self.output_valid.eq(
+                    ~(snapshot_lost & ~output_started) & ~transaction_suppressed
+                )
+                output_accept = (self.output_ready | transaction_suppressed) & ~(
+                    snapshot_lost & ~output_started
+                )
                 final_accept = output_accept & self.output_last
                 m.d.comb += [
                     self.relative_ready.eq(final_accept & commit_allowed & transaction_relative),
@@ -1726,6 +1747,7 @@ class ReportInjectionEngine(Elaboratable):
                             transaction_absolute.eq(0),
                             transaction_click_release.eq(0),
                             transaction_stationary.eq(0),
+                            transaction_suppressed.eq(0),
                             transaction_mapped.eq(0),
                             transaction_invalidated.eq(0),
                             output_started.eq(0),

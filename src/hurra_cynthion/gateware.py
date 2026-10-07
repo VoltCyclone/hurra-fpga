@@ -489,7 +489,11 @@ class ReportInjectionDataPlane(Elaboratable):
         native_input_start = engine.report_valid & engine.report_ready & engine.report_first
         output_accept = monitor.output_valid & monitor.output_ready
         report_accept = output_accept & monitor.output_last
-        command_commit = report_accept & (
+        # Each *_ready is the engine's final-byte handshake. While every commit
+        # carried a report this equalled report_accept & (...) -- the monitor is
+        # transparent -- but a NATIVE_ONLY layout commits with nothing on the
+        # wire, and that command still counts; the report (there is none) does not.
+        command_commit = (
             engine.relative_ready
             | engine.button_ready
             | engine.mask_ready
@@ -511,7 +515,8 @@ class ReportInjectionDataPlane(Elaboratable):
         with m.If(command_commit):
             with m.If(self.command_commit_count != 0xFFFF_FFFF):
                 m.d.usb += self.command_commit_count.eq(self.command_commit_count + 1)
-            with m.If(self.mutated_report_count != 0xFFFF_FFFF):
+            # A suppressed ack carries no report.
+            with m.If(report_accept & (self.mutated_report_count != 0xFFFF_FFFF)):
                 m.d.usb += self.mutated_report_count.eq(self.mutated_report_count + 1)
         with m.If(invalid_rx & (self.invalid_rx_count != 0xFFFF_FFFF)):
             m.d.usb += self.invalid_rx_count.eq(self.invalid_rx_count + 1)
