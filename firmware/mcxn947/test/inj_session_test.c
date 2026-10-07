@@ -1056,6 +1056,20 @@ static void test_drift_is_silent_on_a_pad(void)
     assert(s.relatives_sent == 0u);
 }
 
+// A pad's LX/LY/RX/RY kinds alias the mouse X/Y/WHEEL/PAN kind numbers. A
+// RELATIVE request must be refused before that alias can create a frame which
+// the pad's NATIVE_ONLY map cannot carry.
+static void test_relative_requests_are_refused_on_a_pad(void)
+{
+    inj_session_t s;
+    reach_injecting_pad(&s);
+
+    assert(!inj_session_request_relative(&s, 1, 2, 3, 4));
+    assert(s.requests_refused == 1u);
+    assert(!inj_session_pending_request(&s));
+    tick(&s, INJ_SESSION_DEFAULT_PACE * 3u);
+}
+
 // request_absolute emits one ABSOLUTE citing the active generation, with the
 // mask and seven values as given, and advances command_sequence.
 static void test_requested_absolute_emits_absolute(void)
@@ -1224,6 +1238,7 @@ int main(void)
     test_button_requests_on_a_buttonless_mouse_are_dropped();
     test_pad_map_is_native_only_and_a_mouse_map_is_not();
     test_drift_is_silent_on_a_pad();
+    test_relative_requests_are_refused_on_a_pad();
     test_requested_absolute_emits_absolute();
     test_absolute_drops_unmapped_channels_and_refuses_on_a_mouse();
     test_release_timer_emits_mask_zero_when_it_expires();

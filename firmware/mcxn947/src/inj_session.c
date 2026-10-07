@@ -298,6 +298,9 @@ static uint8_t relative_flags(int16_t x, int16_t y, int16_t wheel, int16_t pan)
 // The RELATIVE enable bits this session's map can honour.
 static uint8_t layout_relative_flags(const inj_session_t *s)
 {
+    if (s->device_class != INJ_DEVICE_CLASS_MOUSE) {
+        return 0u;
+    }
     uint8_t flags = 0u;
     if ((s->layout.axes & HID_MOUSE_AXIS_BIT(HID_MOUSE_X)) != 0u) {
         flags |= (uint8_t)INJ_RELATIVE_FLAG_X;
@@ -442,6 +445,10 @@ static bool request_slot_free(inj_session_t *s)
 bool inj_session_request_relative(inj_session_t *s, int16_t x, int16_t y,
                                   int16_t wheel, int16_t pan)
 {
+    if (s->device_class != INJ_DEVICE_CLASS_MOUSE) {
+        s->requests_refused++;  // a pad map has no relative entries
+        return false;
+    }
     if (!request_slot_free(s)) {
         return false;
     }
