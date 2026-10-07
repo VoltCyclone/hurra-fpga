@@ -204,6 +204,26 @@ static void test_too_many_fields_is_unsupported_not_truncated(void)
     assert(l.field_count == 16u);
 }
 
+// The real DS4: report ID 1, 64 bytes, the same eight fields as the shaped
+// fixture (the capture adds Physical Minimum/Maximum and Unit items around the
+// hat, which the walker ignores). Armed by HID_FIXTURE_DS4_CAPTURED.
+static void test_real_ds4_compiles_like_the_shaped_fixture(void)
+{
+    assert(sizeof(HID_FIXTURE_DS4) == 507u);
+#if HID_FIXTURE_DS4_CAPTURED
+    hid_layout_t l;
+    assert(hid_pad_compile(HID_FIXTURE_DS4, sizeof(HID_FIXTURE_DS4), &l) == HID_PAD_OK);
+    assert(l.report_id == 1u && l.report_length == 64u);
+    assert(l.field_count == 8u);
+    assert_channel(&l, HID_PAD_KIND_LX, 0x01u, 0x30u, 8u, 8u, 0, 255);
+    assert_channel(&l, HID_PAD_KIND_HAT, 0x01u, 0x39u, 40u, 4u, 0, 7);
+    assert_channel(&l, HID_PAD_KIND_LT, 0x01u, 0x33u, 64u, 8u, 0, 255);
+    assert(find(&l, HID_PAD_KIND_BUTTONS, 0u)->bit_width == 14u);
+#else
+    printf("hid_pad_layout_test: HID_FIXTURE_DS4 is a placeholder (capture pending)\n");
+#endif
+}
+
 int main(void)
 {
     test_ds4_shaped_pad();
@@ -212,6 +232,7 @@ int main(void)
     test_hat_outside_0_to_7_is_not_mapped();
     test_simulation_triggers_fill_lt_rt_when_rx_ry_absent();
     test_too_many_fields_is_unsupported_not_truncated();
+    test_real_ds4_compiles_like_the_shaped_fixture();
     printf("hid_pad_layout_test: ok\n");
     return 0;
 }

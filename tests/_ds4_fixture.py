@@ -60,6 +60,10 @@ _TOTAL = 9 + len(_BODY)
 DS4_CONFIG_DESCRIPTOR = bytes([9, 2, _TOTAL & 0xFF, _TOTAL >> 8, 4, 1, 0, 0xC0, 0xFA]) + _BODY
 
 #: The real DS4 report descriptor is 507 bytes (0x01FB, as declared above).
-#: Its contents do not matter to the configuration parser, which only reads
-#: the declared length, so this is filler of exactly the right size.
-DS4_REPORT_DESCRIPTOR = bytes(507)
+#: Byte-exact capture from the bench (docs/PAD_INJECTION.md section 4); until it
+#: lands this is a zero placeholder of exactly the right size, and
+#: ``DS4_REPORT_DESCRIPTOR_CAPTURED`` gates the tests that read its contents.
+#: It must stay identical to ``firmware/mcxn947/test/hid_fixtures.h``'s
+#: ``HID_FIXTURE_DS4``; ``tests/test_mcu_compiled_map_e2e.py`` checks that.
+DS4_REPORT_DESCRIPTOR_CAPTURED = False
+DS4_REPORT_DESCRIPTOR = bytes(507)  # fill from capture: paste ds4_py.txt here
