@@ -6,7 +6,18 @@
 
 #include "inj_command.h"
 
-static uint8_t entry_flags(const hid_mouse_field_t *field)
+// A pad axis is the ABSOLUTE class: neither RELATIVE nor BUTTON set. SIGNED is
+// informational there (the engine ignores it for class 3) and is set for a
+// negative logical minimum as it is for a mouse axis.
+static uint8_t pad_entry_flags(const hid_layout_field_t *field)
+{
+    if (field->kind == HID_PAD_KIND_BUTTONS) {
+        return (uint8_t)INJ_MAP_ENTRY_FLAG_BUTTON;
+    }
+    return (uint8_t)(field->logical_minimum < 0 ? INJ_MAP_ENTRY_FLAG_SIGNED : 0u);
+}
+
+static uint8_t mouse_entry_flags(const hid_layout_field_t *field)
 {
     if (field->kind == HID_MOUSE_BUTTONS) {
         return (uint8_t)INJ_MAP_ENTRY_FLAG_BUTTON;
@@ -34,14 +45,32 @@ static uint8_t entry_flags(const hid_mouse_field_t *field)
     return flags;
 }
 
-uint8_t inj_map_build_entries(const hid_mouse_layout_t *layout, const inj_map_target_t *target,
-                              inj_map_entry_payload_t out[HID_MOUSE_MAX_FIELDS])
+static uint8_t entry_flags(const hid_layout_t *layout, const hid_layout_field_t *field)
 {
-    memset(out, 0, HID_MOUSE_MAX_FIELDS * sizeof(out[0]));
+    return layout->device_class == HID_DEVICE_CLASS_PAD ? pad_entry_flags(field)
+                                                        : mouse_entry_flags(field);
+}
+
+// Byte 25: the wire channel of an absolute entry (a pad axis kind IS its
+// channel, see hid_layout.h). Must be 0 on BUTTON and RELATIVE entries or the
+// store rejects the map with UNSUPPORTED_FIELD -- so a mouse layout, whose
+// kinds overlap the channel numbers, never writes one.
+static uint8_t entry_channel(const hid_layout_t *layout, const hid_layout_field_t *field)
+{
+    if (layout->device_class == HID_DEVICE_CLASS_PAD && field->kind != HID_PAD_KIND_BUTTONS) {
+        return field->kind;
+    }
+    return 0u;
+}
+
+uint8_t inj_map_build_entries(const hid_layout_t *layout, const inj_map_target_t *target,
+                              inj_map_entry_payload_t out[HID_LAYOUT_MAX_FIELDS])
+{
+    memset(out, 0, HID_LAYOUT_MAX_FIELDS * sizeof(out[0]));
     const uint8_t count =
-        layout->field_count < HID_MOUSE_MAX_FIELDS ? layout->field_count : HID_MOUSE_MAX_FIELDS;
+        layout->field_count < HID_LAYOUT_MAX_FIELDS ? layout->field_count : HID_LAYOUT_MAX_FIELDS;
     for (uint8_t i = 0u; i < count; ++i) {
-        const hid_mouse_field_t *field = &layout->fields[i];
+        const hid_layout_field_t *field = &layout->fields[i];
         inj_map_entry_payload_t *e = &out[i];
         e->descriptor_generation = target->descriptor_generation;
         e->map_generation = target->map_generation;
@@ -53,13 +82,11 @@ uint8_t inj_map_build_entries(const hid_mouse_layout_t *layout, const inj_map_ta
         e->usage = field->usage;
         e->bit_offset = field->bit_offset;
         e->bit_width = field->bit_width;
-        e->flags = entry_flags(field);
+        e->flags = entry_flags(layout, field);
         e->logical_minimum = field->logical_minimum;
         e->logical_maximum = field->logical_maximum;
         e->report_length = target->report_length;
-        // Mouse entries never name a pad channel; the memset above already
-        // zeroed byte 25, but the wire now gives it a meaning, so say so.
-        e->channel = 0u;
+        e->channel = entry_channel(layout, field);
     }
     return count;
 }

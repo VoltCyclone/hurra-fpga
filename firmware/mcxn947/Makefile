@@ -1008,11 +1008,12 @@ test-inj-map-build: build/host/inj_map_build_test
 build/host/inj_map_build_test: test/inj_map_build_test.c test/hid_fixtures.h \
 		src/inj_map_build.c src/inj_map_build.h src/inj_command.c src/inj_command.h \
 		src/spi_frame.c src/spi_frame.h src/hid_mouse_layout.c src/hid_mouse_layout.h \
-		src/hid_layout.h \
+		src/hid_layout.h src/hid_pad_layout.c src/hid_pad_layout.h \
 		src/hid_fields.c src/hid_fields.h src/hid_item.c src/hid_item.h \
 		include/injection_wire.h | build/host
 	$(HOST_CC) $(APP_WARNINGS) -Isrc -Itest -isystem include test/inj_map_build_test.c \
 		src/inj_map_build.c src/inj_command.c src/spi_frame.c src/hid_mouse_layout.c \
+		src/hid_pad_layout.c \
 		src/hid_fields.c src/hid_item.c -o $@
 
 # Note what is NOT on this recipe: -isystem include. The decoder speaks raw HID

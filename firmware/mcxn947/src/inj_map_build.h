@@ -1,4 +1,4 @@
-// Mouse layout -> MAP_ENTRY payloads, the wire form of an injection map.
+// Layout -> MAP_ENTRY payloads, the wire form of an injection map.
 //
 // Pure translation: hid_mouse_layout.c decides WHAT is injectable, this only
 // says it in the contract's terms (include/injection_wire.h) and stamps the
@@ -10,7 +10,7 @@
 
 #include <stdint.h>
 
-#include "hid_mouse_layout.h"
+#include "hid_layout.h"
 #include "injection_wire.h"
 
 typedef struct {
@@ -25,8 +25,8 @@ typedef struct {
 } inj_map_target_t;
 
 // Write one entry per layout field, in layout order, and return the count.
-uint8_t inj_map_build_entries(const hid_mouse_layout_t *layout, const inj_map_target_t *target,
-                              inj_map_entry_payload_t out[HID_MOUSE_MAX_FIELDS]);
+uint8_t inj_map_build_entries(const hid_layout_t *layout, const inj_map_target_t *target,
+                              inj_map_entry_payload_t out[HID_LAYOUT_MAX_FIELDS]);
 
 // entries_crc32 as MAP_BEGIN and MAP_COMMIT carry it: CRC-32 over the entries'
 // payload bytes in order, which is what the FPGA's map store recomputes.
